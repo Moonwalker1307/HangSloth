@@ -71,7 +71,8 @@ public class EndToEndTests
         var report = SampleApp.Analyze("never-completes", tfm);
         var f = Assert.Single(report.Findings);
         Assert.Equal("blocked-on-task", f.Id);
-        Assert.Equal("Thread 1 is blocked in .Wait() at Scenarios.cs:122, waiting for NeverCompletesScenario.Importer.ImportAsync (paused at Scenarios.cs:133), which awaits a TaskCompletionSource<bool> task that nothing has completed yet.", f.Summary);
+        // The main thread's managed id isn't guaranteed to be 1 on every runtime/OS.
+        Assert.Matches(@"^Thread \d+ is blocked in \.Wait\(\) at Scenarios\.cs:122, waiting for NeverCompletesScenario\.Importer\.ImportAsync \(paused at Scenarios\.cs:133\), which awaits a TaskCompletionSource<bool> task that nothing has completed yet\.$", f.Summary);
     }
 
     [Theory, MemberData(nameof(Runtimes))]

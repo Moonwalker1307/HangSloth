@@ -72,7 +72,9 @@ public static partial class DumpLoader
         try
         {
             var client = new DiagnosticsClient(pid);
-            client.WriteDump(DumpType.WithHeap, Path.GetFullPath(dumpPath), logDumpGeneration: false);
+            // Full, like dotnet-dump: smaller dump types can omit the JIT debug info (IL offsets) and loader heaps
+            // (statics) that line numbers and lock names come from, notably on Windows.
+            client.WriteDump(DumpType.Full, Path.GetFullPath(dumpPath), logDumpGeneration: false);
         }
         catch (ServerNotAvailableException e)
         {
