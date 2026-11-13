@@ -10,12 +10,10 @@ namespace HangSloth.Tests;
 [Trait("Category", "EndToEnd")]
 public class EndToEndTests
 {
-    public static IEnumerable<object[]> Runtimes() => SampleApp.InstalledTargetFrameworks().Select(tfm => new object[] { tfm });
-
-    [Theory, MemberData(nameof(Runtimes))]
-    public void Sync_over_async_on_a_single_threaded_context(string tfm)
+    [Fact]
+    public void Sync_over_async_on_a_single_threaded_context()
     {
-        var report = SampleApp.Analyze("sync-over-async", tfm);
+        var report = SampleApp.Analyze("sync-over-async");
         var f = report.Findings[0];
         Assert.Equal("sync-over-async-deadlock", f.Id);
         Assert.Equal("Thread 1 is blocking with .Result on a task that's waiting for the same SynchronizationContext. Classic sync-over-async, in OrderController.cs:10.", f.Summary);
@@ -27,17 +25,17 @@ public class EndToEndTests
     public void Sync_over_async_in_a_debug_build()
     {
         // Debug builds compile state machines as classes rather than structs.
-        var report = SampleApp.Analyze("sync-over-async", "net8.0", "Debug");
+        var report = SampleApp.Analyze("sync-over-async", "Debug");
         var f = report.Findings[0];
         Assert.Equal("sync-over-async-deadlock", f.Id);
         Assert.Equal("OrderController.cs", f.Location?.FileName);
         Assert.Contains(f.Details, d => d.Contains("paused at OrderService.cs:9"));
     }
 
-    [Theory, MemberData(nameof(Runtimes))]
-    public void Lock_ordering_deadlock(string tfm)
+    [Fact]
+    public void Lock_ordering_deadlock()
     {
-        var report = SampleApp.Analyze("deadlock", tfm);
+        var report = SampleApp.Analyze("deadlock");
         var f = Assert.Single(report.Findings, x => x.Severity == Severity.Critical);
         Assert.Equal("lock-deadlock", f.Id);
         Assert.Contains("Thread 4 (\"reserve-worker\") and Thread 5 (\"billing-worker\") are each waiting for a lock the other one holds", f.Summary);
@@ -45,19 +43,19 @@ public class EndToEndTests
         Assert.Contains(f.Details, d => d.Contains("holds the lock on LockDeadlockScenario.BillingLock") && d.Contains("Scenarios.cs:51"));
     }
 
-    [Theory, MemberData(nameof(Runtimes))]
-    public void Lock_contention_behind_a_sleeping_owner(string tfm)
+    [Fact]
+    public void Lock_contention_behind_a_sleeping_owner()
     {
-        var report = SampleApp.Analyze("contention", tfm);
+        var report = SampleApp.Analyze("contention");
         var f = Assert.Single(report.Findings);
         Assert.Equal("lock-contention", f.Id);
         Assert.Equal("5 threads are stuck waiting for the lock on LockContentionScenario.CacheLock, held by Thread 4 (\"cache-rebuilder\"), which is sleeping (Thread.Sleep) in Scenarios.cs:84 while holding it.", f.Summary);
     }
 
-    [Theory, MemberData(nameof(Runtimes))]
-    public void Thread_pool_starvation(string tfm)
+    [Fact]
+    public void Thread_pool_starvation()
     {
-        var report = SampleApp.Analyze("starvation", tfm);
+        var report = SampleApp.Analyze("starvation");
         var f = Assert.Single(report.Findings);
         Assert.Equal("threadpool-starvation", f.Id);
         Assert.StartsWith("Thread pool starvation: 8 of 8 thread pool threads are blocked (all in .Result at OrderController.cs:17)", f.Summary);
@@ -65,28 +63,27 @@ public class EndToEndTests
         Assert.True(report.Snapshot.ThreadPool!.QueuedWorkItems > 0);
     }
 
-    [Theory, MemberData(nameof(Runtimes))]
-    public void Task_that_is_never_completed(string tfm)
+    [Fact]
+    public void Task_that_is_never_completed()
     {
-        var report = SampleApp.Analyze("never-completes", tfm);
+        var report = SampleApp.Analyze("never-completes");
         var f = Assert.Single(report.Findings);
         Assert.Equal("blocked-on-task", f.Id);
         // The main thread's managed id isn't guaranteed to be 1 on every runtime/OS.
         Assert.Matches(@"^Thread \d+ is blocked in \.Wait\(\) at Scenarios\.cs:122, waiting for NeverCompletesScenario\.Importer\.ImportAsync \(paused at Scenarios\.cs:133\), which awaits a TaskCompletionSource<bool> task that nothing has completed yet\.$", f.Summary);
     }
 
-    [Theory, MemberData(nameof(Runtimes))]
-    public void Healthy_app_has_no_findings(string tfm)
+    [Fact]
+    public void Healthy_app_has_no_findings()
     {
-        var report = SampleApp.Analyze("healthy", tfm);
+        var report = SampleApp.Analyze("healthy");
         Assert.Empty(report.Findings);
     }
 
     [Fact]
     public void Deadlock_on_net9_lock_type()
     {
-        if (!SampleApp.InstalledTargetFrameworks().Contains("net10.0")) return; // needs a .NET 9+ runtime
-        var report = SampleApp.Analyze("lock-type-deadlock", "net10.0");
+        var report = SampleApp.Analyze("lock-type-deadlock");
         var f = Assert.Single(report.Findings, x => x.Severity == Severity.Critical);
         Assert.Equal("lock-deadlock", f.Id);
         Assert.Contains(f.Details, d => d.Contains("holds the lock on LockTypeDeadlockScenario.Accounts"));
@@ -96,18 +93,10 @@ public class EndToEndTests
 internal static class SampleApp
 {
     private static readonly ConcurrentDictionary<string, Lazy<string>> Builds = new();
-    private static readonly string[] SampleTargetFrameworks = ["net8.0", "net10.0"];
-
-    public static IEnumerable<string> InstalledTargetFrameworks()
+    public static AnalysisReport Analyze(string mode, string configuration = "Release")
     {
-        var runtimes = Run("dotnet", "--list-runtimes");
-        return SampleTargetFrameworks.Where(tfm => runtimes.Contains($"Microsoft.NETCore.App {tfm[3..^2]}."));
-    }
-
-    public static AnalysisReport Analyze(string mode, string tfm, string configuration = "Release")
-    {
-        var app = Builds.GetOrAdd($"{configuration}|{tfm}", _ => new Lazy<string>(() => Build(tfm, configuration))).Value;
-        var dump = Path.Combine(Path.GetTempPath(), $"hangsloth-test-{mode}-{tfm}-{Guid.NewGuid():N}.dmp");
+        var app = Builds.GetOrAdd(configuration, _ => new Lazy<string>(() => Build(configuration))).Value;
+        var dump = Path.Combine(Path.GetTempPath(), $"hangsloth-test-{mode}-{Guid.NewGuid():N}.dmp");
 
         using var process = Process.Start(new ProcessStartInfo("dotnet", [app, mode])
         {
@@ -135,11 +124,11 @@ internal static class SampleApp
         }
     }
 
-    private static string Build(string tfm, string configuration)
+    private static string Build(string configuration)
     {
         var project = Path.Combine(RepoRoot(), "samples", "HangApp", "HangApp.csproj");
-        var output = Path.Combine(Path.GetTempPath(), "hangsloth-sample", configuration, tfm);
-        Run("dotnet", $"build \"{project}\" -c {configuration} -f {tfm} -o \"{output}\" -nologo -v q", expectSuccess: true);
+        var output = Path.Combine(Path.GetTempPath(), "hangsloth-sample", configuration);
+        Run("dotnet", $"build \"{project}\" -c {configuration} -o \"{output}\" -nologo -v q", expectSuccess: true);
         return Path.Combine(output, "HangApp.dll");
     }
 

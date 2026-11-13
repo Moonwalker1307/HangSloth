@@ -12,9 +12,8 @@ switch (mode)
     case "starvation": StarvationScenario.Run(); break;
     case "never-completes": NeverCompletesScenario.Run(); break;
     case "healthy": HealthyScenario.Run(); break;
-#if NET9_0_OR_GREATER
     case "lock-type-deadlock": LockTypeDeadlockScenario.Run(); break;
-#endif
+
     default:
         Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|never-completes|healthy|lock-type-deadlock>");
         Environment.Exit(2);

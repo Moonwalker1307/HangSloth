@@ -69,11 +69,11 @@ If the dump comes from another machine, pass `--symbols` with a folder containin
 
 ## Build and run from source
 
-Requires the .NET 8 SDK (the sample also targets .NET 10).
+Requires the .NET 10 SDK. HangSloth runs on .NET 10 and can analyze dumps of apps on any .NET (Core) 3.1+ runtime.
 
 ```sh
 dotnet build -c Release
-dotnet src/HangSloth.Cli/bin/Release/net8.0/hangsloth.dll <dump-or-pid>
+dotnet src/HangSloth.Cli/bin/Release/net10.0/hangsloth.dll <dump-or-pid>
 
 # or install it as a global tool
 dotnet pack src/HangSloth.Cli -c Release -o artifacts
@@ -83,11 +83,11 @@ dotnet tool install -g HangSloth --add-source ./artifacts
 Try it on the included broken app:
 
 ```sh
-dotnet run --project samples/HangApp -c Release -f net8.0 -- sync-over-async &
+dotnet run --project samples/HangApp -c Release -- sync-over-async &
 hangsloth $!
 ```
 
-Modes: `sync-over-async`, `deadlock`, `contention`, `starvation`, `never-completes`, `healthy`, and on .NET 9+ `lock-type-deadlock`.
+Modes: `sync-over-async`, `deadlock`, `contention`, `starvation`, `never-completes`, `healthy`, `lock-type-deadlock`.
 
 ## How it works
 
@@ -98,7 +98,7 @@ dump / pid ──► ClrMD ──► SnapshotBuilder ──► ProcessSnapshot �
 
 - **`HangSloth.Core/Collection`** reads the dump with [ClrMD](https://github.com/microsoft/clrmd) and gathers facts: every thread's stack with file:line, held monitors and who is trying to enter them, each thread's `SynchronizationContext`, the task a blocked thread is waiting on and the async chain behind it (state machine state, awaited task, and where its continuation is registered or already queued), plus thread pool counters and queue length.
 - **`HangSloth.Core/Analysis`** holds the detectors. They only read the snapshot, so each is unit-tested with hand-built snapshots. They run from most to least specific; a thread explained by one finding isn't reported again by a more generic one.
-- **`tests/`** has unit tests for every detector and end-to-end tests that run `samples/HangApp` in each mode, dump it, and check the explanation word for word, on every installed runtime (.NET 8 and 10), in Release and Debug builds.
+- **`tests/`** has unit tests for every detector and end-to-end tests that run `samples/HangApp` in each mode, dump it, and check the explanation word for word, in Release and Debug builds.
 
 ## Limitations
 

@@ -144,7 +144,6 @@ static class HealthyScenario
     }
 }
 
-#if NET9_0_OR_GREATER
 static class LockTypeDeadlockScenario
 {
     private static readonly Lock Accounts = new();
@@ -179,4 +178,3 @@ static class LockTypeDeadlockScenario
         }
     }
 }
-#endif

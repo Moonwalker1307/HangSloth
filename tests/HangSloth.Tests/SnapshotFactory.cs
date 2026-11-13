@@ -5,7 +5,7 @@ namespace HangSloth.Tests;
 /// Builds synthetic snapshots so detectors can be tested without a dump.
 internal static class SnapshotFactory
 {
-    public static StackFrameInfo Fx(string type, string method) => new() { TypeName = type, MethodName = method, ModuleName = "/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.0/System.Private.CoreLib.dll" };
+    public static StackFrameInfo Fx(string type, string method) => new() { TypeName = type, MethodName = method, ModuleName = "/usr/share/dotnet/shared/Microsoft.NETCore.App/10.0.0/System.Private.CoreLib.dll" };
 
     public static StackFrameInfo App(string type, string method, string file, int line) =>
         new() { TypeName = type, MethodName = method, ModuleName = "/app/MyApp.dll", Source = new SourceLocation($"/src/{file}", line) };

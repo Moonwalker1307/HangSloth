@@ -76,8 +76,8 @@ public class FrameClassifierTests
     }
 
     [Theory]
-    [InlineData("/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.0/System.Private.CoreLib.dll", true)]
-    [InlineData(@"C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App\8.0.0\Microsoft.AspNetCore.dll", true)]
+    [InlineData("/usr/share/dotnet/shared/Microsoft.NETCore.App/10.0.0/System.Private.CoreLib.dll", true)]
+    [InlineData(@"C:\Program Files\dotnet\shared\Microsoft.AspNetCore.App\10.0.0\Microsoft.AspNetCore.dll", true)]
     [InlineData("/app/Newtonsoft.Json.dll", false)]
     [InlineData("/app/MyCompany.Orders.dll", false)]
     public void Framework_modules_are_recognised(string path, bool expected) => Assert.Equal(expected, FrameClassifier.IsFrameworkModule(path));
