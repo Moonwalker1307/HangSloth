@@ -16,7 +16,8 @@ public class EndToEndTests
         var report = SampleApp.Analyze("sync-over-async");
         var f = report.Findings[0];
         Assert.Equal("sync-over-async-deadlock", f.Id);
-        Assert.Equal("Thread 1 is blocking with .Result on a task that's waiting for the same SynchronizationContext. Classic sync-over-async, in OrderController.cs:10.", f.Summary);
+        // The main thread's managed id isn't always 1 (it's 2 on Windows with .NET 10).
+        Assert.Matches(@"^Thread \d+ is blocking with \.Result on a task that's waiting for the same SynchronizationContext\. Classic sync-over-async, in OrderController\.cs:10\.$", f.Summary);
         Assert.Contains(f.Details, d => d.Contains("OrderService.GetOrderAsync (paused at OrderService.cs:9)"));
         Assert.Contains(f.Details, d => d.Contains("posted to the SingleThreadSynchronizationContext"));
     }

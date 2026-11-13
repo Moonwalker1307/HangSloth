@@ -127,7 +127,7 @@ public static partial class DumpLoader
 
     private static IEnumerable<string> LocalDacCandidates(ClrInfo clr)
     {
-        var dacName = clr.DebuggingLibraries.FirstOrDefault(d => d.Kind == DebugLibraryKind.Dac).FileName
+        var dacName = clr.DebuggingLibraries.FirstOrDefault(d => d.Kind == DebugLibraryKind.Dac)?.FileName
                       ?? (OperatingSystem.IsWindows() ? "mscordaccore.dll" : OperatingSystem.IsMacOS() ? "libmscordaccore.dylib" : "libmscordaccore.so");
         dacName = Path.GetFileName(dacName);
 
