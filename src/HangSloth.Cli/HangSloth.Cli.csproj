@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RollForward>Major</RollForward>
+    <AssemblyName>hangsloth</AssemblyName>
+    <RootNamespace>HangSloth.Cli</RootNamespace>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>hangsloth</ToolCommandName>
+    <PackageId>HangSloth</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Point it at a hung .NET process or memory dump and it explains in plain language why it's stuck: sync-over-async deadlocks, lock deadlocks, lock contention, thread pool starvation.</Description>
+    <PackageTags>dotnet;diagnostics;hang;deadlock;dump;clrmd;async</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/Moonwalker1307/HangSloth</RepositoryUrl>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\HangSloth.Core\HangSloth.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\..\assets\icon.png" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+</Project>
