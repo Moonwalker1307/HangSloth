@@ -61,6 +61,14 @@ public static partial class Names
         var lambda = LambdaRegex().Match(method);
         if (lambda.Success)
             method = $"{lambda.Groups["outer"].Value} (lambda)";
+        var local = LocalFunctionRegex().Match(method);
+        if (local.Success)
+        {
+            // "<Wait>g____PInvoke|24_0" is the generated P/Invoke stub for Wait: just call it Wait.
+            var name = local.Groups["name"].Value;
+            method = name == "__PInvoke" ? local.Groups["outer"].Value : $"{local.Groups["outer"].Value}.{name}";
+        }
+        method = CompiledLambdaRegex().Replace(method, "lambda_method");
         var type = ShortType(DisplayClassRegex().Replace(typeName, ""));
         return type.Length == 0 ? method : $"{type}.{method}";
     }
@@ -70,6 +78,13 @@ public static partial class Names
 
     [GeneratedRegex(@"^<(?<outer>[^>]+)>b__[\w]+$")]
     private static partial Regex LambdaRegex();
+
+    [GeneratedRegex(@"^<(?<outer>[^>]+)>g__(?<name>[^|]+)\|[\d_]+$")]
+    private static partial Regex LocalFunctionRegex();
+
+    /// Expression-compiled thunks ("lambda_method12") get a fresh number per compile; the number means nothing to a reader.
+    [GeneratedRegex(@"^lambda_method\d+$")]
+    private static partial Regex CompiledLambdaRegex();
 
     [GeneratedRegex(@"\+<>c(__DisplayClass[\w]+)?$")]
     private static partial Regex DisplayClassRegex();

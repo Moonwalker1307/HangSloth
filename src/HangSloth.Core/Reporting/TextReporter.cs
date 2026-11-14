@@ -51,21 +51,23 @@ public static class TextReporter
 
         var threadIds = options.AllThreads
             ? s.Threads.Select(t => t.ManagedId).ToList()
-            : report.Findings.SelectMany(f => f.ThreadIds).Distinct().Take(64).ToList();
+            : report.Findings.SelectMany(f => f.ThreadIds).Distinct().ToList();
         if (threadIds.Count > 0)
         {
             output.WriteLine(c.Bold(options.AllThreads ? "Threads" : "Stacks of the threads involved"));
-            // Threads with identical stacks (typical for starvation) are shown once.
+            // Threads stopped in the same way at the same lines of app code (typical for starvation
+            // and contention) are shown once, even if the framework frames below them differ.
             var groups = threadIds
                 .Select(s.FindThread)
                 .OfType<ThreadSnapshot>()
-                .GroupBy(t => string.Join("|", t.Frames.Select(f => f.ToString())))
+                .GroupBy(GroupKey)
                 .ToList();
-            foreach (var g in groups)
+            var shownGroups = options.AllThreads ? groups : groups.Take(MaxGroups).ToList();
+            foreach (var g in shownGroups)
                 WriteThread(output, g.ToList(), options, c);
-            var more = report.Findings.SelectMany(f => f.ThreadIds).Distinct().Count() - threadIds.Count;
-            if (!options.AllThreads && more > 0)
-                output.WriteLine(c.Dim($"   (+{more} more; use --all-threads to see every stack)"));
+            var more = groups.Skip(shownGroups.Count).Sum(g => g.Count());
+            if (more > 0)
+                output.WriteLine(c.Dim($"   (+{Describe.Plural(more, "more thread")}; use --all-threads to see every stack)"));
         }
 
         foreach (var w in s.Warnings)
@@ -77,8 +79,8 @@ public static class TextReporter
         var t = same[0];
         if (same.Count > 1)
         {
-            var ids = string.Join(", ", same.Select(x => x.ManagedId));
-            output.WriteLine($"   {c.Bold($"Threads {ids}")}{c.Dim($" · {same.Count} threads with the same stack" + (t.IsThreadPoolWorker ? " · thread pool" : ""))}");
+            var ids = string.Join(", ", same.Take(MaxIdsListed).Select(x => x.ManagedId)) + (same.Count > MaxIdsListed ? $" and {same.Count - MaxIdsListed} more" : "");
+            output.WriteLine($"   {c.Bold($"Threads {ids}")}{c.Dim($" · {same.Count} threads stopped at the same place" + (t.IsThreadPoolWorker ? " · thread pool" : ""))}");
         }
         var tags = new List<string>();
         if (t.IsThreadPoolWorker) tags.Add("thread pool");
@@ -87,7 +89,7 @@ public static class TextReporter
         if (same.Count == 1)
             output.WriteLine($"   {c.Bold(t.Label)}{c.Dim($" · OS thread 0x{t.OSThreadId:x}" + (tags.Count > 0 ? " · " + string.Join(", ", tags) : ""))}");
 
-        var frames = t.Frames;
+        var frames = VisibleFrames(t.Frames);
         var shown = 0;
         foreach (var f in frames)
         {
@@ -102,6 +104,34 @@ public static class TextReporter
         }
         if (frames.Count == 0) output.WriteLine(c.Dim("        (no managed frames)"));
         output.WriteLine();
+    }
+
+    private const int MaxGroups = 12;
+    private const int MaxIdsListed = 10;
+
+    /// What a thread is blocked on plus the app frames it's in. Threads without app frames
+    /// are grouped by their whole visible stack.
+    private static string GroupKey(ThreadSnapshot t)
+    {
+        var visible = VisibleFrames(t.Frames);
+        var user = visible.Where(FrameClassifier.IsUserFrame).ToList();
+        var frames = user.Count > 0 ? user : visible;
+        return FrameClassifier.Classify(t.Frames) + "|" + string.Join("|", frames.Select(f => $"{Names.ShortMethod(f.TypeName, f.MethodName)}@{f.Source}"));
+    }
+
+    /// Frames as a reader sees them: a P/Invoke stub and the method that calls it read as the
+    /// same name twice, so consecutive frames that print identically are shown once.
+    private static List<StackFrameInfo> VisibleFrames(IReadOnlyList<StackFrameInfo> frames)
+    {
+        var result = new List<StackFrameInfo>(frames.Count);
+        string? previous = null;
+        foreach (var f in frames)
+        {
+            var key = $"{Names.ShortMethod(f.TypeName, f.MethodName)}@{f.Source}";
+            if (key != previous) result.Add(f);
+            previous = key;
+        }
+        return result;
     }
 
     private static void WriteWrapped(TextWriter output, string text, string firstIndent, string? restIndent = null)

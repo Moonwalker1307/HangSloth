@@ -28,6 +28,8 @@ public static class FrameClassifier
         var prefix = FrameworkPrefix(frames);
         if (prefix.Count == 0) return BlockingKind.None;
 
+        // app.Run() / host.Run() parks the main thread until shutdown. That's a healthy app, not a hang.
+        if (prefix.Any(IsHostRunFrame)) return BlockingKind.Idle;
         if (prefix.Any(f => IsTaskWaitMethod(f.TypeName, f.MethodName))) return BlockingKind.TaskWait;
         if (IsIdleInfrastructure(frames)) return BlockingKind.Idle;
         if (prefix.Any(IsMonitorEnter)) return BlockingKind.MonitorEnter;
@@ -118,6 +120,11 @@ public static class FrameClassifier
     public static bool IsThreadPoolServiceFrame(StackFrameInfo frame) =>
         frame.TypeName.StartsWith("System.Threading.PortableThreadPool+GateThread", StringComparison.Ordinal)
         || frame.TypeName.StartsWith("System.Threading.PortableThreadPool+WaitThread", StringComparison.Ordinal);
+
+    /// The generic host's blocking Run/WaitForShutdown (behind WebApplication.Run, IHost.Run, RunConsoleAsync().Wait()).
+    public static bool IsHostRunFrame(StackFrameInfo f) =>
+        (f.TypeName.StartsWith("Microsoft.Extensions.Hosting.", StringComparison.Ordinal) && f.MethodName is "Run" or "WaitForShutdown")
+        || (f.TypeName == "Microsoft.AspNetCore.Builder.WebApplication" && f.MethodName == "Run");
 
     private static bool IsMonitorEnter(StackFrameInfo f) =>
         (f.TypeName == "System.Threading.Monitor" && (f.MethodName is "Enter" or "ReliableEnter" or "ReliableEnterTimeout" or "TryEnter" || f.MethodName.Contains("Slow", StringComparison.OrdinalIgnoreCase)))

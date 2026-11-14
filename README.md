@@ -89,6 +89,8 @@ hangsloth $!
 
 Modes: `sync-over-async`, `deadlock`, `contention`, `starvation`, `never-completes`, `healthy`, `lock-type-deadlock`.
 
+To check it on code written by someone else, `scripts/try-diagnostic-scenarios.sh` builds Microsoft's [DiagnosticScenarios sample](https://learn.microsoft.com/en-us/samples/dotnet/samples/diagnostic-scenarios/) (the app from the official [deadlock](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/debug-deadlock) and [thread pool starvation](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/debug-threadpool-starvation) tutorials) in a temp folder, puts each scenario under load, and runs HangSloth on it. `taskasyncwait` is the healthy control and should report nothing.
+
 ## How it works
 
 ```

@@ -22,6 +22,13 @@ public class NamesTests
         Assert.Equal(expected, Names.ShortMethod(type, method));
 
     [Theory]
+    [InlineData("System.Threading.Monitor", "<Wait>g____PInvoke|24_0", "Monitor.Wait")]
+    [InlineData("MyApp.Worker", "<Run>g__Drain|3_0", "Worker.Run.Drain")]
+    [InlineData("", "lambda_method42", "lambda_method")]
+    public void Generated_method_names_are_cleaned_up(string type, string method, string expected) =>
+        Assert.Equal(expected, Names.ShortMethod(type, method));
+
+    [Theory]
     [InlineData("System.Threading.Tasks.Task<HangApp.Order>", "Task<Order>")]
     [InlineData("System.Collections.Generic.Dictionary<System.String, System.Int32>", "Dictionary<string, int>")]
     [InlineData("HangApp.Scenario+Gate", "Scenario.Gate")]
@@ -64,6 +71,20 @@ public class FrameClassifierTests
             Fx("System.Threading.LowLevelLifoSemaphore", "WaitNative"),
             Fx("System.Threading.LowLevelLifoSemaphore", "Wait"),
             Fx("System.Threading.PortableThreadPool+WorkerThread", "WorkerThreadStart"),
+        ];
+        Assert.Equal(BlockingKind.Idle, FrameClassifier.Classify(frames));
+    }
+
+    [Fact]
+    public void Main_thread_parked_in_host_Run_is_idle()
+    {
+        // What app.Run() looks like in every ASP.NET Core app's dump.
+        StackFrameInfo[] frames =
+        [
+            .. ResultWait[..4],
+            Fx("System.Runtime.CompilerServices.TaskAwaiter", "HandleNonSuccessAndDebuggerNotification"),
+            new() { TypeName = "Microsoft.Extensions.Hosting.HostingAbstractionsHostExtensions", MethodName = "Run", ModuleName = "/usr/share/dotnet/shared/Microsoft.AspNetCore.App/10.0.0/Microsoft.Extensions.Hosting.Abstractions.dll" },
+            App("Program", "<Main>$", "Program.cs", 10),
         ];
         Assert.Equal(BlockingKind.Idle, FrameClassifier.Classify(frames));
     }
