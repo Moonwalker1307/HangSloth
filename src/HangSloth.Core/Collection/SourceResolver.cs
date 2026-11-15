@@ -1,6 +1,7 @@
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
+using System.Reflection.Emit;
 using HangSloth.Model;
 
 namespace HangSloth.Collection;
@@ -14,6 +15,7 @@ public sealed class SourceResolver : IDisposable
 
     private readonly IReadOnlyList<string> _searchDirectories;
     private readonly Dictionary<string, MetadataReaderProvider?> _cache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PEReader?> _images = new(StringComparer.OrdinalIgnoreCase);
 
     public SourceResolver(IEnumerable<string>? searchDirectories = null)
     {
@@ -61,6 +63,105 @@ public sealed class SourceResolver : IDisposable
         return null;
     }
 
+    /// Finds the call that blocks on a task (.Result, .Wait(), GetAwaiter().GetResult()...) in a method's IL,
+    /// at or after <paramref name="ilOffset"/>, and returns its source line and how it blocks.
+    /// Optimized (tier-1) code often maps a return address to an earlier statement than the call, and inlines
+    /// Task&lt;T&gt;.Result so that its frame is gone; the method's own IL still says exactly which call it was.
+    public BlockingCall? ResolveBlockingCall(string? modulePath, int methodToken, int ilOffset)
+    {
+        var image = GetImage(modulePath);
+        if (image is null || !TryGetMethodHandle(methodToken, out var handle)) return null;
+        try
+        {
+            var metadata = image.GetMetadataReader();
+            var rva = metadata.GetMethodDefinition(handle).RelativeVirtualAddress;
+            if (rva == 0) return null;
+            var il = image.GetMethodBody(rva).GetILBytes();
+            if (il is null) return null;
+
+            var calls = IlReader.Calls(il)
+                .Select(c => (c.Offset, Call: DescribeBlockingCall(metadata, c.Token)))
+                .Where(c => c.Call is not null)
+                .ToList();
+            if (calls.Count == 0) return null;
+            // The first blocking call at or after the offset; failing that, the last one before it.
+            var (offset, call) = calls.FirstOrDefault(c => c.Offset >= ilOffset) is { Call: not null } after ? after : calls[^1];
+
+            var pdb = GetReader(modulePath);
+            var location = pdb is null ? null : FindSequencePoint(pdb, handle, offset);
+            return new BlockingCall(call!, location);
+        }
+        catch (BadImageFormatException) { return null; }
+        catch (InvalidOperationException) { return null; }
+    }
+
+    /// How a call blocks on a task, in the words a developer would use, or null for any other call.
+    internal static string? DescribeBlockingCall(MetadataReader metadata, int token)
+    {
+        if (!TryGetCallee(metadata, token, out var type, out var method)) return null;
+        var simple = type[(type.LastIndexOfAny(['.', '+']) + 1)..];
+        var inTasks = type.StartsWith("System.Threading.Tasks.", StringComparison.Ordinal) || !type.Contains('.');
+        return (simple, method) switch
+        {
+            ("Task`1" or "ValueTask`1", "get_Result") when inTasks => ".Result",
+            ("Task", "Wait") when inTasks => ".Wait()",
+            ("Task", "WaitAll") when inTasks => "Task.WaitAll(...)",
+            ("Task", "WaitAny") when inTasks => "Task.WaitAny(...)",
+            ("TaskAwaiter" or "TaskAwaiter`1" or "ConfiguredTaskAwaiter" or "ValueTaskAwaiter" or "ValueTaskAwaiter`1", "GetResult") => ".GetAwaiter().GetResult()",
+            _ => null,
+        };
+    }
+
+    private static bool TryGetCallee(MetadataReader metadata, int token, out string type, out string method)
+    {
+        type = method = "";
+        var handle = MetadataTokens.EntityHandle(token);
+        if (handle.Kind == HandleKind.MethodSpecification)
+            handle = metadata.GetMethodSpecification((MethodSpecificationHandle)handle).Method;
+        switch (handle.Kind)
+        {
+            case HandleKind.MemberReference:
+                var member = metadata.GetMemberReference((MemberReferenceHandle)handle);
+                method = metadata.GetString(member.Name);
+                type = TypeName(metadata, member.Parent) ?? "";
+                return type.Length > 0;
+            case HandleKind.MethodDefinition:
+                var def = metadata.GetMethodDefinition((MethodDefinitionHandle)handle);
+                method = metadata.GetString(def.Name);
+                type = TypeName(metadata, def.GetDeclaringType()) ?? "";
+                return type.Length > 0;
+            default:
+                return false;
+        }
+    }
+
+    private static string? TypeName(MetadataReader metadata, EntityHandle handle)
+    {
+        switch (handle.Kind)
+        {
+            case HandleKind.TypeReference:
+                var r = metadata.GetTypeReference((TypeReferenceHandle)handle);
+                var name = metadata.GetString(r.Name);
+                if (r.ResolutionScope.Kind == HandleKind.TypeReference)
+                    return $"{TypeName(metadata, (EntityHandle)r.ResolutionScope)}+{name}";
+                return r.Namespace.IsNil ? name : $"{metadata.GetString(r.Namespace)}.{name}";
+            case HandleKind.TypeDefinition:
+                var d = metadata.GetTypeDefinition((TypeDefinitionHandle)handle);
+                var defName = metadata.GetString(d.Name);
+                if (d.GetDeclaringType() is { IsNil: false } outer)
+                    return $"{TypeName(metadata, outer)}+{defName}";
+                return d.Namespace.IsNil ? defName : $"{metadata.GetString(d.Namespace)}.{defName}";
+            case HandleKind.TypeSpecification:
+                // Task<int> and friends: a generic instantiation of a type reference.
+                var blob = metadata.GetBlobReader(metadata.GetTypeSpecification((TypeSpecificationHandle)handle).Signature);
+                if (blob.ReadSignatureTypeCode() != SignatureTypeCode.GenericTypeInstance) return null;
+                blob.ReadCompressedInteger(); // CLASS or VALUETYPE
+                return TypeName(metadata, blob.ReadTypeHandle());
+            default:
+                return null;
+        }
+    }
+
     private static bool TryGetMethodHandle(int token, out MethodDefinitionHandle handle)
     {
         handle = default;
@@ -101,6 +202,26 @@ public sealed class SourceResolver : IDisposable
             _cache[modulePath] = null;
             return null;
         }
+    }
+
+    private PEReader? GetImage(string? modulePath)
+    {
+        if (string.IsNullOrEmpty(modulePath)) return null;
+        if (_images.TryGetValue(modulePath, out var cached)) return cached;
+        PEReader? image = null;
+        var fileName = Path.GetFileName(modulePath.Replace('\\', '/'));
+        foreach (var candidate in new[] { modulePath }.Concat(_searchDirectories.Select(d => Path.Combine(d, fileName))).Where(File.Exists))
+        {
+            try
+            {
+                var pe = new PEReader(File.OpenRead(candidate));
+                if (pe.HasMetadata) { image = pe; break; }
+                pe.Dispose();
+            }
+            catch (Exception e) when (e is BadImageFormatException or IOException or UnauthorizedAccessException) { }
+        }
+        _images[modulePath] = image;
+        return image;
     }
 
     private MetadataReaderProvider? OpenPdb(string modulePath)
@@ -152,5 +273,45 @@ public sealed class SourceResolver : IDisposable
     {
         foreach (var p in _cache.Values) p?.Dispose();
         _cache.Clear();
+        foreach (var i in _images.Values) i?.Dispose();
+        _images.Clear();
+    }
+}
+
+/// A call in the app's code that blocks on a task, found in the method's IL.
+/// <param name="Call">".Result", ".Wait()", ".GetAwaiter().GetResult()"...</param>
+public sealed record BlockingCall(string Call, SourceLocation? Location);
+
+/// Just enough of an IL decoder to find call instructions.
+internal static class IlReader
+{
+    private static readonly Dictionary<short, OperandType> Operands = typeof(OpCodes)
+        .GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+        .Select(f => (OpCode)f.GetValue(null)!)
+        .GroupBy(o => o.Value)
+        .ToDictionary(g => g.Key, g => g.First().OperandType);
+
+    /// The call and callvirt instructions in a method body, with their offsets and method tokens.
+    public static IEnumerable<(int Offset, int Token)> Calls(byte[] il)
+    {
+        var i = 0;
+        while (i < il.Length)
+        {
+            var start = i;
+            short value = il[i++];
+            if (value == 0xFE && i < il.Length) value = unchecked((short)(0xFE00 | il[i++]));
+            if (!Operands.TryGetValue(value, out var operand)) yield break;
+            if ((value == OpCodes.Call.Value || value == OpCodes.Callvirt.Value) && i + 4 <= il.Length)
+                yield return (start, BitConverter.ToInt32(il, i));
+            i += operand switch
+            {
+                OperandType.InlineNone => 0,
+                OperandType.ShortInlineBrTarget or OperandType.ShortInlineI or OperandType.ShortInlineVar => 1,
+                OperandType.InlineVar => 2,
+                OperandType.InlineI8 or OperandType.InlineR => 8,
+                OperandType.InlineSwitch when i + 4 <= il.Length => 4 + 4 * BitConverter.ToInt32(il, i),
+                _ => 4,
+            };
+        }
     }
 }

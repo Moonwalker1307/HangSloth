@@ -86,6 +86,11 @@ public sealed record StackFrameInfo
     /// A runtime/helper frame rather than managed code (e.g. HelperMethodFrame).
     public bool IsRuntimeFrame { get; init; }
 
+    /// For the app frame that blocks on a task: how it blocks (".Result", ".Wait()", ".GetAwaiter().GetResult()"),
+    /// read from the call in the method's IL. When set, <see cref="Source"/> is the line of that call.
+    /// Null when the IL couldn't be read; the wait is then judged from the framework frames above.
+    public string? BlockingCall { get; init; }
+
     public string FullName => TypeName.Length == 0 ? MethodName : $"{TypeName}.{MethodName}";
 
     public override string ToString() => Source is null ? FullName : $"{FullName} ({Source})";

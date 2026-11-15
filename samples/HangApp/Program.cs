@@ -11,11 +11,12 @@ switch (mode)
     case "contention": LockContentionScenario.Run(); break;
     case "starvation": StarvationScenario.Run(); break;
     case "never-completes": NeverCompletesScenario.Run(); break;
+    case "tiered-starvation": TieredStarvationScenario.Run(); break;
     case "healthy": HealthyScenario.Run(); break;
     case "lock-type-deadlock": LockTypeDeadlockScenario.Run(); break;
 
     default:
-        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|never-completes|healthy|lock-type-deadlock>");
+        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|tiered-starvation|never-completes|healthy|lock-type-deadlock>");
         Environment.Exit(2);
         break;
 }

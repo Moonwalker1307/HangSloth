@@ -192,6 +192,7 @@ public sealed partial class SnapshotBuilder
     private List<StackFrameInfo> ReadFrames(ClrThread thread)
     {
         var frames = new List<StackFrameInfo>();
+        var code = new List<(ClrMethod? Method, ulong Ip, bool IsLeaf)>();
         try
         {
             var first = true;
@@ -209,6 +210,7 @@ public sealed partial class SnapshotBuilder
                         ModuleName = method.Type?.Module?.Name,
                         Source = ResolveSource(method, frame.InstructionPointer, isFirst),
                     });
+                    code.Add((method, frame.InstructionPointer, isFirst));
                 }
                 else if (method is not null)
                 {
@@ -221,6 +223,7 @@ public sealed partial class SnapshotBuilder
                         ModuleName = method.Type?.Module?.Name,
                         IsRuntimeFrame = true,
                     });
+                    code.Add((null, 0, false));
                 }
             }
         }
@@ -228,7 +231,27 @@ public sealed partial class SnapshotBuilder
         {
             _warnings.Add($"Could not fully walk the stack of thread {thread.ManagedThreadId}: {e.Message}");
         }
+        ResolveBlockingCall(frames, code);
         return frames;
+    }
+
+    /// The app frame that blocks on a task: read the blocking call from its IL, which gives the right line and
+    /// the right kind of wait even when optimized code inlined Task&lt;T&gt;.Result and lost its frame.
+    private void ResolveBlockingCall(List<StackFrameInfo> frames, List<(ClrMethod? Method, ulong Ip, bool IsLeaf)> code)
+    {
+        if (FrameClassifier.Classify(frames) != BlockingKind.TaskWait) return;
+        var index = frames.FindIndex(FrameClassifier.IsUserFrame);
+        if (index < 0 || code[index].Method is not { } method || method.Type?.Module is not { IsDynamic: false } module) return;
+        try
+        {
+            var il = method.GetILOffset(code[index].IsLeaf ? code[index].Ip : code[index].Ip - 1);
+            if (_sources.ResolveBlockingCall(module.Name, method.MetadataToken, il) is not { } call) return;
+            frames[index] = frames[index] with { BlockingCall = call.Call, Source = call.Location ?? frames[index].Source };
+        }
+        catch
+        {
+            // Keep what the stack walk gave.
+        }
     }
 
     private SourceLocation? ResolveSource(ClrMethod method, ulong ip, bool isLeaf)
