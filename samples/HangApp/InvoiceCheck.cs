@@ -11,8 +11,8 @@ public sealed class InvoiceCheck
 
     public int CheckAll(IEnumerable<int> invoiceIds) =>
         invoiceIds.Aggregate(0, (errors, id) => errors + Validate(id));
-
-    public int Validate(int invoiceId)
+    // Kept out of line, like a real validator too big to inline, so that only Task<T>.Result gets inlined into it.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)] public int Validate(int invoiceId)
     {
         if (invoiceId <= 0) throw new ArgumentOutOfRangeException(nameof(invoiceId));
         var reference = $"invoice-{invoiceId}";

@@ -72,8 +72,11 @@ public class EndToEndTests
         // inlined: they must all be reported at the .Result line, as .Result, in a single group.
         var report = SampleApp.Analyze("tiered-starvation");
         // The scenario only tests something if some threads really run the inlined code.
-        Assert.Contains(report.Snapshot.Threads, t => t.Frames.Any(x => x.MethodName == "Validate")
-                                                      && !t.Frames.Any(x => x.MethodName is "GetResultCore" or "get_Result"));
+        var stacks = string.Join("\n", report.Snapshot.Threads.Where(t => t.IsThreadPoolWorker)
+            .Select(t => string.Join(" > ", t.Frames.Take(9).Select(x => x.ToString()))).Distinct());
+        Assert.True(report.Snapshot.Threads.Any(t => t.Frames.Any(x => x.MethodName == "Validate")
+                                                     && !t.Frames.Any(x => x.MethodName is "GetResultCore" or "get_Result")),
+            $"No thread ran tier-1 code with Task<T>.Result inlined. Pool thread stacks:\n{stacks}");
         var f = Assert.Single(report.Findings);
         Assert.Equal("threadpool-starvation", f.Id);
         Assert.StartsWith("Thread pool starvation: 200 of ", f.Summary);
