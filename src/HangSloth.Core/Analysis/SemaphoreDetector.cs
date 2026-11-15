@@ -11,7 +11,7 @@ public sealed class SemaphoreDeadlockDetector : IDetector
     {
         var taken = snapshot.Semaphores
             .Where(s => s.CurrentCount == 0 && s.MaxCount == 1)
-            .Select(s => (Semaphore: s, Waiters: s.WaiterThreadIds.Where(id => !claimed.Contains(id)).ToList()))
+            .Select(s => (Semaphore: s, Waiters: s.WaiterThreadIds.Where(id => !claimed.Contains(id) && !SemaphoreFacts.WaitsOnCollection(snapshot, id)).ToList()))
             .Where(x => x.Waiters.Count > 0)
             .ToList();
         if (taken.Count < 2) yield break;
@@ -46,13 +46,16 @@ public sealed class SemaphoreDeadlockDetector : IDetector
 }
 
 /// A single thread synchronously waiting on a SemaphoreSlim that has no free slots.
+/// A BlockingCollection waits on a private SemaphoreSlim of its own; those threads are about the
+/// collection, not a semaphore the app took, so they're skipped here: <see cref="FullQueueDetector"/>
+/// reports a full Add, and an idle Take is normal.
 public sealed class SemaphoreWaitDetector : IDetector
 {
     public IEnumerable<Finding> Detect(ProcessSnapshot snapshot, IReadOnlySet<int> claimed)
     {
         foreach (var s in snapshot.Semaphores.Where(s => s.CurrentCount == 0))
         {
-            var waiters = s.WaiterThreadIds.Where(id => !claimed.Contains(id)).ToList();
+            var waiters = s.WaiterThreadIds.Where(id => !claimed.Contains(id) && !SemaphoreFacts.WaitsOnCollection(snapshot, id)).ToList();
             if (waiters.Count == 0) continue;
             var running = SemaphoreFacts.AppCodeRunningOutside(snapshot, waiters);
             var first = snapshot.FindThread(waiters[0])!;
@@ -81,6 +84,10 @@ internal static class SemaphoreFacts
 
     public static string NoOwner(SemaphoreInfo s) =>
         $"A SemaphoreSlim has no owner: whoever took the slot of {s.DisplayName} has to call Release(). If that code is itself waiting, directly or through this thread, nothing ever will.";
+
+    /// Waiting inside BlockingCollection.Add or Take, whose SemaphoreSlim is the collection's own.
+    public static bool WaitsOnCollection(ProcessSnapshot snapshot, int threadId) =>
+        snapshot.FindThread(threadId)?.WaitingOnCollection is not null;
 
     /// Is any thread other than these running (not blocked, not idle) the app's own code?
     public static bool AppCodeRunningOutside(ProcessSnapshot snapshot, IReadOnlyCollection<int> except) =>
