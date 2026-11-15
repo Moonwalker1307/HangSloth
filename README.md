@@ -64,9 +64,12 @@ hangsloth <pid>         [options]   Capture a dump of a running .NET process and
                        another machine whose DAC can't be downloaded
   --keep-dump <path>   With a pid: keep the captured dump
   --no-color           Disable colored output
+  --version            Show the version
 
 Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found, 1 = error.
 ```
+
+Exit code 1 also covers a check that failed when no other check found anything: the report is still printed, but stderr says which check failed, so do not read "No hang patterns found" as a clean result. An unexpected error is one line on stderr; set `HANGSLOTH_DEBUG=1` to see the full exception. Dumps from .NET Framework are not supported, and a Windows dump has to be analyzed on Windows.
 
 Dumps from `dotnet-dump collect`, `createdump`, `procdump` or Task Manager all work. For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written.
 

@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using HangSloth.Model;
 using Microsoft.Diagnostics.NETCore.Client;
@@ -41,14 +42,41 @@ public static partial class DumpLoader
         lock (DacGate)
         using (target)
         {
-            var clr = target.ClrVersions.FirstOrDefault()
-                      ?? throw new HangSlothException("No .NET runtime found in this dump. Is it a .NET (Core) process?");
+            var clr = PickRuntime(target, path);
             var warnings = new List<string>();
             using var runtime = CreateRuntime(clr, options, warnings);
             using var sources = new SourceResolver(options.SymbolDirectories.Append(Path.GetDirectoryName(Path.GetFullPath(path))!));
             var snapshot = SnapshotBuilder.Build(runtime, path, sources, RuntimeVersion(clr));
             return snapshot with { Warnings = [.. warnings, .. snapshot.Warnings] };
         }
+    }
+
+    /// The .NET (Core) runtime of the dump; a dump with only the desktop CLR is rejected with a clear message.
+    private static ClrInfo PickRuntime(DataTarget target, string path)
+    {
+        List<ClrInfo> versions;
+        try
+        {
+            // ClrMD reads the dump's module list lazily here, so a truncated or damaged file fails now.
+            versions = [.. target.ClrVersions];
+        }
+        catch (Exception e)
+        {
+            throw new HangSlothException($"Could not read '{path}': the dump looks truncated or damaged: {e.Message}", e);
+        }
+
+        var clr = versions.FirstOrDefault(c => c.Flavor == ClrFlavor.Core) ?? versions.FirstOrDefault()
+                  ?? throw new HangSlothException("No .NET runtime found in this dump. Is it a .NET (Core) process?");
+        if (clr.Flavor == ClrFlavor.Desktop)
+            throw new HangSlothException(
+                "This dump is from a .NET Framework process (the desktop CLR), which is not supported yet. " +
+                "HangSloth reads dumps of .NET Core 3.1+ and .NET 5+ apps.");
+
+        // ClrMD cannot read a Windows dump on another OS, and no --dac changes that.
+        if (target.DataReader.TargetPlatform == OSPlatform.Windows && !OperatingSystem.IsWindows())
+            throw new HangSlothException(
+                "This dump comes from Windows, so it has to be analyzed on Windows (a Windows dump cannot be read on Linux or macOS).");
+        return clr;
     }
 
     /// Capture a dump of a live .NET process (via the diagnostics IPC channel, like dotnet-dump) and analyze it.
@@ -96,7 +124,14 @@ public static partial class DumpLoader
         if (options.DacPath is { } explicitDac)
         {
             if (!File.Exists(explicitDac)) throw new HangSlothException($"DAC not found: {explicitDac}");
-            return clr.CreateRuntime(explicitDac, ignoreMismatch: true);
+            try
+            {
+                return clr.CreateRuntime(explicitDac, ignoreMismatch: true);
+            }
+            catch (Exception e)
+            {
+                throw new HangSlothException($"Could not load '{explicitDac}' as the debugging library (DAC): {e.Message}", e);
+            }
         }
 
         Exception? first = null;

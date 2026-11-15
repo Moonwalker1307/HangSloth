@@ -1,6 +1,8 @@
 using HangSloth.Analysis;
 using HangSloth.Collection;
+using HangSloth.Model;
 using HangSloth.Reporting;
+using System.Reflection;
 
 namespace HangSloth.Cli;
 
@@ -21,12 +23,17 @@ public static class Program
                                for dumps from another machine whose DAC can't be downloaded
           --keep-dump <path>   With a pid: keep the captured dump at this path
           --no-color           Disable colored output
+          --version            Show the version
           -h, --help           Show this help
 
         Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found, 1 = error.
         """;
 
-    public static int Main(string[] args)
+    public static int Main(string[] args) => Run(args);
+
+    /// <param name="loadDump">Replaces reading a dump file; lets tests drive the CLI with a synthetic snapshot.</param>
+    /// <param name="analyzer">Replaces the default detector list; lets tests inject a failing detector.</param>
+    internal static int Run(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump = null, Func<HangAnalyzer>? analyzer = null)
     {
         Options options;
         try
@@ -41,20 +48,38 @@ public static class Program
             return 1;
         }
 
+        if (options.ShowVersion)
+        {
+            Console.WriteLine($"hangsloth {Version()}");
+            return 0;
+        }
+
         if (options.ShowHelp || options.Target is null)
         {
             Console.WriteLine(Usage);
             return options.ShowHelp ? 0 : 1;
         }
 
+        var isPid = int.TryParse(options.Target, out var pid) && !File.Exists(options.Target);
+        if (options.KeepDump is not null && !isPid)
+        {
+            Console.Error.WriteLine("--keep-dump only works with a process id.");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine(Usage);
+            return 1;
+        }
+
         try
         {
-            var load = new LoadOptions { SymbolDirectories = options.SymbolDirectories, DacPath = options.DacPath };
-            var snapshot = int.TryParse(options.Target, out var pid) && !File.Exists(options.Target)
-                ? DumpLoader.LoadProcess(pid, load, options.KeepDump)
-                : DumpLoader.LoadDump(options.Target, load);
+            if (options.SymbolDirectories.FirstOrDefault(d => !Directory.Exists(d)) is { } missing)
+                throw new HangSlothException($"Symbols folder not found: {missing}");
 
-            var report = new HangAnalyzer().Analyze(snapshot);
+            var load = new LoadOptions { SymbolDirectories = options.SymbolDirectories, DacPath = options.DacPath };
+            var snapshot = isPid
+                ? DumpLoader.LoadProcess(pid, load, options.KeepDump)
+                : (loadDump ?? DumpLoader.LoadDump)(options.Target, load);
+
+            var report = (analyzer?.Invoke() ?? new HangAnalyzer()).Analyze(snapshot);
             if (options.Json)
             {
                 Console.WriteLine(JsonReporter.Serialize(report));
@@ -64,13 +89,37 @@ public static class Program
                 var color = !options.NoColor && !Console.IsOutputRedirected && Environment.GetEnvironmentVariable("NO_COLOR") is null;
                 TextReporter.Write(report, Console.Out, new TextReportOptions { UseColor = color, AllThreads = options.AllThreads });
             }
-            return report.Findings.Any(f => f.Severity >= Severity.Warning) ? 2 : 0;
+            if (report.Findings.Any(f => f.Severity >= Severity.Warning)) return 2;
+            if (report.FailedDetectors.Count > 0)
+            {
+                // A failed check must not look like a healthy app.
+                var many = report.FailedDetectors.Count > 1;
+                Console.Error.WriteLine($"hangsloth: the {string.Join(", ", report.FailedDetectors)} {(many ? "checks" : "check")} failed, so \"No hang patterns found\" cannot be trusted.");
+                return 1;
+            }
+            return 0;
         }
         catch (HangSlothException e)
         {
             Console.Error.WriteLine($"hangsloth: {e.Message}");
+            if (e.InnerException is not null && Environment.GetEnvironmentVariable("HANGSLOTH_DEBUG") == "1") Console.Error.WriteLine(e.InnerException);
             return 1;
         }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"hangsloth: unexpected error ({e.GetType().Name}): {e.Message.ReplaceLineEndings(" ")}");
+            if (Environment.GetEnvironmentVariable("HANGSLOTH_DEBUG") == "1") Console.Error.WriteLine(e);
+            return 1;
+        }
+    }
+
+    /// The assembly's version; the SDK appends the commit after '+', cut to 7 characters.
+    private static string Version()
+    {
+        var v = typeof(Program).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+                ?? typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "unknown";
+        var plus = v.IndexOf('+');
+        return plus < 0 ? v : v[..Math.Min(v.Length, plus + 1 + 7)];
     }
 
     internal sealed record Options
@@ -80,6 +129,7 @@ public static class Program
         public bool AllThreads { get; init; }
         public bool NoColor { get; init; }
         public bool ShowHelp { get; init; }
+        public bool ShowVersion { get; init; }
         public List<string> SymbolDirectories { get; } = [];
         public string? DacPath { get; init; }
         public string? KeepDump { get; init; }
@@ -96,6 +146,7 @@ public static class Program
                     "--json" => o with { Json = true },
                     "--all-threads" => o with { AllThreads = true },
                     "--no-color" => o with { NoColor = true },
+                    "--version" => o with { ShowVersion = true },
                     "-h" or "--help" or "-?" => o with { ShowHelp = true },
                     "--dac" => o with { DacPath = Value() },
                     "--keep-dump" => o with { KeepDump = Value() },
