@@ -27,7 +27,11 @@ public sealed record Finding
     public SourceLocation? Location { get; init; }
 }
 
-public sealed record AnalysisReport(ProcessSnapshot Snapshot, IReadOnlyList<Finding> Findings);
+public sealed record AnalysisReport(ProcessSnapshot Snapshot, IReadOnlyList<Finding> Findings)
+{
+    /// Names of detectors that threw; their findings are missing, so "nothing found" cannot be trusted.
+    public IReadOnlyList<string> FailedDetectors { get; init; } = [];
+}
 
 public interface IDetector
 {

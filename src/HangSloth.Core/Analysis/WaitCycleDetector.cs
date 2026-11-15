@@ -14,8 +14,11 @@ internal static class WaitGraph
     public static Dictionary<int, WaitEdge> Build(ProcessSnapshot snapshot)
     {
         var edges = new Dictionary<int, WaitEdge>();
-        var locks = snapshot.Locks.ToDictionary(l => l.Object.Address);
-        var runningTask = snapshot.Threads.Where(t => t.RunningTask is not null).ToDictionary(t => t.RunningTask!.Value, t => t.ManagedId);
+        var locks = new Dictionary<ulong, MonitorLock>();
+        foreach (var l in snapshot.Locks) locks.TryAdd(l.Object.Address, l);
+        var runningTask = new Dictionary<ulong, int>();
+        foreach (var t in snapshot.Threads)
+            if (t.RunningTask is { } task) runningTask.TryAdd(task, t.ManagedId);
 
         foreach (var t in snapshot.Threads)
         {

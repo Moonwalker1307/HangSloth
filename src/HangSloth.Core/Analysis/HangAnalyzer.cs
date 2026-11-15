@@ -35,13 +35,28 @@ public sealed class HangAnalyzer
     {
         var claimed = new HashSet<int>();
         var findings = new List<Finding>();
+        var failed = new List<string>();
+        var warnings = new List<string>();
         foreach (var detector in _detectors)
         {
-            var found = detector.Detect(snapshot, claimed).ToList();
+            List<Finding> found;
+            try
+            {
+                found = detector.Detect(snapshot, claimed).ToList();
+            }
+            catch (Exception e)
+            {
+                // One broken check must not lose what the others found.
+                var name = detector.GetType().Name;
+                failed.Add(name);
+                warnings.Add($"The {name} check failed ({e.GetType().Name}: {e.Message.ReplaceLineEndings(" ")}); the other checks are not affected.");
+                continue;
+            }
             findings.AddRange(found);
             foreach (var f in found.Where(f => f.Severity >= Severity.Warning))
                 claimed.UnionWith(f.ThreadIds);
         }
-        return new AnalysisReport(snapshot, findings.OrderByDescending(f => f.Severity).ToList());
+        if (warnings.Count > 0) snapshot = snapshot with { Warnings = [.. snapshot.Warnings, .. warnings] };
+        return new AnalysisReport(snapshot, findings.OrderByDescending(f => f.Severity).ToList()) { FailedDetectors = failed };
     }
 }
