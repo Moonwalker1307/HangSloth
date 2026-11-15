@@ -20,9 +20,12 @@ public sealed class HangAnalyzer
             new SemaphoreDeadlockDetector(),
             new BoundedQueueDeadlockDetector(),
             new MonitorWaitDetector(),
+            new HttpDetector(),
+            new ProcessPipeDetector(),
             new ThreadPoolStarvationDetector(),
             new DatabaseWaitDetector(),
             new LockContentionDetector(),
+            new DatabaseReadDetector(),
             new SemaphoreWaitDetector(),
             new BlockedOnTaskDetector(),
         ];

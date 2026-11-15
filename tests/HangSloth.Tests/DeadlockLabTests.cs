@@ -5,8 +5,10 @@ using HangSloth.Analysis;
 namespace HangSloth.Tests;
 
 /// Runs every samples/DeadlockLab scenario, dumps it, and checks that HangSloth reports the findings the
-/// scenario declares (and, for the healthy controls, nothing). Database scenarios need PostgreSQL
-/// (DEADLOCKLAB_PG, default localhost:5432) and are skipped without it, unless HANGSLOTH_REQUIRE_DB=1.
+/// scenario declares (and, for the healthy controls, nothing). Database scenarios need PostgreSQL and the
+/// sqlserver-* ones SQL Server: a connection string from DEADLOCKLAB_PG / DEADLOCKLAB_SQLSERVER, a server on the
+/// default local port, or a container started with Testcontainers. Without any, they're skipped, unless
+/// HANGSLOTH_REQUIRE_DB=1 / HANGSLOTH_REQUIRE_SQLSERVER=1.
 [Trait("Category", "EndToEnd")]
 [Collection("EndToEnd")]
 public class DeadlockLabTests
@@ -15,14 +17,18 @@ public class DeadlockLabTests
     [
         "transfer", "dining-philosophers", "event-callback", "library-sync-over-async", "semaphore-order", "async-semaphore-reentry",
         "rwlock-vs-lock", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose",
-        "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse", "healthy",
+        "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse",
+        "http-connection-limit", "http-no-response", "timer-overlap", "cancellation-dispose", "finalizer-wait", "child-process-pipe", "healthy",
     ];
 
     public static TheoryData<string> DatabaseScenarios =>
     [
         "db-forgotten-transaction", "db-deadlock-retry", "db-app-lock-cycle", "db-pool-exhaustion", "db-async-row-lock",
-        "db-migration-lock", "db-advisory-lock", "db-starvation", "db-async-pool-exhaustion", "db-healthy",
+        "db-migration-lock", "db-advisory-lock", "db-starvation", "db-async-pool-exhaustion",
+        "ef-row-lock", "ef-nested-context", "db-large-select", "db-select-blocks-alter", "db-select-for-update", "db-healthy",
     ];
+
+    public static TheoryData<string> SqlServerScenarios => ["sqlserver-lock-escalation", "sqlserver-read-blocked"];
 
     /// Phrases the explanation must contain: names of the app's own locks, methods and SQL, not just the right finding id.
     private static readonly Dictionary<string, string[]> Mentions = new()
@@ -53,6 +59,19 @@ public class DeadlockLabTests
         ["db-advisory-lock"] = ["`SELECT pg_advisory_lock(4242)`", "NightlyJob._leaderConnection", "locktype = 'advisory'"],
         ["db-starvation"] = ["ReportsController.GetCount", "`SELECT count(*) FROM lab_reports, pg_sleep(30)`"],
         ["db-async-pool-exhaustion"] = ["3 of 3 connections in use", "AsyncCheckoutHandler.WriteAuditAsync", "AsyncCheckoutHandler.HandleAsync"],
+        ["http-connection-limit"] = ["CatalogApi.GetProductPageAsync keeps an earlier HttpResponseMessage", "allows 2 connections (MaxConnectionsPerServer)", "/reviews/"],
+        ["http-no-response"] = ["`POST http://127.0.0.1:", "/charges`", "Timeout = Infinite"],
+        ["timer-overlap"] = ["the same timer callback (InventorySync.SyncNow)", "PeriodicTimer"],
+        ["cancellation-dispose"] = ["Download._stateLock", "disposing a CancellationTokenRegistration in Download.Complete", "Unregister()"],
+        ["finalizer-wait"] = ["HandleLog.Sync", "(finalizer)", "NativeBuffer.Finalize", "GC.WaitForPendingFinalizers"],
+        ["child-process-pipe"] = ["DeadlockLab", "--spew", "standard output is redirected", "ReadToEnd"],
+        ["ef-row-lock"] = ["`UPDATE lab_ef_orders SET status = @p0 WHERE id = @p1;`", "has an open transaction", "OrderApproval.Approve"],
+        ["ef-nested-context"] = ["2 of 2 connections in use", "EfAudit.Log", "Database.UseTransaction"],
+        ["db-large-select"] = ["EventReportCache._cacheLock", "rows so far", "`SELECT id, kind FROM lab_page_events`"],
+        ["db-select-blocks-alter"] = ["queued behind the ALTER", "`ALTER TABLE lab_events ADD COLUMN source text`", "EventExport.Export"],
+        ["db-select-for-update"] = ["FOR UPDATE", "SKIP LOCKED", "InvoiceBatch.Run"],
+        ["sqlserver-lock-escalation"] = ["REPEATABLE READ", "escalat", "MonthEndReport.Run"],
+        ["sqlserver-read-blocked"] = ["READ_COMMITTED_SNAPSHOT", "StockAdjustment.Adjust"],
         ["db-async-row-lock"] = ["AsyncRefundService.RefundAsync", "`UPDATE lab_async_wallets SET balance = balance + 5 WHERE id = 1`"],
     };
 
@@ -60,7 +79,7 @@ public class DeadlockLabTests
     public void Every_scenario_is_covered()
     {
         var listed = Lab.Expected.Keys.Order().ToList();
-        var tested = ((IEnumerable<object[]>)CodeScenarios).Concat(DatabaseScenarios).Select(row => (string)row[0]).Order().ToList();
+        var tested = ((IEnumerable<object[]>)CodeScenarios).Concat(DatabaseScenarios).Concat(SqlServerScenarios).Select(row => (string)row[0]).Order().ToList();
         Assert.Equal(listed, tested);
     }
 
@@ -73,6 +92,14 @@ public class DeadlockLabTests
     public void Database_scenario(string scenario)
     {
         Skip.IfNot(Lab.PostgresAvailable, "PostgreSQL isn't reachable; set DEADLOCKLAB_PG to run the database scenarios.");
+        Check(scenario);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(SqlServerScenarios))]
+    public void SqlServer_scenario(string scenario)
+    {
+        Skip.IfNot(Lab.SqlServerAvailable, "SQL Server isn't reachable and no container could be started; set DEADLOCKLAB_SQLSERVER to run these.");
         Check(scenario);
     }
 
@@ -105,24 +132,64 @@ internal static class Lab
         .Select(line => line.Split('\t'))
         .ToDictionary(cols => cols[0], cols => cols[3] == "-" ? [] : cols[3].Split(','));
 
-    public static bool PostgresAvailable { get; } = CheckPostgres();
+    // Kept alive for the whole test run (declared first: static fields initialize in order); Testcontainers' reaper removes them when the process exits.
+    private static readonly List<DotNet.Testcontainers.Containers.IDatabaseContainer> Containers = [];
 
-    private static bool CheckPostgres()
+    /// PostgreSQL for the database scenarios: DEADLOCKLAB_PG if set, else localhost:5432 if something listens
+    /// there, else a throwaway container started with Testcontainers (Linux and macOS with Docker only).
+    public static bool PostgresAvailable { get; } = Provide(
+        "DEADLOCKLAB_PG", "PostgreSQL", defaultPort: 5432, "HANGSLOTH_REQUIRE_DB",
+        () => new Testcontainers.PostgreSql.PostgreSqlBuilder("postgres:16-alpine").Build());
+
+    /// SQL Server for the sqlserver-* scenarios, found the same way (DEADLOCKLAB_SQLSERVER, localhost:1433, container).
+    public static bool SqlServerAvailable { get; } = Provide(
+        "DEADLOCKLAB_SQLSERVER", "SQL Server", defaultPort: 1433, "HANGSLOTH_REQUIRE_SQLSERVER",
+        () => new Testcontainers.MsSql.MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest").Build());
+
+    private static bool Provide(string variable, string name, int defaultPort, string requireVariable,
+        Func<DotNet.Testcontainers.Containers.IDatabaseContainer> container)
     {
-        var cs = Environment.GetEnvironmentVariable("DEADLOCKLAB_PG") ?? "Host=localhost";
-        var host = Regex.Match(cs, @"(?:^|;)\s*(?:Host|Server)\s*=\s*([^;,]+)", RegexOptions.IgnoreCase) is { Success: true } h ? h.Groups[1].Value.Trim() : "localhost";
-        var port = Regex.Match(cs, @"(?:^|;)\s*Port\s*=\s*(\d+)", RegexOptions.IgnoreCase) is { Success: true } p ? int.Parse(p.Groups[1].Value) : 5432;
+        var configured = Environment.GetEnvironmentVariable(variable);
+        if (configured is not null ? Reachable(configured, defaultPort) : Reachable("Host=localhost", defaultPort)) return true;
+
+        string? problem = configured is not null ? $"{name} isn't reachable at the address in {variable}." : null;
+        if (problem is null && OperatingSystem.IsWindows())
+            problem = $"{name} isn't running on localhost and Testcontainers needs Linux containers, which Windows runners don't have.";
+        if (problem is null)
+        {
+            try
+            {
+                var db = container();
+                db.StartAsync().GetAwaiter().GetResult();
+                Containers.Add(db);
+                // The lab processes inherit this, so they talk to the container.
+                Environment.SetEnvironmentVariable(variable, db.GetConnectionString());
+                return true;
+            }
+            catch (Exception ex)
+            {
+                problem = $"{name} isn't running on localhost and a container couldn't be started ({ex.GetType().Name}: {ex.Message.Split('\n')[0]}).";
+            }
+        }
+        if (Environment.GetEnvironmentVariable(requireVariable) == "1")
+            throw new InvalidOperationException($"{requireVariable}=1 but {problem}");
+        return false;
+    }
+
+    private static bool Reachable(string cs, int defaultPort)
+    {
+        var host = Regex.Match(cs, @"(?:^|;)\s*(?:Host|Server|Data Source)\s*=\s*(?:tcp:)?([^;,]+)", RegexOptions.IgnoreCase) is { Success: true } h ? h.Groups[1].Value.Trim() : "localhost";
+        var port = Regex.Match(cs, @"(?:^|;)\s*Port\s*=\s*(\d+)", RegexOptions.IgnoreCase) is { Success: true } p ? int.Parse(p.Groups[1].Value)
+            : Regex.Match(cs, @"(?:Server|Data Source)\s*=\s*[^;,]+,(\d+)", RegexOptions.IgnoreCase) is { Success: true } sp ? int.Parse(sp.Groups[1].Value)
+            : defaultPort;
         try
         {
             using var client = new TcpClient();
-            if (client.ConnectAsync(host, port).Wait(TimeSpan.FromSeconds(2)) && client.Connected) return true;
+            return client.ConnectAsync(host, port).Wait(TimeSpan.FromSeconds(2)) && client.Connected;
         }
         catch
         {
-            // Fall through.
+            return false;
         }
-        if (Environment.GetEnvironmentVariable("HANGSLOTH_REQUIRE_DB") == "1")
-            throw new InvalidOperationException($"HANGSLOTH_REQUIRE_DB=1 but PostgreSQL isn't reachable at {host}:{port}.");
-        return false;
     }
 }

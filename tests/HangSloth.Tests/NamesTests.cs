@@ -11,6 +11,8 @@ public class NamesTests
     [InlineData("HangApp.OrderService+<GetOrderAsync>d__0", "OrderService.GetOrderAsync")]
     [InlineData("A.B.Outer+Inner+<RunAsync>d__12", "Outer.Inner.RunAsync")]
     [InlineData("A.Generic`1+<DoAsync>d__3<System.Int32>", "Generic`1.DoAsync")]
+    [InlineData("System.Net.Http.HttpClient+<<SendAsync>g__Core|83_0>d", "HttpClient.SendAsync")]
+    [InlineData("MyApp.Jobs+<>c__DisplayClass0_0+<<Run>b__0>d", "Jobs.Run (lambda)")]
     public void State_machine_names_become_method_names(string typeName, string expected) =>
         Assert.Equal(expected, Names.ShortMethod(typeName, ""));
 

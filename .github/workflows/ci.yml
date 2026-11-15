@@ -19,38 +19,15 @@ jobs:
           dotnet-version: |
             10.0.x
       - run: dotnet build -c Release
+      # The DeadlockLab database scenarios start PostgreSQL and SQL Server with Testcontainers. Linux runners
+      # have Docker, so there they must run; Windows runners can't run Linux containers and skip them.
       - run: dotnet test -c Release --no-build --logger "console;verbosity=normal"
+        env:
+          HANGSLOTH_REQUIRE_DB: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
+          HANGSLOTH_REQUIRE_SQLSERVER: ${{ matrix.os == 'ubuntu-latest' && '1' || '0' }}
       - run: dotnet pack src/HangSloth.Cli -c Release --no-build -o artifacts
       - uses: actions/upload-artifact@v4
         if: matrix.os == 'ubuntu-latest'
         with:
           name: nupkg
           path: artifacts/*.nupkg
-
-  # The DeadlockLab database scenarios need a real PostgreSQL. Service containers only run on
-  # Linux runners, so they get their own job; elsewhere those tests are skipped.
-  database-scenarios:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 15
-    env:
-      DEADLOCKLAB_PG: Host=localhost;Username=postgres;Password=postgres;Database=postgres
-      HANGSLOTH_REQUIRE_DB: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: |
-            10.0.x
-      - run: dotnet build -c Release
-      - run: dotnet test -c Release --no-build --filter "FullyQualifiedName~DeadlockLabTests.Database_scenario" --logger "console;verbosity=normal"

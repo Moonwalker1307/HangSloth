@@ -34,7 +34,7 @@ public sealed class ThreadPoolStarvationDetector : IDetector
             : $"{top.Count()} of them in {top.Key.Call} at {top.Key.Site}";
 
         var summary = $"Thread pool starvation: {blocked.Count} of {workers.Count} thread pool threads are blocked ({where})";
-        summary += queued > 0 ? $", and {Describe.Plural(queued.Value, "work item")} are waiting in the queue." : ".";
+        summary += queued > 0 ? $", and {Describe.Plural(queued.Value, "work item is", "work items are")} waiting in the queue." : ".";
 
         var details = new List<string>();
         foreach (var g in groups.Take(5))
@@ -57,6 +57,15 @@ public sealed class ThreadPoolStarvationDetector : IDetector
                 ? $"The pool is at its maximum of {pool.MaxThreads} threads, so it cannot add more. Nothing can run until a blocked thread is released."
                 : $"The pool has {pool.ActiveWorkers} active workers (minimum {pool.MinThreads}). Above the minimum it only adds about one thread per second, so requests pile up.");
         }
+        // A periodic timer whose callback outlasts its period: each tick takes another pool thread.
+        var timerCallbacks = blocked.Where(x => FrameClassifier.TimerCallback(x.Thread.Frames) is not null)
+            .GroupBy(x => FrameClassifier.TimerCallback(x.Thread.Frames) is { } f ? Names.ShortMethod(f.TypeName, f.MethodName) : "")
+            .OrderByDescending(g => g.Count())
+            .FirstOrDefault();
+        var timer = timerCallbacks is not null && timerCallbacks.Count() >= MinimumBlockedThreads - 1;
+        if (timer)
+            details.Add($"{timerCallbacks!.Count()} of the blocked threads are running the same timer callback ({timerCallbacks.Key}). A System.Threading.Timer doesn't wait for the previous callback: " +
+                        "when the callback takes longer than the period, every tick takes another thread pool thread.");
         if (blocked.Any(x => x.Kind == BlockingKind.TaskWait))
             details.Add("Threads blocked on .Result/.Wait() are usually waiting for a task whose continuation needs a free thread pool thread to finish, which is exactly what's missing.");
 
@@ -68,7 +77,10 @@ public sealed class ThreadPoolStarvationDetector : IDetector
             Title = "Thread pool starvation",
             Summary = summary,
             Details = details,
-            Advice = top.Key.Call.StartsWith('.') || top.Key.Call.StartsWith("Task.", StringComparison.Ordinal)
+            Advice = timer
+                ? $"Make the timer callback ({timerCallbacks!.Key}) non-overlapping: use a one-shot timer re-armed at the end of the callback (timer.Change(period, Timeout.Infinite)), " +
+                  "a PeriodicTimer loop, or skip the tick when the previous one is still running (Monitor.TryEnter / Interlocked). And keep slow work out of the lock."
+                : top.Key.Call.StartsWith('.') || top.Key.Call.StartsWith("Task.", StringComparison.Ordinal)
                 ? $"Stop blocking on async code in thread pool work: await instead of {top.Key.Call} in {top.Key.Site}. Raising ThreadPool.SetMinThreads only hides the problem."
                 : $"Avoid blocking thread pool threads ({top.Key.Call} at {top.Key.Site}); move long blocking work to a dedicated thread or make it async.",
             ThreadIds = blocked.Select(x => x.Thread.ManagedId).ToList(),
@@ -86,6 +98,9 @@ public sealed class ThreadPoolStarvationDetector : IDetector
         BlockingKind.WaitHandle => "WaitHandle.WaitOne",
         BlockingKind.ReaderWriterLock => "ReaderWriterLockSlim",
         BlockingKind.TypeInitializer => "a static constructor",
+        BlockingKind.Finalizers => "GC.WaitForPendingFinalizers",
+        BlockingKind.CancellationCallback => "CancellationTokenRegistration.Dispose",
+        BlockingKind.ProcessExit => "Process.WaitForExit",
         BlockingKind.Database => "a database call",
         BlockingKind.ConnectionPool => "the connection pool",
         _ => kind.ToString(),

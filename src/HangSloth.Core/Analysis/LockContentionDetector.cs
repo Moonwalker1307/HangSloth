@@ -14,7 +14,7 @@ public sealed class LockContentionDetector : IDetector
 
             var owner = l.OwnerThreadId is { } id ? snapshot.FindThread(id) : null;
             var ownerKind = owner is null ? BlockingKind.None : FrameClassifier.Classify(owner.Frames);
-            var ownerBlocked = FrameClassifier.IsBlocked(ownerKind);
+            var ownerBlocked = FrameClassifier.IsBlocked(ownerKind) || owner?.Database?.Waiting == DatabaseWaitKind.ReadingRows;
 
             var who = waiters.Count == 1 ? snapshot.FindThread(waiters[0])!.Label : $"{waiters.Count} threads are";
             var verb = waiters.Count == 1 ? " is" : "";
@@ -56,7 +56,10 @@ public sealed class LockContentionDetector : IDetector
                 Title = owner is null ? "Orphaned lock" : "Threads blocked behind a lock",
                 Summary = summary,
                 Details = details,
-                Advice = ownerBlocked
+                Advice = owner?.Database?.Waiting == DatabaseWaitKind.ReadingRows
+                    ? $"Don't read a big query result while holding {l.DisplayName}: load the rows into a local without the lock, then swap the reference in under the lock. " +
+                      "Better still, read only what you need (WHERE, LIMIT, paging) or aggregate in SQL."
+                    : ownerBlocked
                     ? "Don't do slow or blocking work while holding a lock: copy what you need, release the lock, then do the slow part."
                     : "Keep the work inside this lock short, or use a finer-grained or reader/writer lock.",
                 ThreadIds = owner is null ? waiters : [owner.ManagedId, .. waiters],

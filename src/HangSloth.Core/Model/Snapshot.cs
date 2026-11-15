@@ -60,6 +60,12 @@ public sealed record ThreadSnapshot
     /// The thread whose SynchronizationContext it is has to run the callback before this one can continue.
     public ObjectRef? SendingTo { get; init; }
 
+    /// A CancellationTokenRegistration.Dispose (or Unregister) waiting for its callback, which this thread is running.
+    public int? WaitingForCallbackOnThread { get; init; }
+
+    /// A Process this thread is waiting for (WaitForExit), if any.
+    public ProcessWait? WaitingForProcess { get; init; }
+
     /// The task whose delegate this thread is currently running (a Task.Run body), if any.
     public ulong? RunningTask { get; init; }
 
@@ -67,7 +73,7 @@ public sealed record ThreadSnapshot
     /// and the connections (and open transactions) reachable from its stack.
     public DatabaseActivity? Database { get; init; }
 
-    public string Label => Name is { Length: > 0 } ? $"Thread {ManagedId} (\"{Name}\")" : $"Thread {ManagedId}";
+    public string Label => Name is { Length: > 0 } ? $"Thread {ManagedId} (\"{Name}\")" : IsFinalizer ? $"Thread {ManagedId} (finalizer)" : $"Thread {ManagedId}";
 }
 
 public sealed record StackFrameInfo
@@ -138,7 +144,22 @@ public sealed record TaskInfo
 
     /// For a database library's async command method: the SQL it is running.
     public string? CommandText { get; init; }
+
+    /// For HttpClient's async methods: the request being sent, and the client's timeout.
+    public HttpCall? Http { get; init; }
+
+    /// For HttpConnectionPool's async methods: the pool the request is waiting in.
+    public HttpPoolInfo? HttpPool { get; init; }
+
+    /// An app async method that keeps an HttpResponseMessage in a local: the response (and its connection,
+    /// until the body is read or the response disposed) stays in use while the method waits.
+    public bool HoldsHttpResponse { get; init; }
 }
+
+/// <param name="Timeout">The HttpClient's Timeout; null when infinite or unknown.</param>
+public sealed record HttpCall(string Method, string Uri, TimeSpan? Timeout, bool InfiniteTimeout);
+
+public sealed record HttpPoolInfo(string Server, int MaxConnections, int OpenConnections);
 
 public enum ResumeStatus
 {
@@ -178,6 +199,9 @@ public sealed record MonitorLock
     public int Recursion { get; init; }
     public IReadOnlyList<int> WaiterThreadIds { get; init; } = [];
 }
+
+/// <param name="UnreadOutput">Redirected streams (standard output, standard error) that nothing has started reading.</param>
+public sealed record ProcessWait(int ProcessId, string CommandLine, IReadOnlyList<string> UnreadOutput);
 
 /// A thread in Monitor.Wait(obj), waiting for another thread to call Monitor.Pulse(obj).
 public sealed record PulseWait
@@ -241,6 +265,8 @@ public enum DatabaseWaitKind
     Query,
     /// Waiting for a free connection from the connection pool.
     ConnectionPool,
+    /// Reading the rows of a result (DbDataReader.Read): the query is answering, but the result is big or slow.
+    ReadingRows,
 }
 
 public sealed record DatabaseActivity
@@ -260,6 +286,19 @@ public sealed record DatabaseActivity
 
     /// For ConnectionPool waits: the pool being waited on.
     public ConnectionPoolInfo? Pool { get; init; }
+
+    /// The SQL of a data reader that is still open on this thread's stack, even while the thread does something else.
+    /// An open reader keeps its statement running, with its locks.
+    public string? OpenQuery { get; init; }
+
+    /// For ReadingRows: rows collected so far, from the biggest list on the reading code's stack.
+    public int? RowsRead { get; init; }
+
+    /// The isolation level of a transaction object on this thread's stack ("RepeatableRead", "Serializable"...), when known.
+    public string? Isolation { get; init; }
+
+    /// SQL of the commands on this thread's stack that aren't running now (what an open transaction already did).
+    public IReadOnlyList<string> StackCommands { get; init; } = [];
 }
 
 /// <param name="Field">Set when the connection was found in a field of an object on the stack

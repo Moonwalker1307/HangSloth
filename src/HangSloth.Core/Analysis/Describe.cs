@@ -24,6 +24,9 @@ internal static class Describe
     {
         var kind = FrameClassifier.Classify(thread.Frames);
         var at = withMethod ? Where(FrameClassifier.BestUserFrame(thread.Frames)) : Spot(FrameClassifier.BestUserFrame(thread.Frames));
+        if (thread.Database is { Waiting: DatabaseWaitKind.ReadingRows } reading)
+            return $"reading the rows of {Sql(reading.CommandText)} from {reading.Provider}" +
+                   (reading.RowsRead is { } rows ? $" ({rows:N0} rows so far)" : "") + $" in {at}";
         if (thread.WaitingOnCollection is { } c)
             return $"waiting to {(c.Adding ? "add to" : "take from")} {c.DisplayName} ({(c.Adding ? "full" : "empty")} BlockingCollection) in {at}";
         return kind switch
@@ -41,6 +44,9 @@ internal static class Describe
             BlockingKind.TypeInitializer => $"waiting for another thread's static constructor in {at}",
             BlockingKind.Database => $"waiting for the database in {at}",
             BlockingKind.ConnectionPool => $"waiting for a database connection from the pool in {at}",
+            BlockingKind.Finalizers => $"waiting for the finalizer thread (GC.WaitForPendingFinalizers) in {at}",
+            BlockingKind.CancellationCallback => $"waiting for a running cancellation callback (CancellationTokenRegistration.Dispose) in {at}",
+            BlockingKind.ProcessExit => $"waiting for a child process to exit in {at}",
             _ => $"running {at}",
         };
     }
