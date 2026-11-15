@@ -8,6 +8,7 @@ namespace HangSloth.Tests;
 /// scenario declares (and, for the healthy controls, nothing). Database scenarios need PostgreSQL
 /// (DEADLOCKLAB_PG, default localhost:5432) and are skipped without it, unless HANGSLOTH_REQUIRE_DB=1.
 [Trait("Category", "EndToEnd")]
+[Collection("EndToEnd")]
 public class DeadlockLabTests
 {
     public static TheoryData<string> CodeScenarios =>

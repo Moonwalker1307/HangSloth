@@ -8,6 +8,7 @@ namespace HangSloth.Tests;
 /// Runs the real HangApp sample in each hang mode, captures a dump of it, and checks
 /// that HangSloth explains it correctly, including source lines from the PDBs.
 [Trait("Category", "EndToEnd")]
+[Collection("EndToEnd")]
 public class EndToEndTests
 {
     [Fact]
