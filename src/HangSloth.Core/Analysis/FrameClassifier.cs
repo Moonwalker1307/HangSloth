@@ -27,6 +27,12 @@ public enum BlockingKind
     Database,
     /// Waiting for a free connection from a database connection pool.
     ConnectionPool,
+    /// GC.WaitForPendingFinalizers: waiting for the finalizer thread.
+    Finalizers,
+    /// Disposing a CancellationTokenRegistration whose callback is running on another thread.
+    CancellationCallback,
+    /// Process.WaitForExit.
+    ProcessExit,
 }
 
 public static class FrameClassifier
@@ -44,6 +50,10 @@ public static class FrameClassifier
         if (IsIdleInfrastructure(frames)) return BlockingKind.Idle;
         if (prefix.Any(IsTypeInitializerWait)) return BlockingKind.TypeInitializer;
         if (prefix.Any(IsMonitorEnter)) return BlockingKind.MonitorEnter;
+        if (prefix.Any(f => f.TypeName == "System.GC" && f.MethodName == "WaitForPendingFinalizers")) return BlockingKind.Finalizers;
+        if (prefix.Any(f => f.MethodName == "WaitForCallbackToComplete" && f.TypeName.StartsWith("System.Threading.CancellationTokenSource", StringComparison.Ordinal)))
+            return BlockingKind.CancellationCallback;
+        if (prefix.Any(f => f.TypeName == "System.Diagnostics.Process" && f.MethodName.StartsWith("WaitForExit", StringComparison.Ordinal))) return BlockingKind.ProcessExit;
         if (prefix.Any(f => f.TypeName == "System.Threading.ReaderWriterLockSlim")) return BlockingKind.ReaderWriterLock;
         if (prefix.Any(f => f.TypeName == "System.Threading.SemaphoreSlim" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.SemaphoreWait;
         if (prefix.Any(f => f.TypeName == "System.Threading.Monitor" && f.MethodName is "Wait" or "ObjWait")) return BlockingKind.MonitorWait;
@@ -77,6 +87,12 @@ public static class FrameClassifier
         }
         return null;
     }
+
+    /// The timer callback frame, when the thread is running a System.Threading.Timer callback.
+    public static StackFrameInfo? TimerCallback(IReadOnlyList<StackFrameInfo> frames) =>
+        frames.Any(f => f.TypeName.StartsWith("System.Threading.TimerQueueTimer", StringComparison.Ordinal) && f.MethodName is "Fire" or "CallCallback")
+            ? FirstUserFrame(frames)
+            : null;
 
     public static bool IsBlocked(BlockingKind kind) => kind is not (BlockingKind.None or BlockingKind.Idle);
 

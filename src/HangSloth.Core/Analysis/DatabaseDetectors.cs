@@ -160,7 +160,10 @@ public sealed class ConnectionPoolDetector : IDetector
             Details = details,
             Advice = holdAndWait.Count > 0
                 ? $"Don't open a second connection while holding one: in {Describe.WhereWithCaller(nested.Frames)}, reuse the caller's open connection (and transaction) instead, " +
-                  "or finish with the first connection before opening the next. A bigger pool only raises the number of concurrent requests it takes to hang."
+                  "or finish with the first connection before opening the next. A bigger pool only raises the number of concurrent requests it takes to hang." +
+                  (nested.Frames.Any(f => f.TypeName.StartsWith("Microsoft.EntityFrameworkCore.", StringComparison.Ordinal))
+                      ? " With EF Core, each DbContext opens its own connection: pass the caller's DbContext in, or create the second context on the same DbConnection and join its transaction with Database.UseTransaction(...)."
+                      : "")
                 : "Find what the connection holders are waiting for and keep connections open only for the database work itself.",
             ThreadIds = waiters.Concat(holding).Distinct().Select(t => t.ManagedId).ToList(),
             Location = site?.Source,

@@ -41,6 +41,9 @@ internal static class Describe
             BlockingKind.TypeInitializer => $"waiting for another thread's static constructor in {at}",
             BlockingKind.Database => $"waiting for the database in {at}",
             BlockingKind.ConnectionPool => $"waiting for a database connection from the pool in {at}",
+            BlockingKind.Finalizers => $"waiting for the finalizer thread (GC.WaitForPendingFinalizers) in {at}",
+            BlockingKind.CancellationCallback => $"waiting for a running cancellation callback (CancellationTokenRegistration.Dispose) in {at}",
+            BlockingKind.ProcessExit => $"waiting for a child process to exit in {at}",
             _ => $"running {at}",
         };
     }

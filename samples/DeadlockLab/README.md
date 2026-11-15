@@ -1,8 +1,9 @@
 # DeadlockLab
 
-A small, deliberately broken "shop" app with 29 ways to hang: textbook lock-ordering deadlocks, the
-hidden kind that hide in callbacks, libraries, initializers, semaphores, queues and UI dispatching, and
-deadlocks that involve a real PostgreSQL database. It's HangSloth's test bed: every scenario declares which finding HangSloth
+A small, deliberately broken "shop" app with 37 ways to hang: textbook lock-ordering deadlocks, the
+hidden kind that hide in callbacks, libraries, initializers, semaphores, queues, UI dispatching, HTTP
+clients, finalizers and child processes, and deadlocks that involve a real PostgreSQL database, with and
+without EF Core. It's HangSloth's test bed: every scenario declares which finding HangSloth
 should report, and the end-to-end tests (`tests/HangSloth.Tests/DeadlockLabTests.cs`) run them all.
 
 ```sh
@@ -39,6 +40,12 @@ Database scenarios need PostgreSQL. Set `DEADLOCKLAB_PG` to an Npgsql connection
 | `throttle-reentry` | hidden | A `SemaphoreSlim(3)` throttle: each call holds a slot and makes a nested call through the same throttle. Three concurrent calls use every slot. | `semaphore-wait` (Critical: every slot held by a nested waiter) |
 | `bounded-queue` | hidden | A publisher holds a lock while adding to a full `BlockingCollection`; the only consumer needs that lock before it takes the next item. | `bounded-queue-deadlock` |
 | `lost-pulse` | hidden | A hand-rolled queue pulses only when the consumer is already waiting; the item arrived first, so the consumer waits forever. | `monitor-wait`, noting the queue already holds an item |
+| `http-connection-limit` | hidden | `HttpClient` with `MaxConnectionsPerServer = 2`; each page request keeps its first response unread while it makes a second request to the same server. | `http-connection-limit`, naming the method that holds the response |
+| `http-no-response` | obvious | `.Result` on a POST to a payment gateway that accepted the connection and never answers, with `Timeout = Infinite`. | `http-wait`, with the method and URL |
+| `timer-overlap` | hidden | A timer fires every 100 ms; its callback holds a lock for seconds, so callbacks pile up until the thread pool is full. | `threadpool-starvation`, pointing at the overlapping timer callback |
+| `cancellation-dispose` | hidden | `CancellationTokenRegistration.Dispose` under a lock waits for the running callback, which waits for that lock. | `wait-cycle` (lock + cancellation callback) |
+| `finalizer-wait` | hidden | `GC.WaitForPendingFinalizers` under a lock that a finalizer takes. | `wait-cycle` (lock + finalizer thread) |
+| `child-process-pipe` | hidden | `WaitForExit` on a child with redirected, unread output; the child fills the pipe and blocks. | `process-pipe-deadlock`, with the child's command line and pid |
 | `healthy` | control | Short locks and a timer, nothing wrong. | nothing |
 | `db-forgotten-transaction` | obvious | One thread updates a row and waits for an approval without committing; another updates the same row. | `database-wait` naming the idle transaction and the blocked SQL |
 | `db-deadlock-retry` | obvious | Two transactions update two rows in opposite order; PostgreSQL aborts one, the app retries the same way. | `database-wait` (possible database deadlock) |
@@ -49,6 +56,8 @@ Database scenarios need PostgreSQL. Set `DEADLOCKLAB_PG` to an Npgsql connection
 | `db-advisory-lock` | hidden | A job takes a session-level `pg_advisory_lock`, never unlocks, and keeps the connection in a field; the next scheduler waits forever. No transaction involved. | `database-wait`, naming the idle connection in `NightlyJob._leaderConnection` |
 | `db-starvation` | obvious | Controller actions block on async database calls with `.Result`; requests hold every pool thread. | `threadpool-starvation`, with the SQL they wait for |
 | `db-async-pool-exhaustion` | hidden | The async version of the nested-connection pool deadlock: no thread is blocked on the database, every request awaits a second connection while holding one. | `connection-pool-exhausted`, found from the paused async methods on the heap |
+| `ef-row-lock` | hidden | EF Core: an approval saves an order in a transaction and waits for a fraud check; the warehouse's `SaveChanges` on the same order waits for the row lock. | `database-wait`, finding the open transaction inside EF Core's wrappers |
+| `ef-nested-context` | hidden | EF Core: a checkout holds a `DbContext` transaction and logs through a second `DbContext`; three checkouts, two pooled connections. | `connection-pool-exhausted`, with EF-specific advice |
 | `db-healthy` | control | An idle app with an open pooled connection. | nothing |
 
 A database deadlock that stays inside the database (`db-deadlock-retry`) is detected by the database
@@ -59,7 +68,7 @@ the server (`pg_blocking_pids`).
 ## Before and after
 
 When the lab was written, HangSloth explained 7 of the first 19 scenarios, and after the first round
-of fixes, 4 of the 10 added later. Most misses were reported as plain
+of fixes, 4 of the 10 added in the second round, and 2 of the 8 in the third. Most misses were reported as plain
 lock contention ("held by Thread 1, which is blocked on .Wait()"), which is true but doesn't say
 it's a deadlock, or not at all (semaphores, static constructors, everything involving the database).
-It now explains all 29. The changes are described in the pull requests that added the scenarios.
+It now explains all 37. The changes are described in the pull requests that added the scenarios.

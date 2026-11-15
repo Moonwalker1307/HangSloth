@@ -267,3 +267,95 @@ public class ThrottleTests
         Assert.Contains(f.Details, d => d.StartsWith("PartnerApi._throttle has 3 slots and 3 async callers waiting for one."));
     }
 }
+
+public class ThirdBatchTests
+{
+    [Fact]
+    public void Disposing_a_registration_whose_callback_waits_for_our_lock()
+    {
+        var snapshot = Process(
+            Thread(4, [Fx("System.Threading.Thread", "Sleep"), Fx("System.Threading.CancellationTokenSource+Registrations", "WaitForCallbackToComplete"),
+                       App("MyApp.Download", "Complete", "Download.cs", 24)], "complete") with { WaitingForCallbackOnThread = 5 },
+            Thread(5, [.. MonitorEnter, App("MyApp.Download+<>c__DisplayClass3_0", "<Start>b__0", "Download.cs", 15),
+                       Fx("System.Threading.CancellationTokenSource", "ExecuteCallbackHandlers")], "cancel") with { WaitingForLock = 0x100 }) with
+        {
+            Locks = [new MonitorLock { Object = new ObjectRef(0x100, "System.Object"), FieldName = "Download._stateLock", OwnerThreadId = 4, WaiterThreadIds = [5] }],
+        };
+
+        Assert.Equal(BlockingKind.CancellationCallback, FrameClassifier.Classify(snapshot.Threads[0].Frames));
+        var f = Assert.Single(new WaitCycleDetector().Detect(snapshot, new HashSet<int>()));
+        Assert.Equal("Deadlock: unregistering a cancellation callback that is waiting for you", f.Title);
+        Assert.Contains(f.Details, d => d == "Thread 4 (\"complete\") holds the lock on Download._stateLock and is disposing a CancellationTokenRegistration in Download.Complete (Download.cs:24), which waits for its callback to finish running on Thread 5 (\"cancel\").");
+    }
+
+    [Fact]
+    public void Waiting_for_finalizers_while_holding_a_lock_a_finalizer_needs()
+    {
+        var snapshot = Process(
+            Thread(1, [Fx("System.GC", "WaitForPendingFinalizers"), App("MyApp.Cleanup", "Run", "Cleanup.cs", 29)]),
+            Thread(2, [.. MonitorEnter, App("MyApp.NativeBuffer", "Finalize", "NativeBuffer.cs", 15), Fx("System.GC", "RunFinalizers")]) with { IsFinalizer = true, WaitingForLock = 0x100 }) with
+        {
+            Locks = [new MonitorLock { Object = new ObjectRef(0x100, "System.Object"), FieldName = "HandleLog.Sync", OwnerThreadId = 1, WaiterThreadIds = [2] }],
+        };
+
+        var f = Assert.Single(new WaitCycleDetector().Detect(snapshot, new HashSet<int>()));
+        Assert.Equal("Deadlock: waiting for finalizers while holding a lock a finalizer needs", f.Title);
+        Assert.StartsWith("Thread 1 and Thread 2 (finalizer) are waiting for each other", f.Summary);
+    }
+
+    [Fact]
+    public void Waiting_for_a_child_process_with_unread_output()
+    {
+        var snapshot = Process(Thread(1, [Fx("System.Threading.WaitHandle", "WaitOneNoCheck"), Fx("System.Diagnostics.Process", "WaitForExit"), App("MyApp.Exporter", "Export", "Exporter.cs", 20)])
+            with { WaitingForProcess = new ProcessWait(1234, "report-gen --all", ["standard output"]) });
+
+        var f = Assert.Single(new ProcessPipeDetector().Detect(snapshot, new HashSet<int>()));
+        Assert.Equal("process-pipe-deadlock", f.Id);
+        Assert.StartsWith("Thread 1 is waiting in Exporter.Export (Exporter.cs:20) for `report-gen --all` (pid 1234) to exit, but its standard output is redirected", f.Summary);
+        Assert.Empty(new ProcessPipeDetector().Detect(snapshot with { Threads = [snapshot.Threads[0] with { WaitingForProcess = new ProcessWait(1234, "x", []) }] }, new HashSet<int>()));
+    }
+
+    private static TaskInfo HttpChain(TaskInfo leaf, HttpPoolInfo? pool = null, bool holds = false, bool infinite = true)
+    {
+        var poolTask = new TaskInfo { Address = 0x30, TypeName = "Box<System.Net.Http.HttpConnectionPool+<SendAsync>d>", Kind = TaskKind.AsyncMethod, Description = "HttpConnectionPool.SendAsync", HttpPool = pool, Awaiting = leaf };
+        var client = new TaskInfo
+        {
+            Address = 0x20, TypeName = "Box<System.Net.Http.HttpClient+<SendAsync>d>", Kind = TaskKind.AsyncMethod, Description = "HttpClient.SendAsync",
+            Http = new HttpCall("GET", "http://api/reviews/1", infinite ? null : TimeSpan.FromSeconds(100), infinite), Awaiting = poolTask,
+        };
+        return new TaskInfo
+        {
+            Address = 0x10, TypeName = "System.Runtime.CompilerServices.AsyncTaskMethodBuilder+AsyncStateMachineBox<MyApp.Catalog+<GetPageAsync>d__2>",
+            Kind = TaskKind.AsyncMethod, Description = "Catalog.GetPageAsync", HoldsHttpResponse = holds, Awaiting = client,
+        };
+    }
+
+    [Fact]
+    public void Http_calls_holding_a_response_while_waiting_for_a_connection()
+    {
+        var waitingForConnection = new TaskInfo { Address = 0x40, TypeName = "System.Threading.Tasks.Task<System.Net.Http.HttpConnection>", Kind = TaskKind.Promise, Description = "a TaskCompletionSource<HttpConnection> task" };
+        var snapshot = Process(Thread(1, [.. ResultWait, App("MyApp.Program", "Main", "Program.cs", 5)]) with
+            { BlockedOnTask = HttpChain(waitingForConnection, new HttpPoolInfo("api:80", 2, 2), holds: true) });
+
+        var f = Assert.Single(new HttpDetector().Detect(snapshot, new HashSet<int>()));
+        Assert.Equal("http-connection-limit", f.Id);
+        Assert.Equal(Severity.Critical, f.Severity);
+        Assert.Contains(f.Details, d => d.StartsWith("Catalog.GetPageAsync keeps an earlier HttpResponseMessage in a local"));
+    }
+
+    [Fact]
+    public void Http_call_waiting_for_a_response_without_a_timeout()
+    {
+        var reading = new TaskInfo { Address = 0x40, TypeName = "Box<System.Net.Http.HttpConnection+<InitialFillAsync>d>", Kind = TaskKind.AsyncMethod, Description = "HttpConnection.InitialFillAsync" };
+        var snapshot = Process(Thread(1, [.. ResultWait, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = HttpChain(reading) });
+
+        var f = Assert.Single(new HttpDetector().Detect(snapshot, new HashSet<int>()));
+        Assert.Equal("http-wait", f.Id);
+        Assert.Equal(Severity.Warning, f.Severity);
+        Assert.Contains("`GET http://api/reviews/1`", f.Summary);
+        Assert.Contains("Timeout = Infinite", f.Summary);
+
+        var withTimeout = Process(Thread(1, [.. ResultWait, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = HttpChain(reading, infinite: false) });
+        Assert.Equal(Severity.Info, Assert.Single(new HttpDetector().Detect(withTimeout, new HashSet<int>())).Severity);
+    }
+}

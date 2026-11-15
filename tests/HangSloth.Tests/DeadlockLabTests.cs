@@ -15,13 +15,15 @@ public class DeadlockLabTests
     [
         "transfer", "dining-philosophers", "event-callback", "library-sync-over-async", "semaphore-order", "async-semaphore-reentry",
         "rwlock-vs-lock", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose",
-        "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse", "healthy",
+        "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse",
+        "http-connection-limit", "http-no-response", "timer-overlap", "cancellation-dispose", "finalizer-wait", "child-process-pipe", "healthy",
     ];
 
     public static TheoryData<string> DatabaseScenarios =>
     [
         "db-forgotten-transaction", "db-deadlock-retry", "db-app-lock-cycle", "db-pool-exhaustion", "db-async-row-lock",
-        "db-migration-lock", "db-advisory-lock", "db-starvation", "db-async-pool-exhaustion", "db-healthy",
+        "db-migration-lock", "db-advisory-lock", "db-starvation", "db-async-pool-exhaustion",
+        "ef-row-lock", "ef-nested-context", "db-healthy",
     ];
 
     /// Phrases the explanation must contain: names of the app's own locks, methods and SQL, not just the right finding id.
@@ -53,6 +55,14 @@ public class DeadlockLabTests
         ["db-advisory-lock"] = ["`SELECT pg_advisory_lock(4242)`", "NightlyJob._leaderConnection", "locktype = 'advisory'"],
         ["db-starvation"] = ["ReportsController.GetCount", "`SELECT count(*) FROM lab_reports, pg_sleep(30)`"],
         ["db-async-pool-exhaustion"] = ["3 of 3 connections in use", "AsyncCheckoutHandler.WriteAuditAsync", "AsyncCheckoutHandler.HandleAsync"],
+        ["http-connection-limit"] = ["CatalogApi.GetProductPageAsync keeps an earlier HttpResponseMessage", "allows 2 connections (MaxConnectionsPerServer)", "/reviews/"],
+        ["http-no-response"] = ["`POST http://127.0.0.1:", "/charges`", "Timeout = Infinite"],
+        ["timer-overlap"] = ["the same timer callback (InventorySync.SyncNow)", "PeriodicTimer"],
+        ["cancellation-dispose"] = ["Download._stateLock", "disposing a CancellationTokenRegistration in Download.Complete", "Unregister()"],
+        ["finalizer-wait"] = ["HandleLog.Sync", "(finalizer)", "NativeBuffer.Finalize", "GC.WaitForPendingFinalizers"],
+        ["child-process-pipe"] = ["DeadlockLab", "--spew", "standard output is redirected", "ReadToEnd"],
+        ["ef-row-lock"] = ["`UPDATE lab_ef_orders SET status = @p0 WHERE id = @p1;`", "has an open transaction", "OrderApproval.Approve"],
+        ["ef-nested-context"] = ["2 of 2 connections in use", "EfAudit.Log", "Database.UseTransaction"],
         ["db-async-row-lock"] = ["AsyncRefundService.RefundAsync", "`UPDATE lab_async_wallets SET balance = balance + 5 WHERE id = 1`"],
     };
 

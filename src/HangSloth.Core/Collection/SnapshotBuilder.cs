@@ -80,6 +80,8 @@ public sealed partial class SnapshotBuilder
             {
                 RunningTask = FindRunningTask(roots),
                 SendingTo = FindSendTarget(roots),
+                WaitingForCallbackOnThread = FindCallbackThread(roots, snapshot.Frames, clr.ManagedThreadId),
+                WaitingForProcess = FindProcessWait(roots, snapshot.Frames),
                 Database = ReadDatabaseActivity(roots, BlockingKind.None),
             };
             var kind = FrameClassifier.Classify(snapshot.Frames);
@@ -329,7 +331,22 @@ public sealed partial class SnapshotBuilder
                 return DescribeTask(obj, 0, []);
             fallback ??= obj;
         }
-        return fallback is { } f ? DescribeTask(f, 0, []) : null;
+        if (fallback is { } f) return DescribeTask(f, 0, []);
+
+        // Task.WaitAll / WaitAny take an array: report its first pending task.
+        foreach (var root in roots)
+        {
+            var obj = root.Object;
+            if (obj.IsNull || obj.Type?.IsArray != true || !IsTask(obj.Type.ComponentType)) continue;
+            var array = obj.AsArray();
+            for (var i = 0; i < Math.Min(array.Length, 1000); i++)
+            {
+                var element = array.GetObjectValue(i);
+                if (!element.IsNull && IsTask(element.Type) && ReadTaskState(element) == TaskState.Pending)
+                    return DescribeTask(element, 0, []);
+            }
+        }
+        return null;
     }
 
     private TaskInfo DescribeTask(ClrObject task, int depth, HashSet<ulong> visited)
@@ -395,14 +412,21 @@ public sealed partial class SnapshotBuilder
         if (smType?.Name is { } exactName)
             info = info with { Description = Names.ShortMethod(exactName, "") };
 
+        ClrObject self = default;
         if (smType?.GetFieldByName("<>4__this") is { IsObjectReference: true } thisField)
         {
-            var self = stateMachine.ReadObject(thisField);
+            self = stateMachine.ReadObject(thisField);
             if (!self.IsNull)
             {
                 _asyncThisObjects.Add(self);
-                info = info with { ThisAddress = self.Address, CommandText = DatabaseCommandText(self) };
+                info = info with { ThisAddress = self.Address, CommandText = DatabaseCommandText(self), HttpPool = ReadHttpPool(self) };
             }
+        }
+        if (smType is not null)
+        {
+            info = info with { Http = ReadHttpCall(stateMachine, smType, self) };
+            if (Describe.IsAppAsyncMethod(info))
+                info = info with { HoldsHttpResponse = HoldsHttpResponse(stateMachine, smType) };
         }
 
         var state = stateMachine.ReadInt("<>1__state");

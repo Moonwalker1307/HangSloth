@@ -2,7 +2,7 @@ using HangSloth.Model;
 
 namespace HangSloth.Analysis;
 
-internal enum WaitKind { Lock, Task, Join, TypeInitializer, Send }
+internal enum WaitKind { Lock, Task, Join, TypeInitializer, Send, Callback, Finalizer }
 
 /// One thread waiting for another: for a lock it owns, a task it is running, for it to exit,
 /// for a static constructor it is running, or to run a callback Sent to its SynchronizationContext.
@@ -37,6 +37,15 @@ internal static class WaitGraph
                      && snapshot.Threads.FirstOrDefault(o => o.ManagedId != t.ManagedId && o.SynchronizationContext?.Address == context.Address) is { } owner2)
             {
                 edges[t.ManagedId] = new WaitEdge(t.ManagedId, owner2.ManagedId, WaitKind.Send, TypeName: context.TypeName);
+            }
+            else if (t.WaitingForCallbackOnThread is { } runner && snapshot.FindThread(runner) is not null)
+            {
+                edges[t.ManagedId] = new WaitEdge(t.ManagedId, runner, WaitKind.Callback);
+            }
+            else if (FrameClassifier.Classify(t.Frames) == BlockingKind.Finalizers
+                     && snapshot.Threads.FirstOrDefault(o => o.IsFinalizer && o.ManagedId != t.ManagedId) is { } finalizer)
+            {
+                edges[t.ManagedId] = new WaitEdge(t.ManagedId, finalizer.ManagedId, WaitKind.Finalizer);
             }
             else if (FrameClassifier.Classify(t.Frames) == BlockingKind.TypeInitializer && FindInitializer(snapshot, t) is var (initializer, type))
             {
@@ -104,7 +113,7 @@ public sealed class WaitCycleDetector : IDetector
     private static List<int> Rotate(List<int> cycle, Dictionary<int, WaitEdge> edges)
     {
         var first = cycle.FindIndex(id => edges.Values.Any(e => e.Kind == WaitKind.TypeInitializer && e.To == id));
-        if (first < 0) first = cycle.FindIndex(id => edges[id].Kind is WaitKind.Task or WaitKind.Join);
+        if (first < 0) first = cycle.FindIndex(id => edges[id].Kind is WaitKind.Task or WaitKind.Join or WaitKind.Callback or WaitKind.Finalizer);
         return first <= 0 ? cycle : [.. cycle[first..], .. cycle[..first]];
     }
 
@@ -114,6 +123,8 @@ public sealed class WaitCycleDetector : IDetector
         var kinds = cycle.Select(id => edges[id].Kind).ToHashSet();
         var typeInit = cycle.Select(id => edges[id]).FirstOrDefault(e => e.Kind == WaitKind.TypeInitializer);
         var send = cycle.Select(id => edges[id]).FirstOrDefault(e => e.Kind == WaitKind.Send);
+        var callback = kinds.Contains(WaitKind.Callback);
+        var finalizerWait = cycle.Select(id => edges[id]).FirstOrDefault(e => e.Kind == WaitKind.Finalizer);
         var parallel = cycle.Select(id => edges[id].Task).Any(t => t?.Description.StartsWith("a Parallel.", StringComparison.Ordinal) == true);
         var lazy = cycle.Select(id => edges[id].Lock).FirstOrDefault(l => l?.DisplayName.Contains("Lazy<", StringComparison.Ordinal) == true);
 
@@ -140,6 +151,8 @@ public sealed class WaitCycleDetector : IDetector
             id = "wait-cycle";
             title = lazy is not null ? "Deadlock: Lazy<T> factory waiting for code that needs the same Lazy<T>"
                 : send is not null ? $"Deadlock: {snapshot.FindThread(send.To)!.Label} waits for work that is waiting for it"
+                : finalizerWait is not null ? "Deadlock: waiting for finalizers while holding a lock a finalizer needs"
+                : callback ? "Deadlock: unregistering a cancellation callback that is waiting for you"
                 : parallel ? "Deadlock: Parallel loop body needs a lock its caller holds"
                 : "Deadlock: threads waiting on each other";
             summary = (threads.Count == 2
@@ -151,6 +164,12 @@ public sealed class WaitCycleDetector : IDetector
                 : send is not null
                     ? $"{snapshot.FindThread(send.To)!.Label} owns the {Names.ShortType(send.TypeName!)} and is blocked, so the callback Sent to it (Send, Control.Invoke, Dispatcher.Invoke) can never run. " +
                       "Don't block a thread with a SynchronizationContext (a UI thread) on work that calls back into it: await the work instead of Wait()/.Result, or use Post/BeginInvoke for the callback."
+                : finalizerWait is not null
+                    ? "GC.WaitForPendingFinalizers waits for every queued finalizer, on the single finalizer thread, and one of them needs a lock this thread holds. " +
+                      "Don't call it while holding locks, and keep finalizers free of locks and shared state (use SafeHandle instead of a finalizer where you can)."
+                : callback
+                    ? "CancellationTokenRegistration.Dispose (and CancellationTokenSource.Dispose of a linked source) waits for the callback if it is running right now. " +
+                      "Don't dispose the registration while holding a lock the callback takes: dispose it outside the lock, or use registration.Unregister(), which doesn't wait."
                 : parallel
                     ? "Parallel.For/ForEach runs the loop body on other threads, so a lock the caller holds isn't reentrant for them. Don't hold a lock around a parallel loop whose body takes it: " +
                       "release it first, or collect results without the lock and apply them afterwards."
@@ -202,6 +221,8 @@ public sealed class WaitCycleDetector : IDetector
             WaitKind.Lock => $"{t.Label} {holds}is waiting in {where} for {Describe.Wanted(edge.Lock!)}, which {other} holds.",
             WaitKind.Task => $"{t.Label} {holds}is blocked in {FrameClassifier.DescribeTaskWait(t.Frames)} at {where}, waiting for {Describe.Task(edge.Task!)}, which is running on {other}.",
             WaitKind.Join => $"{t.Label} {holds}is waiting in {where} for {other} to finish (Thread.Join).",
+            WaitKind.Callback => $"{t.Label} {holds}is disposing a CancellationTokenRegistration in {where}, which waits for its callback to finish running on {other}.",
+            WaitKind.Finalizer => $"{t.Label} {holds}is waiting in {where} for {other} to finish running finalizers (GC.WaitForPendingFinalizers).",
             WaitKind.Send => $"{t.Label} {holds}is blocked in {Names.ShortType(edge.TypeName!)}.Send, called from {Describe.Where(SendCaller(t, edge))}, waiting for {other} to run the callback, since that SynchronizationContext belongs to {other}.",
             _ => $"{t.Label} {holds}needs {(edge.TypeName is { } type ? Names.ShortType(type) : "a type")} in {where}, so it waits for its static constructor, which {other} is running.",
         };

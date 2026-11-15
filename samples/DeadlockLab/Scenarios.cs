@@ -1,5 +1,6 @@
 using DeadlockLab.Code;
 using DeadlockLab.Database;
+using DeadlockLab.Http;
 
 namespace DeadlockLab;
 
@@ -96,6 +97,30 @@ public static class Scenarios
             "A hand-rolled queue pulses only when the consumer is already waiting; the item arrived first, so the consumer waits forever.",
             ["monitor-wait"], LostPulseScenario.Run),
 
+        new("http-connection-limit", Area.Code, Difficulty.Hidden,
+            "An HttpClient allows 2 connections per server. Each page request keeps its first response unread while it makes a second request to the same server.",
+            ["http-connection-limit"], HttpConnectionLimitScenario.Run),
+
+        new("http-no-response", Area.Code, Difficulty.Obvious,
+            "Checkout calls a payment gateway with .Result and no timeout; the gateway accepted the connection and never answers.",
+            ["http-wait"], HttpNoResponseScenario.Run),
+
+        new("timer-overlap", Area.Code, Difficulty.Hidden,
+            "A timer fires every 100 ms but its callback holds a lock for seconds. Callbacks don't wait for each other, so they pile up behind the lock until the thread pool is full.",
+            ["threadpool-starvation"], TimerOverlapScenario.Run),
+
+        new("cancellation-dispose", Area.Code, Difficulty.Hidden,
+            "Disposing a CancellationTokenRegistration waits for its callback if it's running. The callback needs a lock that the disposing code holds.",
+            ["wait-cycle"], CancellationDisposeScenario.Run),
+
+        new("finalizer-wait", Area.Code, Difficulty.Hidden,
+            "A cleanup job holds a logger's lock and calls GC.WaitForPendingFinalizers; a finalizer logs through the same logger.",
+            ["wait-cycle"], FinalizerWaitScenario.Run),
+
+        new("child-process-pipe", Area.Code, Difficulty.Hidden,
+            "The app redirects a child process's output and waits for it to exit before reading it. The child fills the pipe and waits for the parent to read.",
+            ["process-pipe-deadlock"], ChildProcessScenario.Run),
+
         new("healthy", Area.Code, Difficulty.Obvious,
             "Control: background workers ticking along with short locks and a timer. Nothing is wrong.",
             [], HealthyScenario.Run),
@@ -136,6 +161,14 @@ public static class Scenarios
         new("db-async-pool-exhaustion", Area.Database, Difficulty.Hidden,
             "The async version of the nested-connection pool deadlock: every request awaits a second connection while holding one. No thread is blocked except the one waiting for all of them.",
             ["connection-pool-exhausted"], AsyncPoolExhaustionScenario.Run),
+
+        new("ef-row-lock", Area.Database, Difficulty.Hidden,
+            "EF Core: approving an order saves it inside a transaction and then waits for a fraud check before committing; the warehouse's SaveChanges on the same order waits for the row lock.",
+            ["database-wait"], EfRowLockScenario.Run),
+
+        new("ef-nested-context", Area.Database, Difficulty.Hidden,
+            "EF Core: a checkout holds a DbContext transaction and logs through an audit service that creates its own DbContext. Three checkouts, two pooled connections.",
+            ["connection-pool-exhausted"], EfNestedContextScenario.Run),
 
         new("db-healthy", Area.Database, Difficulty.Obvious,
             "Control: an idle app with a warm connection pool. Nothing is wrong.",

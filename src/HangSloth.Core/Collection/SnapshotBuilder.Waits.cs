@@ -224,6 +224,7 @@ public sealed partial class SnapshotBuilder
             if (obj.IsNull || !seen.Add(obj.Address)) continue;
             if (DerivesFrom(obj.Type, "System.Data.Common.DbCommand")) commands.Add(obj);
             else if (DerivesFrom(obj.Type, "System.Data.Common.DbConnection")) connections.Add(obj);
+            else if (EfConnection(obj) is { } wrapped && seen.Add(wrapped.Address)) connections.Add(wrapped);
         }
 
         // A connection kept in a field of the app's own objects (a "leader" connection, a cached one) is
@@ -265,6 +266,19 @@ public sealed partial class SnapshotBuilder
             Connections = open,
             Pool = waiting == DatabaseWaitKind.ConnectionPool ? connections.Select(ReadPool).FirstOrDefault(p => p is not null) : null,
         };
+    }
+
+    /// EF Core keeps the ADO.NET connection inside its own wrappers: a RelationalTransaction (what
+    /// BeginTransaction returns) points at a RelationalConnection, which holds the DbConnection.
+    private static ClrObject? EfConnection(ClrObject obj)
+    {
+        if (obj.Type?.Name?.StartsWith("Microsoft.EntityFrameworkCore.", StringComparison.Ordinal) != true
+            && obj.Type?.Name?.Contains(".EntityFrameworkCore.", StringComparison.Ordinal) != true) return null;
+        var relational = obj;
+        if (DerivesFrom(obj.Type, "Microsoft.EntityFrameworkCore.Storage.RelationalTransaction")
+            && !(obj.TryReadObjectField("<Connection>k__BackingField", out relational) && !relational.IsNull)) return null;
+        if (!DerivesFrom(relational.Type, "Microsoft.EntityFrameworkCore.Storage.RelationalConnection")) return null;
+        return relational.TryReadObjectField("_connection", out var connection) && !connection.IsNull ? connection : null;
     }
 
     private static DatabaseConnection? ReadConnection(ClrObject connection)

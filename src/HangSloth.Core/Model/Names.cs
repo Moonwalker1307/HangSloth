@@ -23,9 +23,20 @@ public static partial class Names
             method = m.Groups["method"].Value;
             return true;
         }
+        // An async local function or lambda: "HttpClient+<<SendAsync>g__Core|83_0>d" belongs to SendAsync.
+        var nested = NestedStateMachineRegex().Match(typeName);
+        if (nested.Success)
+        {
+            ownerType = nested.Groups["owner"].Value;
+            method = nested.Groups["kind"].Value == "b" ? $"{nested.Groups["outer"].Value} (lambda)" : nested.Groups["outer"].Value;
+            return true;
+        }
         ownerType = method = "";
         return false;
     }
+
+    [GeneratedRegex(@"^(?<owner>.+?)\+<<(?<outer>[^>]+)>(?<kind>[bg])__[^>]*>d(__\d+)?(`\d+)?(<.*>)?$")]
+    private static partial Regex NestedStateMachineRegex();
 
     /// Drops namespaces, keeps nesting and generic arguments short: "System.Threading.Tasks.Task<HangApp.Order>" -> "Task<Order>".
     public static string ShortType(string typeName)
@@ -59,7 +70,7 @@ public static partial class Names
         // Generic method instantiations ("Start[[Npgsql.Foo+<Bar>d__1, Npgsql]]") say nothing a reader needs.
         if (method.IndexOf("[[", StringComparison.Ordinal) is var generic and > 0) method = method[..generic];
         if (TryParseStateMachine(typeName, out var owner, out var asyncMethod))
-            return $"{ShortType(owner)}.{asyncMethod}";
+            return $"{ShortType(DisplayClassRegex().Replace(owner, ""))}.{asyncMethod}";
         var lambda = LambdaRegex().Match(method);
         if (lambda.Success)
             method = $"{lambda.Groups["outer"].Value} (lambda)";

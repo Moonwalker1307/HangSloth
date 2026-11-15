@@ -17,6 +17,12 @@ if (args is ["--list"])
     return 0;
 }
 
+if (args is ["--spew"])
+{
+    DeadlockLab.Code.ReportExporter.Spew(); // the child process of the child-process-pipe scenario
+    return 0;
+}
+
 var scenario = args.Length == 1 ? Scenarios.All.FirstOrDefault(s => s.Name == args[0]) : null;
 if (scenario is null)
 {

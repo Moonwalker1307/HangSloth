@@ -60,6 +60,12 @@ public sealed record ThreadSnapshot
     /// The thread whose SynchronizationContext it is has to run the callback before this one can continue.
     public ObjectRef? SendingTo { get; init; }
 
+    /// A CancellationTokenRegistration.Dispose (or Unregister) waiting for its callback, which this thread is running.
+    public int? WaitingForCallbackOnThread { get; init; }
+
+    /// A Process this thread is waiting for (WaitForExit), if any.
+    public ProcessWait? WaitingForProcess { get; init; }
+
     /// The task whose delegate this thread is currently running (a Task.Run body), if any.
     public ulong? RunningTask { get; init; }
 
@@ -67,7 +73,7 @@ public sealed record ThreadSnapshot
     /// and the connections (and open transactions) reachable from its stack.
     public DatabaseActivity? Database { get; init; }
 
-    public string Label => Name is { Length: > 0 } ? $"Thread {ManagedId} (\"{Name}\")" : $"Thread {ManagedId}";
+    public string Label => Name is { Length: > 0 } ? $"Thread {ManagedId} (\"{Name}\")" : IsFinalizer ? $"Thread {ManagedId} (finalizer)" : $"Thread {ManagedId}";
 }
 
 public sealed record StackFrameInfo
@@ -138,7 +144,22 @@ public sealed record TaskInfo
 
     /// For a database library's async command method: the SQL it is running.
     public string? CommandText { get; init; }
+
+    /// For HttpClient's async methods: the request being sent, and the client's timeout.
+    public HttpCall? Http { get; init; }
+
+    /// For HttpConnectionPool's async methods: the pool the request is waiting in.
+    public HttpPoolInfo? HttpPool { get; init; }
+
+    /// An app async method that keeps an HttpResponseMessage in a local: the response (and its connection,
+    /// until the body is read or the response disposed) stays in use while the method waits.
+    public bool HoldsHttpResponse { get; init; }
 }
+
+/// <param name="Timeout">The HttpClient's Timeout; null when infinite or unknown.</param>
+public sealed record HttpCall(string Method, string Uri, TimeSpan? Timeout, bool InfiniteTimeout);
+
+public sealed record HttpPoolInfo(string Server, int MaxConnections, int OpenConnections);
 
 public enum ResumeStatus
 {
@@ -178,6 +199,9 @@ public sealed record MonitorLock
     public int Recursion { get; init; }
     public IReadOnlyList<int> WaiterThreadIds { get; init; } = [];
 }
+
+/// <param name="UnreadOutput">Redirected streams (standard output, standard error) that nothing has started reading.</param>
+public sealed record ProcessWait(int ProcessId, string CommandLine, IReadOnlyList<string> UnreadOutput);
 
 /// A thread in Monitor.Wait(obj), waiting for another thread to call Monitor.Pulse(obj).
 public sealed record PulseWait
