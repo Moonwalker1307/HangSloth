@@ -56,6 +56,8 @@ public static partial class Names
     /// "HangApp.OrderService" + "GetOrderAsync" -> "OrderService.GetOrderAsync"
     public static string ShortMethod(string typeName, string method)
     {
+        // Generic method instantiations ("Start[[Npgsql.Foo+<Bar>d__1, Npgsql]]") say nothing a reader needs.
+        if (method.IndexOf("[[", StringComparison.Ordinal) is var generic and > 0) method = method[..generic];
         if (TryParseStateMachine(typeName, out var owner, out var asyncMethod))
             return $"{ShortType(owner)}.{asyncMethod}";
         var lambda = LambdaRegex().Match(method);

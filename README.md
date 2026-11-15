@@ -39,7 +39,10 @@ Stacks of the threads involved
 | Pattern | What HangSloth tells you |
 |---|---|
 | **Sync-over-async deadlock** | A thread blocks with `.Result` / `.Wait()` / `.GetAwaiter().GetResult()` on a task whose continuation needs that same thread's `SynchronizationContext` (WinForms, WPF, classic ASP.NET, custom pumps). It follows the await chain to the method that's stuck and the line it's paused at. |
-| **Lock deadlock** | Two or more threads each holding a lock the next one wants (`lock`/`Monitor` and .NET 9's `System.Threading.Lock`). Locks are named after the field that holds them, e.g. `Billing._ledger`. |
+| **Lock deadlock** | Two or more threads each holding a lock the next one wants (`lock`/`Monitor`, .NET 9's `System.Threading.Lock`, and `ReaderWriterLockSlim` write locks). Locks are named after the field that holds them, e.g. `Billing._ledger`, and after their object when that's what differs, e.g. `Account.Sync (Id = "alice")`. |
+| **Mixed wait cycles** | Threads waiting on each other through different kinds of waits: a lock holder blocked on a `Task.Run` (or `Thread.Join`) that needs the lock, a `Lazy<T>` factory waiting for work that reads the same `Lazy<T>`, a static constructor waiting for a thread that needs the type. |
+| **SemaphoreSlim deadlocks** | Two `SemaphoreSlim(1, 1)` "locks" taken in opposite order, and async code waiting in `WaitAsync` for a semaphore it already holds further up the same await chain. |
+| **Database waits** | Threads waiting on SQL (PostgreSQL via Npgsql; SQL Server, MySQL and others by their driver frames), with the SQL text and server session: a query blocked by another thread's idle open transaction, transactions that look deadlocked inside the database, a deadlock between an app lock and a database row lock that neither side can see, and a connection pool exhausted by nested connections. |
 | **Lock contention** | Threads piling up behind one lock, and what the owner is doing while holding it (sleeping, waiting on a task, waiting for another lock). Also orphaned locks whose owner is gone. |
 | **Thread pool starvation** | Most pool threads blocked (typically sync-over-async in ASP.NET Core), how many work items are queued, and whether the pool is at its maximum. |
 | **Task nobody completes** | A thread waiting on an async chain that ends in a `TaskCompletionSource` nobody has completed, a long `Task.Delay`, or a still-running `Task.Run`. |
@@ -89,6 +92,8 @@ hangsloth $!
 
 Modes: `sync-over-async`, `deadlock`, `contention`, `starvation`, `never-completes`, `healthy`, `lock-type-deadlock`.
 
+For harder cases, [`samples/DeadlockLab`](samples/DeadlockLab) is a shop app with 19 deadlocks, from textbook lock ordering to hidden ones in callbacks, static constructors, `Lazy<T>`, semaphores and a real PostgreSQL database. `scripts/try-deadlock-lab.sh` runs every scenario and prints what HangSloth found next to what it should find.
+
 To check it on code written by someone else, `scripts/try-diagnostic-scenarios.sh` builds Microsoft's [DiagnosticScenarios sample](https://learn.microsoft.com/en-us/samples/dotnet/samples/diagnostic-scenarios/) (the app from the official [deadlock](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/debug-deadlock) and [thread pool starvation](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/debug-threadpool-starvation) tutorials) in a temp folder, puts each scenario under load, and runs HangSloth on it. `taskasyncwait` is the healthy control and should report nothing.
 
 ## How it works
@@ -100,13 +105,16 @@ dump / pid ──► ClrMD ──► SnapshotBuilder ──► ProcessSnapshot �
 
 - **`HangSloth.Core/Collection`** reads the dump with [ClrMD](https://github.com/microsoft/clrmd) and gathers facts: every thread's stack with file:line, held monitors and who is trying to enter them, each thread's `SynchronizationContext`, the task a blocked thread is waiting on and the async chain behind it (state machine state, awaited task, and where its continuation is registered or already queued), plus thread pool counters and queue length.
 - **`HangSloth.Core/Analysis`** holds the detectors. They only read the snapshot, so each is unit-tested with hand-built snapshots. They run from most to least specific; a thread explained by one finding isn't reported again by a more generic one.
-- **`tests/`** has unit tests for every detector and end-to-end tests that run `samples/HangApp` in each mode, dump it, and check the explanation word for word, in Release and Debug builds.
+- **`tests/`** has unit tests for every detector and end-to-end tests that run `samples/HangApp` in each mode and every `samples/DeadlockLab` scenario, dump them, and check the explanation. The DeadlockLab database scenarios need PostgreSQL (`DEADLOCKLAB_PG`) and are skipped without it.
 
 ## Limitations
 
 - .NET Core 3.1+ / .NET 5+ only (no .NET Framework yet).
 - One dump is one moment. A thread that is merely slow can look stuck; if in doubt, take two dumps a few seconds apart.
-- `ValueTask`-based awaits from custom `IValueTaskSource`s, `SemaphoreSlim.WaitAsync` chains and `ReaderWriterLockSlim` aren't followed yet.
+- `ValueTask`-based awaits from custom `IValueTaskSource`s aren't followed yet.
+- `SemaphoreSlim` and `ReaderWriterLockSlim` read locks have no recorded owner, so deadlocks through them are inferred ("most likely"), not proven.
+- For database waits HangSloth sees only the app's side. It names the blocked SQL, the sessions and any idle open transaction, and gives the query to confirm it on the server; it doesn't query the database itself. Transaction and pool details are read from Npgsql; other drivers get the SQL text only.
+- Waiting on a `WaitHandle` (e.g. `Timer.Dispose(WaitHandle)`) can't be linked to the thread that would signal it, so those cycles show up as lock contention with a hint.
 
 ## License
 

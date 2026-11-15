@@ -18,6 +18,12 @@ public sealed class BlockedOnTaskDetector : IDetector
             var call = FrameClassifier.DescribeTaskWait(thread.Frames);
             var site = FrameClassifier.BestUserFrame(thread.Frames);
 
+            if (leaf.Kind == TaskKind.SemaphoreWait)
+            {
+                yield return SemaphoreWait(snapshot, thread, chain, call, site);
+                continue;
+            }
+
             var leafText = leaf.Kind switch
             {
                 TaskKind.Promise => $"{leaf.Description} that nothing has completed yet",
@@ -46,5 +52,48 @@ public sealed class BlockedOnTaskDetector : IDetector
                 Location = site?.Source,
             };
         }
+    }
+
+    private static string Path(List<TaskInfo> chain, string leafText) =>
+        chain.Count == 1
+            ? leafText
+            : $"{Describe.Task(chain[0])}" + string.Concat(chain.Skip(1).SkipLast(1).Select(t => $", which awaits {Describe.Task(t)}")) + $", which {leafText}";
+
+    /// An async chain parked in SemaphoreSlim.WaitAsync, often because something further up the same
+    /// chain already holds that semaphore (SemaphoreSlim isn't reentrant).
+    private static Finding SemaphoreWait(ProcessSnapshot snapshot, ThreadSnapshot thread, List<TaskInfo> chain, string call, StackFrameInfo? site)
+    {
+        var semaphore = chain[^1].Semaphore is { } a ? snapshot.FindSemaphore(a) : null;
+        var name = semaphore?.DisplayName ?? "a SemaphoreSlim";
+        var slots = semaphore is null ? "" : $", {SemaphoreFacts.Slots(semaphore)}";
+        var waiting = chain.Count >= 2 ? chain[^2] : null;
+        var leafText = chain.Count == 1 ? $"SemaphoreSlim.WaitAsync() on {name}{slots}" : $"is waiting to enter {name} (SemaphoreSlim.WaitAsync(){slots})";
+
+        var details = new List<string>();
+        var sameOwner = semaphore?.ContainerAddress is { } owner && waiting is not null
+            ? chain.SkipLast(2).Where(t => t.ThisAddress == owner).ToList()
+            : [];
+        if (sameOwner.Count > 0)
+        {
+            details.Add($"{Describe.JoinAnd(sameOwner.Select(t => t.Description))}, earlier in this same async chain, runs on the same object that owns {name}. " +
+                        $"If it took {name} before calling {waiting!.Description}, the chain is waiting for itself: SemaphoreSlim isn't reentrant, so the second WaitAsync never completes.");
+        }
+        if (semaphore is not null) details.Add(SemaphoreFacts.NoOwner(semaphore));
+
+        return new Finding
+        {
+            Id = "semaphore-wait",
+            // Paused past its own WaitAsync and waiting on the same one-slot semaphore: as good as proof.
+            Severity = sameOwner.Count > 0 && semaphore is { MaxCount: 1, CurrentCount: 0 } ? Severity.Critical : Severity.Warning,
+            Title = sameOwner.Count > 0 ? "Deadlock: async code waiting for a SemaphoreSlim it already holds" : "Waiting for a SemaphoreSlim nobody releases",
+            Summary = $"{thread.Label} is blocked in {call} at {Describe.Spot(site)}, waiting for {Path(chain, leafText)}.",
+            Details = details,
+            Advice = sameOwner.Count > 0
+                ? $"Don't take {name} twice on one call path: give {waiting!.Description} a variant that expects the semaphore to be held already, or release it before calling. " +
+                  "A WaitAsync timeout turns this hang into an error you can see."
+                : $"Find the code that took {name} and make sure it calls Release() on every path (try/finally), and that it isn't waiting for this chain while holding it.",
+            ThreadIds = [thread.ManagedId],
+            Location = site?.Source,
+        };
     }
 }

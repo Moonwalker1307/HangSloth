@@ -42,6 +42,10 @@ public sealed class LockDeadlockDetector : IDetector
         return null;
     }
 
+    /// "Account.Sync (Id = "alice")" -> "Account.Sync".
+    private static string? BaseName(string? field) =>
+        field is not null && field.IndexOf(" (", StringComparison.Ordinal) is var p and > 0 ? field[..p] : field;
+
     private static Finding Explain(ProcessSnapshot snapshot, List<int> cycle, Dictionary<int, (int Owner, MonitorLock Lock)> waitsFor)
     {
         var threads = cycle.Select(id => snapshot.FindThread(id)!).ToList();
@@ -49,10 +53,10 @@ public sealed class LockDeadlockDetector : IDetector
         foreach (var t in threads)
         {
             var (owner, wanted) = waitsFor[t.ManagedId];
-            var held = snapshot.Locks.Where(l => l.OwnerThreadId == t.ManagedId).Select(l => l.DisplayName).ToList();
-            var holds = held.Count == 0 ? "" : $"holds the lock on {Describe.JoinAnd(held)} and ";
+            var held = snapshot.Locks.Where(l => l.OwnerThreadId == t.ManagedId).Select(Describe.Held).ToList();
+            var holds = held.Count == 0 ? "" : $"holds {Describe.JoinAnd(held)} and ";
             details.Add($"{t.Label} {holds}is waiting in {Describe.Where(FrameClassifier.BestUserFrame(t.Frames))} " +
-                        $"for the lock on {wanted.DisplayName}, which {snapshot.FindThread(owner)?.Label ?? $"thread {owner}"} holds.");
+                        $"for {Describe.Wanted(wanted)}, which {snapshot.FindThread(owner)?.Label ?? $"thread {owner}"} holds.");
         }
 
         var labels = threads.Select(t => t.Label).ToList();
@@ -61,7 +65,13 @@ public sealed class LockDeadlockDetector : IDetector
             : $"{Describe.JoinAnd(labels)} are waiting for each other's locks in a circle, so none of them can ever continue.";
 
         var order = cycle.Select(id => waitsFor[id].Lock.DisplayName).Distinct().ToList();
+        var fields = cycle.Select(id => BaseName(waitsFor[id].Lock.FieldName)).Distinct().ToList();
         var first = FrameClassifier.BestUserFrame(threads[0].Frames);
+        var advice = fields is [{ } sameField] && order.Count > 1
+            ? $"These are all {sameField}, on different objects, taken in a different order by each thread (typically a transfer from A to B racing one from B to A). " +
+              "Lock the objects in one fixed order everywhere, for example sorted by id, or protect the whole operation with a single lock."
+            : $"Take these locks in one consistent order everywhere ({string.Join(" before ", order.AsEnumerable().Reverse())} or the reverse, but always the same), " +
+              "or avoid acquiring a second lock while holding the first.";
         return new Finding
         {
             Id = "lock-deadlock",
@@ -69,8 +79,7 @@ public sealed class LockDeadlockDetector : IDetector
             Title = "Deadlock: threads waiting on each other's locks",
             Summary = summary + (first?.Source is null ? "" : $" Start at {first.Source}."),
             Details = details,
-            Advice = $"Take these locks in one consistent order everywhere ({string.Join(" before ", order.AsEnumerable().Reverse())} or the reverse, but always the same), " +
-                     "or avoid acquiring a second lock while holding the first.",
+            Advice = advice,
             ThreadIds = cycle,
             Location = first?.Source,
         };

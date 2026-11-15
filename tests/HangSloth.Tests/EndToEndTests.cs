@@ -94,16 +94,19 @@ public class EndToEndTests
 internal static class SampleApp
 {
     private static readonly ConcurrentDictionary<string, Lazy<string>> Builds = new();
-    public static AnalysisReport Analyze(string mode, string configuration = "Release")
+    /// <param name="until">For timing-dependent scenarios: dump again (up to 3 times) until the report satisfies this.</param>
+    public static AnalysisReport Analyze(string mode, string configuration = "Release", string project = "HangApp", Func<AnalysisReport, bool>? until = null)
     {
-        var app = Builds.GetOrAdd(configuration, _ => new Lazy<string>(() => Build(configuration))).Value;
+        var app = Build(project, configuration);
         var dump = Path.Combine(Path.GetTempPath(), $"hangsloth-test-{mode}-{Guid.NewGuid():N}.dmp");
 
         using var process = Process.Start(new ProcessStartInfo("dotnet", [app, mode])
         {
             RedirectStandardOutput = true,
+            RedirectStandardError = true,
             UseShellExecute = false,
         })!;
+        var stderr = process.StandardError.ReadToEndAsync();
         try
         {
             var ready = Task.Run(() =>
@@ -112,11 +115,16 @@ internal static class SampleApp
                     if (line == "READY") return true;
                 return false;
             });
-            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, $"Sample '{mode}' never became ready.");
+            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, $"Sample '{mode}' never became ready.{(process.HasExited ? " " + stderr.Result : "")}");
 
-            DumpLoader.CollectDump(process.Id, dump);
-            var snapshot = DumpLoader.LoadDump(dump);
-            return new HangAnalyzer().Analyze(snapshot);
+            for (var attempt = 1; ; attempt++)
+            {
+                DumpLoader.CollectDump(process.Id, dump);
+                var report = new HangAnalyzer().Analyze(DumpLoader.LoadDump(dump));
+                File.Delete(dump);
+                if (until is null || until(report) || attempt == 3) return report;
+                Thread.Sleep(700);
+            }
         }
         finally
         {
@@ -125,22 +133,24 @@ internal static class SampleApp
         }
     }
 
-    private static string Build(string configuration)
-    {
-        var project = Path.Combine(RepoRoot(), "samples", "HangApp", "HangApp.csproj");
-        var output = Path.Combine(Path.GetTempPath(), "hangsloth-sample", configuration);
-        Run("dotnet", $"build \"{project}\" -c {configuration} -o \"{output}\" -nologo -v q", expectSuccess: true);
-        return Path.Combine(output, "HangApp.dll");
-    }
+    /// Builds a sample once per test run and returns the path of its .dll.
+    public static string Build(string project, string configuration = "Release") =>
+        Builds.GetOrAdd($"{project}|{configuration}", _ => new Lazy<string>(() =>
+        {
+            var csproj = Path.Combine(RepoRoot(), "samples", project, $"{project}.csproj");
+            var output = Path.Combine(Path.GetTempPath(), "hangsloth-sample", project, configuration);
+            Run("dotnet", $"build \"{csproj}\" -c {configuration} -o \"{output}\" -nologo -v q", expectSuccess: true);
+            return Path.Combine(output, $"{project}.dll");
+        })).Value;
 
-    private static string RepoRoot()
+    public static string RepoRoot()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
             if (File.Exists(Path.Combine(dir.FullName, "HangSloth.sln"))) return dir.FullName;
         throw new InvalidOperationException("Could not find the repository root.");
     }
 
-    private static string Run(string file, string args, bool expectSuccess = false)
+    public static string Run(string file, string args, bool expectSuccess = false)
     {
         using var p = Process.Start(new ProcessStartInfo(file, args) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false })!;
         var stdout = p.StandardOutput.ReadToEndAsync();

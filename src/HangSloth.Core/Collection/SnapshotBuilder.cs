@@ -10,7 +10,7 @@ namespace HangSloth.Collection;
 ///
 /// Everything here is about gathering facts. Judging whether those facts mean
 /// "deadlock" is the analyzers' job.
-public sealed class SnapshotBuilder
+public sealed partial class SnapshotBuilder
 {
     private const int MaxFramesPerThread = 200;
     private const int MaxTaskChainDepth = 16;
@@ -28,6 +28,8 @@ public sealed class SnapshotBuilder
     private readonly List<string> _warnings = [];
     private readonly Dictionary<ulong, HashSet<ulong>> _contextDelegateTargets = [];
     private readonly Dictionary<ulong, ObjectRef> _contextsInUse = [];
+    private readonly HashSet<ulong> _semaphoresInChains = [];
+    private readonly List<ClrObject> _asyncThisObjects = [];
 
     private SnapshotBuilder(ClrRuntime runtime, SourceResolver sources)
     {
@@ -74,23 +76,52 @@ public sealed class SnapshotBuilder
         var threads = new List<ThreadSnapshot>();
         foreach (var (clr, snapshot, roots) in partial)
         {
-            var result = snapshot;
+            var result = snapshot with
+            {
+                RunningTask = FindRunningTask(roots),
+                Database = ReadDatabaseActivity(roots, BlockingKind.None),
+            };
             var kind = FrameClassifier.Classify(snapshot.Frames);
-            if (kind == BlockingKind.TaskWait)
-                result = result with { BlockedOnTask = FindBlockedOnTask(roots) };
-            if (kind == BlockingKind.MonitorEnter)
-                result = result with { WaitingForLock = FindLockBeingEntered(clr, roots, locks, clrThreads) };
+            switch (kind)
+            {
+                case BlockingKind.TaskWait:
+                    var task = FindBlockedOnTask(roots);
+                    result = result with { BlockedOnTask = task };
+                    if (task is not null && DatabaseCommandInChain(task) is { } command)
+                        result = result with { Database = AsyncDatabaseWait(command, result.Database) };
+                    break;
+                case BlockingKind.MonitorEnter:
+                    result = result with { WaitingForLock = FindLockBeingEntered(clr, roots, locks, clrThreads) };
+                    break;
+                case BlockingKind.ReaderWriterLock:
+                    result = result with { WaitingForLock = FindReaderWriterLock(roots, locks) };
+                    break;
+                case BlockingKind.SemaphoreWait:
+                    result = result with { WaitingForSemaphore = FindSemaphoreBeingWaited(roots) };
+                    break;
+                case BlockingKind.Join:
+                    result = result with { JoiningThreadId = FindJoinTarget(roots, clr.ManagedThreadId) };
+                    break;
+                case BlockingKind.Database or BlockingKind.ConnectionPool:
+                    result = result with { Database = ReadDatabaseActivity(roots, kind) };
+                    break;
+            }
             threads.Add(result);
         }
 
         // Fill in waiters from what each thread is trying to enter, and name each lock after the field holding it.
-        var fieldNames = NameLockObjects(locks.Keys.ToHashSet(), partial.SelectMany(p => p.Roots));
+        var semaphoreAddresses = threads.Select(t => t.WaitingForSemaphore).OfType<ulong>().Concat(_semaphoresInChains).ToHashSet();
+        var named = NameObjects(locks.Keys.Concat(semaphoreAddresses).ToHashSet(), partial.SelectMany(p => p.Roots));
         var lockList = locks.Values
             .Select(l => l with
             {
                 WaiterThreadIds = threads.Where(t => t.WaitingForLock == l.Object.Address).Select(t => t.ManagedId).ToList(),
-                FieldName = fieldNames.GetValueOrDefault(l.Object.Address),
+                FieldName = named.GetValueOrDefault(l.Object.Address)?.Name,
             })
+            .ToList();
+        var semaphores = semaphoreAddresses
+            .Select(a => ReadSemaphore(a, named.GetValueOrDefault(a), threads))
+            .OfType<SemaphoreInfo>()
             .ToList();
 
         return new ProcessSnapshot
@@ -99,6 +130,7 @@ public sealed class SnapshotBuilder
             RuntimeVersion = runtimeVersion,
             Threads = threads,
             Locks = lockList,
+            Semaphores = semaphores,
             ThreadPool = ReadThreadPool(),
             Warnings = _warnings,
         };
@@ -269,53 +301,6 @@ public sealed class SnapshotBuilder
         return null;
     }
 
-    /// "lock on object" says nothing; "lock on OrderCache._sync" does. Look for the static field, or the
-    /// field of an object on an involved thread's stack, that references each lock object.
-    private Dictionary<ulong, string> NameLockObjects(HashSet<ulong> lockAddresses, IEnumerable<ClrStackRoot> roots)
-    {
-        var names = new Dictionary<ulong, string>();
-        if (lockAddresses.Count == 0) return names;
-        try
-        {
-            var domain = _runtime.AppDomains.FirstOrDefault();
-            if (domain is not null)
-            {
-                foreach (var module in _runtime.EnumerateModules())
-                {
-                    if (module.IsDynamic || FrameClassifier.IsFrameworkModule(module.Name)) continue;
-                    foreach (var type in module.EnumerateTypesWithStaticFields())
-                    {
-                        foreach (var field in type.StaticFields)
-                        {
-                            if (!field.IsObjectReference || !field.IsInitialized(domain)) continue;
-                            var value = field.ReadObject(domain);
-                            if (!value.IsNull && lockAddresses.Contains(value.Address) && !names.ContainsKey(value.Address))
-                                names[value.Address] = $"{Names.ShortType(type.Name ?? "")}.{field.Name}";
-                        }
-                    }
-                }
-            }
-
-            foreach (var root in roots)
-            {
-                var obj = root.Object;
-                if (obj.IsNull || obj.Type is null || lockAddresses.Contains(obj.Address) || FrameClassifier.IsFrameworkType(obj.Type.Name ?? "")) continue;
-                foreach (var field in obj.Type.Fields)
-                {
-                    if (!field.IsObjectReference) continue;
-                    var value = obj.ReadObjectField(field);
-                    if (!value.IsNull && lockAddresses.Contains(value.Address) && !names.ContainsKey(value.Address))
-                        names[value.Address] = $"{Names.ShortType(obj.Type.Name ?? "")}.{field.Name}";
-                }
-            }
-        }
-        catch
-        {
-            // Names are a nicety.
-        }
-        return names;
-    }
-
     // ---------------------------------------------------------------- tasks
 
     private TaskInfo? FindBlockedOnTask(List<ClrStackRoot> roots)
@@ -352,6 +337,12 @@ public sealed class SnapshotBuilder
         if (typeName.Contains("AsyncStateMachineBox", StringComparison.Ordinal))
             return DescribeAsyncMethod(task, info, depth, visited);
 
+        if (typeName == "System.Threading.SemaphoreSlim+TaskNode")
+        {
+            var semaphore = FindSemaphoreOfTaskNode(task);
+            if (semaphore is { } sem) _semaphoresInChains.Add(sem);
+            return info with { Kind = TaskKind.SemaphoreWait, Description = "SemaphoreSlim.WaitAsync()", Semaphore = semaphore };
+        }
         if (typeName.Contains("DelayPromise", StringComparison.Ordinal))
             return info with { Kind = TaskKind.Delay, Description = "Task.Delay(...)" };
         if (typeName.Contains("WhenAllPromise", StringComparison.Ordinal))
@@ -389,6 +380,16 @@ public sealed class SnapshotBuilder
         var smType = stateMachine.Type;
         if (smType?.Name is { } exactName)
             info = info with { Description = Names.ShortMethod(exactName, "") };
+
+        if (smType?.GetFieldByName("<>4__this") is { IsObjectReference: true } thisField)
+        {
+            var self = stateMachine.ReadObject(thisField);
+            if (!self.IsNull)
+            {
+                _asyncThisObjects.Add(self);
+                info = info with { ThisAddress = self.Address, CommandText = DatabaseCommandText(self) };
+            }
+        }
 
         var state = stateMachine.ReadInt("<>1__state");
         var moveNext = smType?.Methods.FirstOrDefault(m => m.Name == "MoveNext");

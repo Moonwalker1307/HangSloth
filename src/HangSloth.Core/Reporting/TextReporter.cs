@@ -90,12 +90,24 @@ public static class TextReporter
             output.WriteLine($"   {c.Bold(t.Label)}{c.Dim($" · OS thread 0x{t.OSThreadId:x}" + (tags.Count > 0 ? " · " + string.Join(", ", tags) : ""))}");
 
         var frames = VisibleFrames(t.Frames);
+        // Database drivers and async plumbing can stack dozens of framework frames on top of the app's
+        // code. Keep the top few (what it's blocked in) and the last one (how the app got there).
+        var prefix = frames.TakeWhile(f => !FrameClassifier.IsUserFrame(f)).Count();
+        var skipFrom = prefix > LongPrefix ? 4 : int.MaxValue;
+        var skipTo = prefix > LongPrefix ? prefix - 1 : int.MaxValue;
         var shown = 0;
-        foreach (var f in frames)
+        for (var i = 0; i < frames.Count; i++)
         {
+            if (i == skipFrom)
+            {
+                output.WriteLine(c.Dim($"        … {skipTo - skipFrom} framework frames"));
+                i = skipTo - 1;
+                continue;
+            }
+            var f = frames[i];
             if (shown++ >= options.MaxFrames)
             {
-                output.WriteLine(c.Dim($"        … {frames.Count - options.MaxFrames} more frames"));
+                output.WriteLine(c.Dim($"        … {frames.Count - i} more frames"));
                 break;
             }
             var name = Names.ShortMethod(f.TypeName, f.MethodName);
@@ -107,6 +119,7 @@ public static class TextReporter
     }
 
     private const int MaxGroups = 12;
+    private const int LongPrefix = 8;
     private const int MaxIdsListed = 10;
 
     /// What a thread is blocked on plus the app frames it's in. Threads without app frames

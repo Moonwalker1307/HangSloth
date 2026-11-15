@@ -1,0 +1,185 @@
+using HangSloth.Model;
+
+namespace HangSloth.Analysis;
+
+internal enum WaitKind { Lock, Task, Join, TypeInitializer }
+
+/// One thread waiting for another: for a lock it owns, a task it is running, for it to exit,
+/// or for a static constructor it is running.
+internal sealed record WaitEdge(int From, int To, WaitKind Kind, MonitorLock? Lock = null, TaskInfo? Task = null, string? TypeName = null);
+
+internal static class WaitGraph
+{
+    /// Each blocked thread waits for at most one thing, so the graph is a map from waiter to edge.
+    public static Dictionary<int, WaitEdge> Build(ProcessSnapshot snapshot)
+    {
+        var edges = new Dictionary<int, WaitEdge>();
+        var locks = snapshot.Locks.ToDictionary(l => l.Object.Address);
+        var runningTask = snapshot.Threads.Where(t => t.RunningTask is not null).ToDictionary(t => t.RunningTask!.Value, t => t.ManagedId);
+
+        foreach (var t in snapshot.Threads)
+        {
+            if (t.WaitingForLock is { } addr && locks.TryGetValue(addr, out var l) && l.OwnerThreadId is { } owner && owner != t.ManagedId)
+            {
+                edges[t.ManagedId] = new WaitEdge(t.ManagedId, owner, WaitKind.Lock, Lock: l);
+            }
+            else if (t.BlockedOnTask is { } waited
+                     && Describe.Chain(waited).FirstOrDefault(x => x.State == TaskState.Pending && runningTask.ContainsKey(x.Address)) is { } running
+                     && runningTask[running.Address] != t.ManagedId)
+            {
+                edges[t.ManagedId] = new WaitEdge(t.ManagedId, runningTask[running.Address], WaitKind.Task, Task: running);
+            }
+            else if (t.JoiningThreadId is { } joined && snapshot.FindThread(joined) is not null)
+            {
+                edges[t.ManagedId] = new WaitEdge(t.ManagedId, joined, WaitKind.Join);
+            }
+            else if (FrameClassifier.Classify(t.Frames) == BlockingKind.TypeInitializer && FindInitializer(snapshot, t) is var (initializer, type))
+            {
+                edges[t.ManagedId] = new WaitEdge(t.ManagedId, initializer, WaitKind.TypeInitializer, TypeName: type);
+            }
+        }
+        return edges;
+    }
+
+    /// Which thread is running the static constructor this thread waits for? The runtime's class-init lock
+    /// isn't visible in a dump, so match the type the waiting code belongs to, or the only candidate.
+    private static (int Thread, string? Type)? FindInitializer(ProcessSnapshot snapshot, ThreadSnapshot waiter)
+    {
+        var running = snapshot.Threads
+            .Where(t => t.ManagedId != waiter.ManagedId)
+            .SelectMany(t => FrameClassifier.RunningStaticConstructors(t.Frames).Select(type => (t.ManagedId, Type: type)))
+            .ToList();
+        if (running.Count == 0) return null;
+
+        var caller = FrameClassifier.FirstUserFrame(waiter.Frames)?.TypeName ?? "";
+        foreach (var r in running)
+        {
+            if (caller == r.Type || caller.StartsWith(r.Type + "+", StringComparison.Ordinal))
+                return (r.ManagedId, r.Type);
+        }
+        return running.Select(r => r.ManagedId).Distinct().Count() == 1 ? (running[0].ManagedId, null) : null;
+    }
+
+    public static List<int>? FindCycle(int start, Dictionary<int, WaitEdge> edges)
+    {
+        var path = new List<int>();
+        var current = start;
+        while (edges.TryGetValue(current, out var edge))
+        {
+            var index = path.IndexOf(current);
+            if (index >= 0) return path[index..];
+            path.Add(current);
+            current = edge.To;
+        }
+        return null;
+    }
+}
+
+/// Threads waiting on each other in a circle where at least one wait isn't a plain lock: a lock holder
+/// blocked on a Task.Run that needs the lock, a Join on a thread that needs a lock, a Lazy&lt;T&gt; factory
+/// waiting for work that reads the same Lazy, a static constructor waiting for a thread that needs the type.
+public sealed class WaitCycleDetector : IDetector
+{
+    public IEnumerable<Finding> Detect(ProcessSnapshot snapshot, IReadOnlySet<int> claimed)
+    {
+        var edges = WaitGraph.Build(snapshot);
+        var reported = new HashSet<string>();
+        foreach (var start in edges.Keys.Order())
+        {
+            var cycle = WaitGraph.FindCycle(start, edges);
+            if (cycle is null || cycle.Any(claimed.Contains)) continue;
+            if (cycle.All(id => edges[id].Kind == WaitKind.Lock)) continue; // LockDeadlockDetector's job
+            if (!reported.Add(string.Join(",", cycle.Order()))) continue;
+            yield return Explain(snapshot, Rotate(cycle, edges), edges);
+        }
+    }
+
+    /// Start the story at the thread that holds the most context: the static constructor, else the
+    /// thread blocked on a task or join while holding a lock.
+    private static List<int> Rotate(List<int> cycle, Dictionary<int, WaitEdge> edges)
+    {
+        var first = cycle.FindIndex(id => edges.Values.Any(e => e.Kind == WaitKind.TypeInitializer && e.To == id));
+        if (first < 0) first = cycle.FindIndex(id => edges[id].Kind is WaitKind.Task or WaitKind.Join);
+        return first <= 0 ? cycle : [.. cycle[first..], .. cycle[..first]];
+    }
+
+    private static Finding Explain(ProcessSnapshot snapshot, List<int> cycle, Dictionary<int, WaitEdge> edges)
+    {
+        var threads = cycle.Select(id => snapshot.FindThread(id)!).ToList();
+        var kinds = cycle.Select(id => edges[id].Kind).ToHashSet();
+        var typeInit = cycle.Select(id => edges[id]).FirstOrDefault(e => e.Kind == WaitKind.TypeInitializer);
+        var lazy = cycle.Select(id => edges[id].Lock).FirstOrDefault(l => l?.DisplayName.Contains("Lazy<", StringComparison.Ordinal) == true);
+
+        var details = threads.Select(t => Step(snapshot, t, edges[t.ManagedId])).ToList();
+        var labels = threads.Select(t => t.Label).ToList();
+        var site = FrameClassifier.BestUserFrame(threads[0].Frames);
+        var start = site?.Source is null ? "" : $" Start at {site.Source}.";
+
+        string id, title, summary, advice;
+        if (typeInit is not null)
+        {
+            var initializer = snapshot.FindThread(typeInit.To)!;
+            var waiter = snapshot.FindThread(typeInit.From)!;
+            var type = TypeLabel(typeInit, initializer);
+            id = "type-initializer-deadlock";
+            title = "Deadlock: static constructor waiting for a thread that needs it";
+            summary = $"{initializer.Label} is running the static constructor of {type} and waits for {waiter.Label}, but {waiter.Label} uses {type} " +
+                      $"and has to wait for that static constructor to finish. Neither can continue.{start}";
+            advice = $"Don't wait for other threads or tasks inside a static constructor or static field initializer, least of all for code that uses the same type. " +
+                     $"Move the slow initialization out of {type}'s static constructor (an explicit Initialize() call, or a Lazy<T> created on first use), or do the work on the same thread.";
+        }
+        else
+        {
+            id = "wait-cycle";
+            title = lazy is not null ? "Deadlock: Lazy<T> factory waiting for code that needs the same Lazy<T>" : "Deadlock: threads waiting on each other";
+            summary = (threads.Count == 2
+                ? $"{labels[0]} and {labels[1]} are waiting for each other, so neither can ever continue."
+                : $"{Describe.JoinAnd(labels)} are waiting for each other in a circle, so none of them can ever continue.") + start;
+            advice = lazy is not null
+                ? $"A Lazy<T> runs its factory under a lock (LazyThreadSafetyMode.ExecutionAndPublication), and this factory waits for work that reads {LazyField(lazy)}.Value. " +
+                  "Don't read the Value from inside the factory, directly or from work the factory waits for: pass the data it needs in instead."
+                : kinds.Contains(WaitKind.Join)
+                    ? "Don't Join a thread while holding a lock that thread needs to finish. Release the lock before calling Join (set the stop flag under the lock, Join outside it)."
+                    : "Don't block on a task while holding a lock the task needs. Release the lock before waiting, await outside the lock, or let the task do its work without taking the lock.";
+        }
+
+        return new Finding
+        {
+            Id = id,
+            Severity = Severity.Critical,
+            Title = title,
+            Summary = summary,
+            Details = details,
+            Advice = advice,
+            ThreadIds = cycle,
+            Location = site?.Source,
+        };
+    }
+
+    /// "CatalogService._catalog (Lazy<Catalog>)" -> "CatalogService._catalog".
+    private static string LazyField(MonitorLock l) =>
+        l.DisplayName.IndexOf(" (Lazy<", StringComparison.Ordinal) is var i and > 0 ? l.DisplayName[..i] : "the Lazy<T>";
+
+    private static string TypeLabel(WaitEdge edge, ThreadSnapshot initializer) =>
+        edge.TypeName is { } t ? Names.ShortType(t)
+        : FrameClassifier.RunningStaticConstructors(initializer.Frames).Select(Names.ShortType).FirstOrDefault() ?? "a type";
+
+    private static string Step(ProcessSnapshot snapshot, ThreadSnapshot t, WaitEdge edge)
+    {
+        var other = snapshot.FindThread(edge.To)?.Label ?? $"thread {edge.To}";
+        var held = snapshot.Locks.Where(l => l.OwnerThreadId == t.ManagedId).Select(Describe.Held).ToList();
+        var cctor = FrameClassifier.RunningStaticConstructors(t.Frames).Select(Names.ShortType).FirstOrDefault();
+        var context = new List<string>();
+        if (cctor is not null && edge.Kind != WaitKind.TypeInitializer) context.Add($"is running the static constructor of {cctor}");
+        if (held.Count > 0) context.Add($"holds {Describe.JoinAnd(held)}");
+        var holds = context.Count == 0 ? "" : string.Join(", ", context) + " and ";
+        var where = Describe.Where(FrameClassifier.BestUserFrame(t.Frames));
+        return edge.Kind switch
+        {
+            WaitKind.Lock => $"{t.Label} {holds}is waiting in {where} for {Describe.Wanted(edge.Lock!)}, which {other} holds.",
+            WaitKind.Task => $"{t.Label} {holds}is blocked in {FrameClassifier.DescribeTaskWait(t.Frames)} at {where}, waiting for {Describe.Task(edge.Task!)}, which is running on {other}.",
+            WaitKind.Join => $"{t.Label} {holds}is waiting in {where} for {other} to finish (Thread.Join).",
+            _ => $"{t.Label} {holds}needs {(edge.TypeName is { } type ? Names.ShortType(type) : "a type")} in {where}, so it waits for its static constructor, which {other} is running.",
+        };
+    }
+}
