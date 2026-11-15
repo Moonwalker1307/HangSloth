@@ -22,23 +22,25 @@ public sealed class ThreadPoolStarvationDetector : IDetector
         var pool = snapshot.ThreadPool;
         var queued = pool?.QueuedWorkItems;
 
+        // Group by the method that blocks, not by line and label: optimized code can resolve the same call site
+        // to an earlier line and lose the frame that tells .Result from .Wait(), splitting one cause into several.
         var groups = blocked
-            .GroupBy(x => (Call: x.Kind == BlockingKind.TaskWait ? FrameClassifier.DescribeTaskWait(x.Thread.Frames) : KindName(x.Kind),
-                           Site: Describe.Spot(FrameClassifier.BestUserFrame(x.Thread.Frames))))
-            .OrderByDescending(g => g.Count())
+            .GroupBy(x => (Kind: x.Kind, Method: FrameClassifier.BestUserFrame(x.Thread.Frames) is { } f ? f.FullName : ""))
+            .Select(g => Site.Of(g.Key.Kind, g.ToList()))
+            .OrderByDescending(g => g.Threads.Count)
             .ToList();
 
         var top = groups[0];
         var where = groups.Count == 1
-            ? $"all in {top.Key.Call} at {top.Key.Site}"
-            : $"{top.Count()} of them in {top.Key.Call} at {top.Key.Site}";
+            ? $"all in {top.Call} at {top.Spot}"
+            : $"{top.Threads.Count} of them in {top.Call} at {top.Spot}";
 
         var summary = $"Thread pool starvation: {blocked.Count} of {workers.Count} thread pool threads are blocked ({where})";
         summary += queued > 0 ? $", and {Describe.Plural(queued.Value, "work item is", "work items are")} waiting in the queue." : ".";
 
         var details = new List<string>();
         foreach (var g in groups.Take(5))
-            details.Add($"{Describe.Plural(g.Count(), "thread")}: {g.Key.Call} at {Describe.Where(FrameClassifier.BestUserFrame(g.First().Thread.Frames))}.");
+            details.Add($"{Describe.Plural(g.Threads.Count, "thread")}: {g.Call} at {g.Where}.");
 
         // Blocked on async database calls: say what they wait for, since the stack only shows .Result.
         var onDatabase = blocked.Where(x => x.Thread.Database?.Waiting == DatabaseWaitKind.Query).Select(x => x.Thread.Database!).ToList();
@@ -69,7 +71,6 @@ public sealed class ThreadPoolStarvationDetector : IDetector
         if (blocked.Any(x => x.Kind == BlockingKind.TaskWait))
             details.Add("Threads blocked on .Result/.Wait() are usually waiting for a task whose continuation needs a free thread pool thread to finish, which is exactly what's missing.");
 
-        var site = FrameClassifier.BestUserFrame(top.First().Thread.Frames);
         yield return new Finding
         {
             Id = "threadpool-starvation",
@@ -80,12 +81,43 @@ public sealed class ThreadPoolStarvationDetector : IDetector
             Advice = timer
                 ? $"Make the timer callback ({timerCallbacks!.Key}) non-overlapping: use a one-shot timer re-armed at the end of the callback (timer.Change(period, Timeout.Infinite)), " +
                   "a PeriodicTimer loop, or skip the tick when the previous one is still running (Monitor.TryEnter / Interlocked). And keep slow work out of the lock."
-                : top.Key.Call.StartsWith('.') || top.Key.Call.StartsWith("Task.", StringComparison.Ordinal)
-                ? $"Stop blocking on async code in thread pool work: await instead of {top.Key.Call} in {top.Key.Site}. Raising ThreadPool.SetMinThreads only hides the problem."
-                : $"Avoid blocking thread pool threads ({top.Key.Call} at {top.Key.Site}); move long blocking work to a dedicated thread or make it async.",
+                : top.Kind == BlockingKind.TaskWait && (top.Call.StartsWith('.') || top.Call.StartsWith("Task.", StringComparison.Ordinal))
+                ? $"Stop blocking on async code in thread pool work: await instead of {top.Call} in {top.Spot}. Raising ThreadPool.SetMinThreads only hides the problem."
+                : $"Avoid blocking thread pool threads ({top.Call} at {top.Spot}); move long blocking work to a dedicated thread or make it async.",
             ThreadIds = blocked.Select(x => x.Thread.ManagedId).ToList(),
-            Location = site?.Source,
+            Location = top.Location,
         };
+    }
+
+    /// Blocked threads in one method, with the call and line most of them agree on.
+    private sealed record Site(BlockingKind Kind, List<(ThreadSnapshot Thread, BlockingKind Kind)> Threads, string Call, string Spot, string Where, SourceLocation? Location)
+    {
+        public static Site Of(BlockingKind kind, List<(ThreadSnapshot Thread, BlockingKind Kind)> threads)
+        {
+            var frames = threads.Select(x => (x.Thread, Frame: FrameClassifier.BestUserFrame(x.Thread.Frames))).ToList();
+            // A line and wait read from the app's IL is certain; one taken from the stack alone may be off in optimized code.
+            var confirmed = frames.Where(x => x.Frame?.BlockingCall is not null && x.Frame.Source is not null).ToList();
+            var basis = confirmed.Count > 0 ? confirmed : frames;
+
+            var calls = basis.Select(x => FrameClassifier.DescribeTaskWait(x.Thread.Frames)).ToList();
+            var known = calls.Where(c => c != FrameClassifier.UnknownTaskWait).ToList();
+            var call = kind == BlockingKind.TaskWait ? MostCommon(known.Count > 0 ? known : calls)! : KindName(kind);
+
+            var sources = basis.Select(x => x.Frame?.Source).Distinct().ToList();
+            var frame = basis[0].Frame;
+            if (sources.Count == 1 || confirmed.Count > 0)
+            {
+                var source = MostCommon(basis.Select(x => x.Frame?.Source));
+                frame = basis.First(x => Equals(x.Frame?.Source, source)).Frame;
+                return new Site(kind, threads, call, Describe.Spot(frame), Describe.Where(frame), frame?.Source);
+            }
+            // The threads disagree on the line and nothing confirms one: name the method rather than a line that may be wrong.
+            var method = frame is null ? null : frame with { Source = null };
+            return new Site(kind, threads, call, Describe.Spot(method), Describe.Where(method), null);
+        }
+
+        private static T? MostCommon<T>(IEnumerable<T> values) =>
+            values.GroupBy(v => v).OrderByDescending(g => g.Count()).Select(g => g.Key).FirstOrDefault();
     }
 
     private static string KindName(BlockingKind kind) => kind switch

@@ -178,3 +178,33 @@ static class LockTypeDeadlockScenario
         }
     }
 }
+
+static class TieredStarvationScenario
+{
+    /// 200 pool threads blocked on the same .Result: some still in tier-0 code, the rest in optimized
+    /// tier-1 code where Task<T>.Result is inlined into the app's method.
+    public static void Run()
+    {
+        ThreadPool.SetMinThreads(220, 220);
+        var directory = new CustomerDirectory();
+        var check = new InvoiceCheck(directory);
+        var ids = Enumerable.Range(1, 1).ToArray();
+
+        directory.Upstream = true;
+        for (var i = 0; i < 60; i++) _ = Task.Run(() => check.CheckAll(ids));
+        Thread.Sleep(300);
+
+        // Call it often enough, with time in between, for the JIT to recompile it at tier 1.
+        directory.Upstream = false;
+        for (var round = 0; round < 20; round++)
+        {
+            for (var i = 0; i < 2000; i++) check.CheckAll(ids);
+            Thread.Sleep(50);
+        }
+
+        directory.Upstream = true;
+        for (var i = 0; i < 140; i++) _ = Task.Run(() => check.CheckAll(ids));
+        Ready.SignalLater(1500);
+        Thread.Sleep(Timeout.Infinite);
+    }
+}

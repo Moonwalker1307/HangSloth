@@ -14,9 +14,14 @@ public sealed class BlockedOnTaskDetector : IDetector
                 continue;
 
             var chain = Describe.Chain(waited).ToList();
+            // A test runner or host waiting for its own work (testhost's Main, host.RunAsync().GetAwaiter().GetResult()):
+            // that's how a healthy process looks.
+            if (FrameClassifier.Classify(thread.Frames) == BlockingKind.Idle || chain.Any(FrameClassifier.IsHostRunTask))
+                continue;
+
             var leaf = chain[^1];
             var call = FrameClassifier.DescribeTaskWait(thread.Frames);
-            var site = FrameClassifier.BestUserFrame(thread.Frames);
+            var site = FrameClassifier.BestUserFrame(thread.Frames) ?? FrameClassifier.WaitingFrame(thread.Frames);
 
             if (leaf.Kind == TaskKind.SemaphoreWait)
             {

@@ -44,6 +44,8 @@ public static class FrameClassifier
 
         // app.Run() / host.Run() parks the main thread until shutdown. That's a healthy app, not a hang.
         if (prefix.Any(IsHostRunFrame)) return BlockingKind.Idle;
+        // A test runner's own main thread waiting for its engine while the tests run (vstest's testhost).
+        if (IsTestHostWait(frames)) return BlockingKind.Idle;
         if (prefix.Any(IsConnectionPoolFrame)) return BlockingKind.ConnectionPool;
         if (prefix.Any(IsDatabaseCommandFrame)) return BlockingKind.Database;
         if (prefix.Any(f => IsTaskWaitMethod(f.TypeName, f.MethodName))) return BlockingKind.TaskWait;
@@ -202,18 +204,30 @@ public static class FrameClassifier
         return false;
     }
 
+    /// Said of a task wait when neither the app's IL nor the framework frames tell which call it was.
+    public const string UnknownTaskWait = ".Result/.Wait()";
+
     /// How the app's code blocked on the task, in the words a developer would use.
     public static string DescribeTaskWait(IReadOnlyList<StackFrameInfo> frames)
     {
+        // Read from the call in the app's IL: right even when optimized code inlined the framework frames.
+        if (FirstUserFrame(frames)?.BlockingCall is { } call) return call;
         var prefix = FrameworkPrefix(frames);
         if (prefix.Any(f => f.TypeName.StartsWith("System.Runtime.CompilerServices.", StringComparison.Ordinal) && f.MethodName is "GetResult" or "HandleNonSuccessAndDebuggerNotification" or "ValidateEnd"))
             return ".GetAwaiter().GetResult()";
-        if (prefix.Any(f => f.MethodName.StartsWith("WaitAll", StringComparison.Ordinal))) return "Task.WaitAll(...)";
-        if (prefix.Any(f => f.MethodName.StartsWith("WaitAny", StringComparison.Ordinal))) return "Task.WaitAny(...)";
-        if (prefix.Any(f => f.MethodName is "GetResultCore" or "get_Result")) return ".Result";
-        if (prefix.Any(f => f.MethodName == "Wait")) return ".Wait()";
+        if (prefix.Any(f => IsTaskType(f) && f.MethodName.StartsWith("WaitAll", StringComparison.Ordinal))) return "Task.WaitAll(...)";
+        if (prefix.Any(f => IsTaskType(f) && f.MethodName.StartsWith("WaitAny", StringComparison.Ordinal))) return "Task.WaitAny(...)";
+        if (prefix.Any(f => IsTaskType(f) && f.MethodName is "GetResultCore" or "get_Result")) return ".Result";
+        // Only Task.Wait itself: ManualResetEventSlim.Wait and Monitor.Wait sit above every kind of task wait.
+        if (prefix.Any(f => IsTaskType(f) && f.MethodName == "Wait")) return ".Wait()";
+        // Optimized code can inline Task<T>.Result (and Task.Wait()) into the app's method, leaving only
+        // Task.InternalWait: don't guess which one it was.
+        if (prefix.Any(f => IsTaskType(f) && f.MethodName.StartsWith("InternalWait", StringComparison.Ordinal))) return UnknownTaskWait;
         return "a blocking wait";
     }
+
+    private static bool IsTaskType(StackFrameInfo f) =>
+        f.TypeName.StartsWith("System.Threading.Tasks.Task", StringComparison.Ordinal);
 
     public static bool IsThreadPoolDispatchFrame(StackFrameInfo frame) =>
         (frame.TypeName == "System.Threading.ThreadPoolWorkQueue" && frame.MethodName == "Dispatch")
@@ -228,6 +242,32 @@ public static class FrameClassifier
     public static bool IsHostRunFrame(StackFrameInfo f) =>
         (f.TypeName.StartsWith("Microsoft.Extensions.Hosting.", StringComparison.Ordinal) && f.MethodName is "Run" or "WaitForShutdown")
         || (f.TypeName == "Microsoft.AspNetCore.Builder.WebApplication" && f.MethodName == "Run");
+
+    /// The test platform's own code, as in vstest's testhost.dll (Microsoft.VisualStudio.TestPlatform.TestHost.Program.Main).
+    public static bool IsTestPlatformFrame(StackFrameInfo f) =>
+        f.TypeName.StartsWith("Microsoft.VisualStudio.TestPlatform.", StringComparison.Ordinal)
+        || f.TypeName.StartsWith("Microsoft.Testing.Platform.", StringComparison.Ordinal);
+
+    /// A thread with none of the app's code on it, where the test platform waits (testhost's Main waiting for
+    /// its engine to run the tests). The tests themselves run on other threads, which are judged on their own.
+    public static bool IsTestHostWait(IReadOnlyList<StackFrameInfo> frames) =>
+        !frames.Any(IsUserFrame) && frames.Any(IsTestPlatformFrame);
+
+    /// A task that is the generic host running until shutdown (host.RunAsync(), WaitForShutdownAsync()),
+    /// as in Main calling RunAsync().GetAwaiter().GetResult(). Waiting for it is what a healthy host does.
+    public static bool IsHostRunTask(TaskInfo task) =>
+        (task.TypeName.Contains("Microsoft.Extensions.Hosting.", StringComparison.Ordinal)
+         || task.TypeName.Contains("Microsoft.AspNetCore.Builder.WebApplication", StringComparison.Ordinal))
+        && (task.TypeName.Contains("<RunAsync>", StringComparison.Ordinal)
+            || task.TypeName.Contains("<WaitForShutdownAsync>", StringComparison.Ordinal)
+            || task.TypeName.Contains("<RunConsoleAsync>", StringComparison.Ordinal));
+
+    /// The innermost frame below the framework's wait frames, for naming the waiting code when none of it is
+    /// the app's (e.g. "Program.Main" in a host's own assembly).
+    public static StackFrameInfo? WaitingFrame(IReadOnlyList<StackFrameInfo> frames) =>
+        FirstUserFrame(frames) ?? frames.FirstOrDefault(f => !f.IsRuntimeFrame
+            && !f.TypeName.StartsWith("System.Threading", StringComparison.Ordinal)
+            && !f.TypeName.StartsWith("System.Runtime.CompilerServices.", StringComparison.Ordinal));
 
     private static bool IsMonitorEnter(StackFrameInfo f) =>
         (f.TypeName == "System.Threading.Monitor" && (f.MethodName is "Enter" or "ReliableEnter" or "ReliableEnterTimeout" or "TryEnter" || f.MethodName.Contains("Slow", StringComparison.OrdinalIgnoreCase)))

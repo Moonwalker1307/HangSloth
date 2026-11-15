@@ -66,6 +66,26 @@ public class EndToEndTests
     }
 
     [Fact]
+    public void Starvation_in_optimized_code_reports_the_line_of_the_Result()
+    {
+        // 200 pool threads blocked on the same .Result, most of them in tier-1 code where Task<T>.Result is
+        // inlined: they must all be reported at the .Result line, as .Result, in a single group.
+        var report = SampleApp.Analyze("tiered-starvation");
+        // The scenario only tests something if some threads really run the inlined code.
+        var stacks = string.Join("\n", report.Snapshot.Threads.Where(t => t.IsThreadPoolWorker)
+            .Select(t => string.Join(" > ", t.Frames.Take(9).Select(x => x.ToString()))).Distinct());
+        Assert.True(report.Snapshot.Threads.Any(t => t.Frames.Any(x => x.MethodName == "Validate")
+                                                     && !t.Frames.Any(x => x.MethodName is "GetResultCore" or "get_Result")),
+            $"No thread ran tier-1 code with Task<T>.Result inlined. Pool thread stacks:\n{stacks}");
+        var f = Assert.Single(report.Findings);
+        Assert.Equal("threadpool-starvation", f.Id);
+        Assert.StartsWith("Thread pool starvation: 200 of ", f.Summary);
+        Assert.Contains("(all in .Result at InvoiceCheck.cs:23)", f.Summary);
+        Assert.Contains("200 threads: .Result at InvoiceCheck.Validate (InvoiceCheck.cs:23).", f.Details);
+        Assert.Contains("await instead of .Result in InvoiceCheck.cs:23", f.Advice);
+    }
+
+    [Fact]
     public void Task_that_is_never_completed()
     {
         var report = SampleApp.Analyze("never-completes");
