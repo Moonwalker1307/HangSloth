@@ -17,6 +17,7 @@ public class NamesTests
     [Theory]
     [InlineData("HangApp.Scenario+<>c", "<Run>b__0_0", "Scenario.Run (lambda)")]
     [InlineData("HangApp.Scenario+<>c__DisplayClass2_0", "<Run>b__1", "Scenario.Run (lambda)")]
+    [InlineData("System.Linq.Enumerable", "ToDictionary[[System.Collections.Generic.KeyValuePair`2[[System.__Canon, System.Private.CoreLib]], System.Private.CoreLib]]", "Enumerable.ToDictionary")]
     [InlineData("HangApp.OrderController", "Get", "OrderController.Get")]
     public void Lambdas_are_named_after_their_method(string type, string method, string expected) =>
         Assert.Equal(expected, Names.ShortMethod(type, method));

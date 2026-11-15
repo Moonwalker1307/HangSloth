@@ -18,6 +18,8 @@ public sealed class HangSlothException(string message, Exception? inner = null) 
 
 public static partial class DumpLoader
 {
+    private static readonly object DacGate = new();
+
     /// Load a dump file (Windows minidump, Linux core dump or macOS dump) and take a snapshot of it.
     public static ProcessSnapshot LoadDump(string path, LoadOptions? options = null)
     {
@@ -34,6 +36,9 @@ public static partial class DumpLoader
             throw new HangSlothException($"Could not open '{path}' as a memory dump: {e.Message}", e);
         }
 
+        // The DAC keeps process-wide state (its PAL on Linux), so two dumps read at the same time from
+        // one process can corrupt each other and crash with an access violation. Read one at a time.
+        lock (DacGate)
         using (target)
         {
             var clr = target.ClrVersions.FirstOrDefault()

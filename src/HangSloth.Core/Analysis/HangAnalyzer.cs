@@ -14,8 +14,14 @@ public sealed class HangAnalyzer
         [
             new SyncOverAsyncDetector(),
             new LockDeadlockDetector(),
+            new WaitCycleDetector(),
+            new DatabaseDeadlockDetector(),
+            new ConnectionPoolDetector(),
+            new SemaphoreDeadlockDetector(),
             new ThreadPoolStarvationDetector(),
+            new DatabaseWaitDetector(),
             new LockContentionDetector(),
+            new SemaphoreWaitDetector(),
             new BlockedOnTaskDetector(),
         ];
     }

@@ -14,13 +14,16 @@ public sealed class SyncOverAsyncDetector : IDetector
                 continue;
 
             var chain = Describe.Chain(waited).ToList();
-            var stuck = chain.FirstOrDefault(t => t.Resume?.SynchronizationContext.Address == ctx.Address);
+            // Every method in the chain that captured the context needs it to finish; the one already sitting
+            // in the context's queue is where it is literally stuck.
+            var capturing = chain.Where(t => t.Resume?.SynchronizationContext.Address == ctx.Address).ToList();
+            var stuck = capturing.LastOrDefault(t => t.Resume!.Status == ResumeStatus.Queued) ?? capturing.FirstOrDefault();
             var call = FrameClassifier.DescribeTaskWait(thread.Frames);
             var site = FrameClassifier.BestUserFrame(thread.Frames);
 
             if (stuck is not null)
             {
-                yield return Confirmed(thread, ctx, waited, stuck, call, site);
+                yield return Confirmed(thread, ctx, waited, stuck, capturing, call, site);
             }
             else if (waited.State == TaskState.Pending && waited.Kind == TaskKind.AsyncMethod && ctx.TypeName != "System.Threading.SynchronizationContext")
             {
@@ -40,7 +43,7 @@ public sealed class SyncOverAsyncDetector : IDetector
         }
     }
 
-    private static Finding Confirmed(ThreadSnapshot thread, ObjectRef ctx, TaskInfo waited, TaskInfo stuck, string call, StackFrameInfo? site)
+    private static Finding Confirmed(ThreadSnapshot thread, ObjectRef ctx, TaskInfo waited, TaskInfo stuck, List<TaskInfo> capturing, string call, StackFrameInfo? site)
     {
         var details = new List<string>
         {
@@ -63,7 +66,7 @@ public sealed class SyncOverAsyncDetector : IDetector
             Summary = $"{thread.Label} is blocking with {call} on a task that's waiting for the same SynchronizationContext. Classic sync-over-async{where}.",
             Details = details,
             Advice = $"Make the caller async and await the task instead of using {call}. " +
-                     $"If that isn't possible yet, add .ConfigureAwait(false) to the awaits in {stuck.Description} (and everything it calls) so they don't need the blocked context.",
+                     $"If that isn't possible yet, add .ConfigureAwait(false) to the awaits in {Describe.JoinAnd(capturing.Select(t => t.Description).Reverse())} (and everything it calls) so they don't need the blocked context.",
             ThreadIds = [thread.ManagedId],
             Location = site?.Source,
         };

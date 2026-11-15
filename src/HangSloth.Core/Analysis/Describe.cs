@@ -19,21 +19,51 @@ internal static class Describe
     public static string Task(TaskInfo task) =>
         task.AwaitLocation is null ? task.Description : $"{task.Description} (paused at {task.AwaitLocation})";
 
-    public static string Activity(ThreadSnapshot thread)
+    /// <param name="withMethod">"in Refunds.Charge (Refunds.cs:15)" rather than just "in Refunds.cs:15".</param>
+    public static string Activity(ThreadSnapshot thread, bool withMethod = false)
     {
         var kind = FrameClassifier.Classify(thread.Frames);
-        var at = Spot(FrameClassifier.BestUserFrame(thread.Frames));
+        var at = withMethod ? Where(FrameClassifier.BestUserFrame(thread.Frames)) : Spot(FrameClassifier.BestUserFrame(thread.Frames));
         return kind switch
         {
             BlockingKind.Sleep => $"sleeping (Thread.Sleep) in {at}",
             BlockingKind.TaskWait => $"blocked on {FrameClassifier.DescribeTaskWait(thread.Frames)} in {at}",
             BlockingKind.MonitorEnter => $"itself waiting for another lock in {at}",
+            BlockingKind.MonitorWait when FrameClassifier.FrameworkPrefix(thread.Frames).Any(f => f.TypeName == "System.Threading.ManualResetEventSlim")
+                => $"waiting for a ManualResetEventSlim to be set in {at}",
             BlockingKind.MonitorWait => $"waiting in Monitor.Wait in {at}",
             BlockingKind.Join => $"waiting for another thread to finish (Thread.Join) in {at}",
             BlockingKind.SemaphoreWait => $"waiting on a SemaphoreSlim in {at}",
             BlockingKind.WaitHandle => $"waiting on a WaitHandle in {at}",
+            BlockingKind.ReaderWriterLock => $"itself waiting for a ReaderWriterLockSlim in {at}",
+            BlockingKind.TypeInitializer => $"waiting for another thread's static constructor in {at}",
+            BlockingKind.Database => $"waiting for the database in {at}",
+            BlockingKind.ConnectionPool => $"waiting for a database connection from the pool in {at}",
             _ => $"running {at}",
         };
+    }
+
+    /// "Db.Open (Db.cs:26), called from AuditTrail.Write (PoolExhaustion.cs:26)": for helpers, the caller is what matters.
+    public static string WhereWithCaller(IReadOnlyList<StackFrameInfo> frames)
+    {
+        var user = frames.Where(FrameClassifier.IsUserFrame).Take(2).ToList();
+        if (user.Count == 0) return "an unknown place";
+        var best = FrameClassifier.BestUserFrame(frames);
+        return user.Count == 2 && best == user[0] ? $"{Where(user[0])}, called from {Where(user[1])}" : Where(best);
+    }
+
+    /// The lock as a thread holds it: "the lock on X", or "the write lock on X" for a ReaderWriterLockSlim.
+    public static string Held(MonitorLock l) => l.Kind == LockKind.ReaderWriter ? $"the write lock on {l.DisplayName}" : $"the lock on {l.DisplayName}";
+
+    /// The lock as a thread waits for it.
+    public static string Wanted(MonitorLock l) => l.Kind == LockKind.ReaderWriter ? $"{l.DisplayName} (a ReaderWriterLockSlim)" : $"the lock on {l.DisplayName}";
+
+    /// SQL squeezed onto one line and kept short enough for a sentence.
+    public static string Sql(string? sql)
+    {
+        if (string.IsNullOrWhiteSpace(sql)) return "a command";
+        var oneLine = string.Join(' ', sql.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return $"`{(oneLine.Length > 160 ? oneLine[..157] + "..." : oneLine)}`";
     }
 
     public static string Plural(int n, string singular, string? plural = null) => n == 1 ? $"1 {singular}" : $"{n} {plural ?? singular + "s"}";
@@ -48,6 +78,15 @@ internal static class Describe
             2 => $"{list[0]} and {list[1]}",
             _ => string.Join(", ", list.Take(list.Count - 1)) + $" and {list[^1]}",
         };
+    }
+
+    /// An async method of the app itself (not of the BCL or a library like a database driver).
+    public static bool IsAppAsyncMethod(TaskInfo task)
+    {
+        if (task.Kind != TaskKind.AsyncMethod) return false;
+        const string marker = "AsyncStateMachineBox<";
+        var at = task.TypeName.LastIndexOf(marker, StringComparison.Ordinal);
+        return at >= 0 && !FrameClassifier.IsFrameworkType(task.TypeName[(at + marker.Length)..]);
     }
 
     /// Walk an async chain from the waited task to the innermost thing it is waiting for.

@@ -74,6 +74,10 @@ public sealed class ThreadPoolStarvationDetector : IDetector
         BlockingKind.Join => "Thread.Join",
         BlockingKind.SemaphoreWait => "SemaphoreSlim.Wait",
         BlockingKind.WaitHandle => "WaitHandle.WaitOne",
+        BlockingKind.ReaderWriterLock => "ReaderWriterLockSlim",
+        BlockingKind.TypeInitializer => "a static constructor",
+        BlockingKind.Database => "a database call",
+        BlockingKind.ConnectionPool => "the connection pool",
         _ => kind.ToString(),
     };
 }

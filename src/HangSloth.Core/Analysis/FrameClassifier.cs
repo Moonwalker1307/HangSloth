@@ -19,6 +19,14 @@ public enum BlockingKind
     Join,
     SemaphoreWait,
     WaitHandle,
+    /// Trying to enter a ReaderWriterLockSlim (read, write or upgradeable).
+    ReaderWriterLock,
+    /// Waiting for another thread to finish running a static constructor.
+    TypeInitializer,
+    /// Waiting for a database server to answer a command.
+    Database,
+    /// Waiting for a free connection from a database connection pool.
+    ConnectionPool,
 }
 
 public static class FrameClassifier
@@ -30,13 +38,17 @@ public static class FrameClassifier
 
         // app.Run() / host.Run() parks the main thread until shutdown. That's a healthy app, not a hang.
         if (prefix.Any(IsHostRunFrame)) return BlockingKind.Idle;
+        if (prefix.Any(IsConnectionPoolFrame)) return BlockingKind.ConnectionPool;
+        if (prefix.Any(IsDatabaseCommandFrame)) return BlockingKind.Database;
         if (prefix.Any(f => IsTaskWaitMethod(f.TypeName, f.MethodName))) return BlockingKind.TaskWait;
         if (IsIdleInfrastructure(frames)) return BlockingKind.Idle;
+        if (prefix.Any(IsTypeInitializerWait)) return BlockingKind.TypeInitializer;
         if (prefix.Any(IsMonitorEnter)) return BlockingKind.MonitorEnter;
+        if (prefix.Any(f => f.TypeName == "System.Threading.ReaderWriterLockSlim")) return BlockingKind.ReaderWriterLock;
+        if (prefix.Any(f => f.TypeName == "System.Threading.SemaphoreSlim" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.SemaphoreWait;
         if (prefix.Any(f => f.TypeName == "System.Threading.Monitor" && f.MethodName is "Wait" or "ObjWait")) return BlockingKind.MonitorWait;
         if (prefix.Any(f => f.TypeName == "System.Threading.Thread" && f.MethodName is "Sleep" or "SleepInternal")) return BlockingKind.Sleep;
         if (prefix.Any(f => f.TypeName == "System.Threading.Thread" && f.MethodName == "Join")) return BlockingKind.Join;
-        if (prefix.Any(f => f.TypeName == "System.Threading.SemaphoreSlim" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.SemaphoreWait;
         if (prefix.Any(f => f.TypeName == "System.Threading.WaitHandle" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.WaitHandle;
         return BlockingKind.None;
     }
@@ -70,7 +82,57 @@ public static class FrameClassifier
         typeName.StartsWith("System.", StringComparison.Ordinal)
         || typeName.StartsWith("Microsoft.", StringComparison.Ordinal)
         || typeName.StartsWith("Internal.", StringComparison.Ordinal)
-        || typeName.Length == 0;
+        || typeName.Length == 0
+        || IsLibraryType(typeName);
+
+    /// Well-known third-party libraries (database drivers and the like) whose frames are plumbing,
+    /// not the app's code: the interesting frame is the app's call into them.
+    private static readonly string[] LibraryNamespaces =
+        ["Npgsql.", "MySqlConnector.", "MySql.Data.", "Oracle.ManagedDataAccess.", "Dapper.", "Polly."];
+
+    public static bool IsLibraryType(string typeName)
+    {
+        foreach (var ns in LibraryNamespaces)
+            if (typeName.StartsWith(ns, StringComparison.Ordinal)) return true;
+        return false;
+    }
+
+    /// Database drivers by namespace, and how to name the server they talk to.
+    public static string? DatabaseProvider(string typeName) =>
+        typeName.StartsWith("Npgsql.", StringComparison.Ordinal) ? "PostgreSQL"
+        : typeName.StartsWith("Microsoft.Data.SqlClient.", StringComparison.Ordinal) || typeName.StartsWith("System.Data.SqlClient.", StringComparison.Ordinal) ? "SQL Server"
+        : typeName.StartsWith("MySqlConnector.", StringComparison.Ordinal) || typeName.StartsWith("MySql.Data.", StringComparison.Ordinal) ? "MySQL"
+        : typeName.StartsWith("Oracle.ManagedDataAccess.", StringComparison.Ordinal) ? "Oracle"
+        : typeName.StartsWith("Microsoft.Data.Sqlite.", StringComparison.Ordinal) ? "SQLite"
+        : null;
+
+    /// A driver's command or reader method: the thread is waiting for the server's answer.
+    public static bool IsDatabaseCommandFrame(StackFrameInfo f)
+    {
+        if (DatabaseProvider(f.TypeName) is null) return false;
+        var type = f.TypeName;
+        if (type.IndexOf('+') is var plus and >= 0) type = type[..plus];
+        if (type.IndexOf('<') is var generic and >= 0) type = type[..generic];
+        return (type.EndsWith("Command", StringComparison.Ordinal) && f.MethodName.StartsWith("Execute", StringComparison.Ordinal))
+               || (type.EndsWith("Batch", StringComparison.Ordinal) && f.MethodName.StartsWith("Execute", StringComparison.Ordinal))
+               || (type.EndsWith("DataReader", StringComparison.Ordinal) && f.MethodName is "Read" or "NextResult" or "ReadAsync" or "NextResultAsync");
+    }
+
+    /// Renting a connection from the driver's pool (Npgsql's PoolingDataSource, SqlClient's DbConnectionPool...).
+    public static bool IsConnectionPoolFrame(StackFrameInfo f) =>
+        DatabaseProvider(f.TypeName) is not null
+        && (f.TypeName.Contains("PoolingDataSource", StringComparison.Ordinal) || f.TypeName.Contains("ConnectionPool", StringComparison.Ordinal))
+        && (f.MethodName.Contains("Get", StringComparison.Ordinal) || f.MethodName.Contains("Rent", StringComparison.Ordinal) || f.MethodName.Contains("Wait", StringComparison.Ordinal));
+
+    /// .NET 9+ runs class initialization through managed helpers; a thread parked in one, before any of
+    /// the app's own frames, is waiting for another thread's static constructor.
+    public static bool IsTypeInitializerWait(StackFrameInfo f) =>
+        f.TypeName is "System.Runtime.CompilerServices.InitHelpers" or "System.Runtime.CompilerServices.StaticsHelpers"
+        && (f.MethodName.StartsWith("InitClass", StringComparison.Ordinal) || f.MethodName.Contains("StaticBase", StringComparison.Ordinal));
+
+    /// Types whose static constructor is running on this thread (a ".cctor" frame on the stack).
+    public static IEnumerable<string> RunningStaticConstructors(IReadOnlyList<StackFrameInfo> frames) =>
+        frames.Where(f => f.MethodName == ".cctor" && IsUserFrame(f)).Select(f => f.TypeName);
 
     public static bool IsFrameworkModule(string? modulePath)
     {
