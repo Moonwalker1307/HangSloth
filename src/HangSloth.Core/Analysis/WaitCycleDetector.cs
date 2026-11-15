@@ -2,10 +2,10 @@ using HangSloth.Model;
 
 namespace HangSloth.Analysis;
 
-internal enum WaitKind { Lock, Task, Join, TypeInitializer }
+internal enum WaitKind { Lock, Task, Join, TypeInitializer, Send }
 
 /// One thread waiting for another: for a lock it owns, a task it is running, for it to exit,
-/// or for a static constructor it is running.
+/// for a static constructor it is running, or to run a callback Sent to its SynchronizationContext.
 internal sealed record WaitEdge(int From, int To, WaitKind Kind, MonitorLock? Lock = null, TaskInfo? Task = null, string? TypeName = null);
 
 internal static class WaitGraph
@@ -32,6 +32,11 @@ internal static class WaitGraph
             else if (t.JoiningThreadId is { } joined && snapshot.FindThread(joined) is not null)
             {
                 edges[t.ManagedId] = new WaitEdge(t.ManagedId, joined, WaitKind.Join);
+            }
+            else if (t.SendingTo is { } context
+                     && snapshot.Threads.FirstOrDefault(o => o.ManagedId != t.ManagedId && o.SynchronizationContext?.Address == context.Address) is { } owner2)
+            {
+                edges[t.ManagedId] = new WaitEdge(t.ManagedId, owner2.ManagedId, WaitKind.Send, TypeName: context.TypeName);
             }
             else if (FrameClassifier.Classify(t.Frames) == BlockingKind.TypeInitializer && FindInitializer(snapshot, t) is var (initializer, type))
             {
@@ -108,6 +113,8 @@ public sealed class WaitCycleDetector : IDetector
         var threads = cycle.Select(id => snapshot.FindThread(id)!).ToList();
         var kinds = cycle.Select(id => edges[id].Kind).ToHashSet();
         var typeInit = cycle.Select(id => edges[id]).FirstOrDefault(e => e.Kind == WaitKind.TypeInitializer);
+        var send = cycle.Select(id => edges[id]).FirstOrDefault(e => e.Kind == WaitKind.Send);
+        var parallel = cycle.Select(id => edges[id].Task).Any(t => t?.Description.StartsWith("a Parallel.", StringComparison.Ordinal) == true);
         var lazy = cycle.Select(id => edges[id].Lock).FirstOrDefault(l => l?.DisplayName.Contains("Lazy<", StringComparison.Ordinal) == true);
 
         var details = threads.Select(t => Step(snapshot, t, edges[t.ManagedId])).ToList();
@@ -131,13 +138,22 @@ public sealed class WaitCycleDetector : IDetector
         else
         {
             id = "wait-cycle";
-            title = lazy is not null ? "Deadlock: Lazy<T> factory waiting for code that needs the same Lazy<T>" : "Deadlock: threads waiting on each other";
+            title = lazy is not null ? "Deadlock: Lazy<T> factory waiting for code that needs the same Lazy<T>"
+                : send is not null ? $"Deadlock: {snapshot.FindThread(send.To)!.Label} waits for work that is waiting for it"
+                : parallel ? "Deadlock: Parallel loop body needs a lock its caller holds"
+                : "Deadlock: threads waiting on each other";
             summary = (threads.Count == 2
                 ? $"{labels[0]} and {labels[1]} are waiting for each other, so neither can ever continue."
                 : $"{Describe.JoinAnd(labels)} are waiting for each other in a circle, so none of them can ever continue.") + start;
             advice = lazy is not null
                 ? $"A Lazy<T> runs its factory under a lock (LazyThreadSafetyMode.ExecutionAndPublication), and this factory waits for work that reads {LazyField(lazy)}.Value. " +
                   "Don't read the Value from inside the factory, directly or from work the factory waits for: pass the data it needs in instead."
+                : send is not null
+                    ? $"{snapshot.FindThread(send.To)!.Label} owns the {Names.ShortType(send.TypeName!)} and is blocked, so the callback Sent to it (Send, Control.Invoke, Dispatcher.Invoke) can never run. " +
+                      "Don't block a thread with a SynchronizationContext (a UI thread) on work that calls back into it: await the work instead of Wait()/.Result, or use Post/BeginInvoke for the callback."
+                : parallel
+                    ? "Parallel.For/ForEach runs the loop body on other threads, so a lock the caller holds isn't reentrant for them. Don't hold a lock around a parallel loop whose body takes it: " +
+                      "release it first, or collect results without the lock and apply them afterwards."
                 : kinds.Contains(WaitKind.Join)
                     ? "Don't Join a thread while holding a lock that thread needs to finish. Release the lock before calling Join (set the stop flag under the lock, Join outside it)."
                     : "Don't block on a task while holding a lock the task needs. Release the lock before waiting, await outside the lock, or let the task do its work without taking the lock.";
@@ -154,6 +170,13 @@ public sealed class WaitCycleDetector : IDetector
             ThreadIds = cycle,
             Location = site?.Source,
         };
+    }
+
+    /// The code that called Send, rather than the Send override itself.
+    private static StackFrameInfo? SendCaller(ThreadSnapshot t, WaitEdge edge)
+    {
+        var i = t.Frames.ToList().FindIndex(f => f.MethodName == "Send" && f.TypeName == edge.TypeName);
+        return i < 0 ? FrameClassifier.BestUserFrame(t.Frames) : FrameClassifier.BestUserFrame(t.Frames.Skip(i + 1).ToList()) ?? FrameClassifier.BestUserFrame(t.Frames);
     }
 
     /// "CatalogService._catalog (Lazy<Catalog>)" -> "CatalogService._catalog".
@@ -179,6 +202,7 @@ public sealed class WaitCycleDetector : IDetector
             WaitKind.Lock => $"{t.Label} {holds}is waiting in {where} for {Describe.Wanted(edge.Lock!)}, which {other} holds.",
             WaitKind.Task => $"{t.Label} {holds}is blocked in {FrameClassifier.DescribeTaskWait(t.Frames)} at {where}, waiting for {Describe.Task(edge.Task!)}, which is running on {other}.",
             WaitKind.Join => $"{t.Label} {holds}is waiting in {where} for {other} to finish (Thread.Join).",
+            WaitKind.Send => $"{t.Label} {holds}is blocked in {Names.ShortType(edge.TypeName!)}.Send, called from {Describe.Where(SendCaller(t, edge))}, waiting for {other} to run the callback, since that SynchronizationContext belongs to {other}.",
             _ => $"{t.Label} {holds}needs {(edge.TypeName is { } type ? Names.ShortType(type) : "a type")} in {where}, so it waits for its static constructor, which {other} is running.",
         };
     }

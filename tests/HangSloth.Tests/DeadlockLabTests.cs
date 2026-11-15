@@ -14,12 +14,14 @@ public class DeadlockLabTests
     public static TheoryData<string> CodeScenarios =>
     [
         "transfer", "dining-philosophers", "event-callback", "library-sync-over-async", "semaphore-order", "async-semaphore-reentry",
-        "rwlock-vs-lock", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose", "healthy",
+        "rwlock-vs-lock", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose",
+        "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse", "healthy",
     ];
 
     public static TheoryData<string> DatabaseScenarios =>
     [
-        "db-forgotten-transaction", "db-deadlock-retry", "db-app-lock-cycle", "db-pool-exhaustion", "db-async-row-lock", "db-healthy",
+        "db-forgotten-transaction", "db-deadlock-retry", "db-app-lock-cycle", "db-pool-exhaustion", "db-async-row-lock",
+        "db-migration-lock", "db-advisory-lock", "db-starvation", "db-async-pool-exhaustion", "db-healthy",
     ];
 
     /// Phrases the explanation must contain: names of the app's own locks, methods and SQL, not just the right finding id.
@@ -41,6 +43,16 @@ public class DeadlockLabTests
         ["db-deadlock-retry"] = ["each inside its own open transaction", "`UPDATE lab_ledger"],
         ["db-app-lock-cycle"] = ["ProductCache._cacheLock", "`UPDATE lab_products SET views = views + 1 WHERE id = 1`", "pg_blocking_pids"],
         ["db-pool-exhaustion"] = ["4 of 4 connections in use", "AuditTrail.Write"],
+        ["parallel-foreach-under-lock"] = ["a lock the caller holds isn't reentrant for them", "ThumbnailService._cacheLock", "a Parallel.For/ForEach worker"],
+        ["ui-invoke"] = ["UiDispatcherContext.Send, called from ExportWindow.Export (UiInvoke.cs:", "Task.Run(ExportWindow.Export)"],
+        ["inline-continuation"] = ["OrderPipeline._pipelineLock", "OrderPipeline.ShippingLock", "inline: OrderPipeline.MarkPaid (InlineContinuation.cs:", "RunContinuationsAsynchronously"],
+        ["throttle-reentry"] = ["PartnerApi._throttle", "3 slots and 3 async callers waiting"],
+        ["bounded-queue"] = ["EventBus._queue", "full (2 of 2)", "EventBus._subscribersLock"],
+        ["lost-pulse"] = ["Monitor.Wait(WorkQueue._sync)", "WorkQueue._items (1 item)", "(Thread.Join)"],
+        ["db-migration-lock"] = ["`SELECT count(*) FROM lab_catalog`", "has an open transaction", "ALTER TABLE"],
+        ["db-advisory-lock"] = ["`SELECT pg_advisory_lock(4242)`", "NightlyJob._leaderConnection", "locktype = 'advisory'"],
+        ["db-starvation"] = ["ReportsController.GetCount", "`SELECT count(*) FROM lab_reports, pg_sleep(30)`"],
+        ["db-async-pool-exhaustion"] = ["3 of 3 connections in use", "AsyncCheckoutHandler.WriteAuditAsync", "AsyncCheckoutHandler.HandleAsync"],
         ["db-async-row-lock"] = ["AsyncRefundService.RefundAsync", "`UPDATE lab_async_wallets SET balance = balance + 5 WHERE id = 1`"],
     };
 

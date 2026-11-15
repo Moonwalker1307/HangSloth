@@ -1,8 +1,8 @@
 # DeadlockLab
 
-A small, deliberately broken "shop" app with 19 ways to hang: textbook lock-ordering deadlocks, the
-hidden kind that hide in callbacks, libraries, initializers and semaphores, and deadlocks that involve
-a real PostgreSQL database. It's HangSloth's test bed: every scenario declares which finding HangSloth
+A small, deliberately broken "shop" app with 29 ways to hang: textbook lock-ordering deadlocks, the
+hidden kind that hide in callbacks, libraries, initializers, semaphores, queues and UI dispatching, and
+deadlocks that involve a real PostgreSQL database. It's HangSloth's test bed: every scenario declares which finding HangSloth
 should report, and the end-to-end tests (`tests/HangSloth.Tests/DeadlockLabTests.cs`) run them all.
 
 ```sh
@@ -33,12 +33,22 @@ Database scenarios need PostgreSQL. Set `DEADLOCKLAB_PG` to an Npgsql connection
 | `lock-then-wait` | obvious | A thread holds a lock and `.Result`s a `Task.Run` that needs that lock. | `wait-cycle` (lock + task) |
 | `thread-join-under-lock` | hidden | `Stop()` joins the worker while holding the lock the worker needs to finish. | `wait-cycle` (lock + join) |
 | `timer-dispose` | hidden | `Stop()` holds a lock while waiting for the timer to drain; the in-flight callback waits for that lock. | `lock-contention`, flagging the timer callback (the link between a `WaitHandle` and a timer isn't in the dump) |
+| `parallel-foreach-under-lock` | hidden | A thread holds a lock and runs `Parallel.ForEach`; the loop body, on other threads, takes the same lock. | `wait-cycle` (lock + Parallel worker) |
+| `ui-invoke` | hidden | The UI thread `.Wait()`s for a background export, which `Send`s a status update to the UI thread (`Control.Invoke` style). | `wait-cycle` (task + `SynchronizationContext.Send`) |
+| `inline-continuation` | hidden | `TaskCompletionSource.SetResult` under a lock runs the awaiting method inline; that continuation needs a lock another thread holds while it waits for the first. | `lock-deadlock`, pointing out the continuation that ran inside `SetResult` |
+| `throttle-reentry` | hidden | A `SemaphoreSlim(3)` throttle: each call holds a slot and makes a nested call through the same throttle. Three concurrent calls use every slot. | `semaphore-wait` (Critical: every slot held by a nested waiter) |
+| `bounded-queue` | hidden | A publisher holds a lock while adding to a full `BlockingCollection`; the only consumer needs that lock before it takes the next item. | `bounded-queue-deadlock` |
+| `lost-pulse` | hidden | A hand-rolled queue pulses only when the consumer is already waiting; the item arrived first, so the consumer waits forever. | `monitor-wait`, noting the queue already holds an item |
 | `healthy` | control | Short locks and a timer, nothing wrong. | nothing |
 | `db-forgotten-transaction` | obvious | One thread updates a row and waits for an approval without committing; another updates the same row. | `database-wait` naming the idle transaction and the blocked SQL |
 | `db-deadlock-retry` | obvious | Two transactions update two rows in opposite order; PostgreSQL aborts one, the app retries the same way. | `database-wait` (possible database deadlock) |
 | `db-app-lock-cycle` | hidden | Thread A holds an app lock and waits for a row lock; thread B holds that row lock in a transaction and waits for the app lock. Neither .NET nor PostgreSQL sees the cycle. | `database-deadlock` |
 | `db-pool-exhaustion` | hidden | Each request holds a connection and opens a second one for audit logging; with more requests than pool slots, nobody gets one. | `connection-pool-exhausted` (pool deadlock) |
 | `db-async-row-lock` | hidden | Like the forgotten transaction, but the blocked update is async and the caller blocks on it. | `database-wait`, following the async chain into the driver to get the SQL |
+| `db-migration-lock` | hidden | A migration runs `ALTER TABLE` in a transaction and waits before committing; plain `SELECT`s queue behind its table lock. | `database-wait` (reads blocked by a table lock) |
+| `db-advisory-lock` | hidden | A job takes a session-level `pg_advisory_lock`, never unlocks, and keeps the connection in a field; the next scheduler waits forever. No transaction involved. | `database-wait`, naming the idle connection in `NightlyJob._leaderConnection` |
+| `db-starvation` | obvious | Controller actions block on async database calls with `.Result`; requests hold every pool thread. | `threadpool-starvation`, with the SQL they wait for |
+| `db-async-pool-exhaustion` | hidden | The async version of the nested-connection pool deadlock: no thread is blocked on the database, every request awaits a second connection while holding one. | `connection-pool-exhausted`, found from the paused async methods on the heap |
 | `db-healthy` | control | An idle app with an open pooled connection. | nothing |
 
 A database deadlock that stays inside the database (`db-deadlock-retry`) is detected by the database
@@ -48,7 +58,8 @@ the server (`pg_blocking_pids`).
 
 ## Before and after
 
-When the lab was written, HangSloth explained 7 of the 19 scenarios. Most misses were reported as plain
+When the lab was written, HangSloth explained 7 of the first 19 scenarios, and after the first round
+of fixes, 4 of the 10 added later. Most misses were reported as plain
 lock contention ("held by Thread 1, which is blocked on .Wait()"), which is true but doesn't say
 it's a deadlock, or not at all (semaphores, static constructors, everything involving the database).
-It now explains all 19. The changes are described in the pull request that added the lab.
+It now explains all 29. The changes are described in the pull requests that added the scenarios.

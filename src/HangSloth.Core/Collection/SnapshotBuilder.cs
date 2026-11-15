@@ -79,6 +79,7 @@ public sealed partial class SnapshotBuilder
             var result = snapshot with
             {
                 RunningTask = FindRunningTask(roots),
+                SendingTo = FindSendTarget(roots),
                 Database = ReadDatabaseActivity(roots, BlockingKind.None),
             };
             var kind = FrameClassifier.Classify(snapshot.Frames);
@@ -97,7 +98,10 @@ public sealed partial class SnapshotBuilder
                     result = result with { WaitingForLock = FindReaderWriterLock(roots, locks) };
                     break;
                 case BlockingKind.SemaphoreWait:
-                    result = result with { WaitingForSemaphore = FindSemaphoreBeingWaited(roots) };
+                    result = result with { WaitingForSemaphore = FindSemaphoreBeingWaited(roots), WaitingOnCollection = FindCollectionWait(roots) };
+                    break;
+                case BlockingKind.MonitorWait:
+                    result = result with { WaitingForPulse = FindPulseWait(roots, snapshot.Frames) };
                     break;
                 case BlockingKind.Join:
                     result = result with { JoiningThreadId = FindJoinTarget(roots, clr.ManagedThreadId) };
@@ -111,7 +115,13 @@ public sealed partial class SnapshotBuilder
 
         // Fill in waiters from what each thread is trying to enter, and name each lock after the field holding it.
         var semaphoreAddresses = threads.Select(t => t.WaitingForSemaphore).OfType<ulong>().Concat(_semaphoresInChains).ToHashSet();
-        var named = NameObjects(locks.Keys.Concat(semaphoreAddresses).ToHashSet(), partial.SelectMany(p => p.Roots));
+        var collections = threads.Select(t => t.WaitingOnCollection?.Collection.Address)
+            .Concat(threads.Select(t => t.WaitingForPulse?.Object.Address)).OfType<ulong>();
+        var named = NameObjects(locks.Keys.Concat(semaphoreAddresses).Concat(collections).ToHashSet(), partial.SelectMany(p => p.Roots));
+        threads = threads
+            .Select(t => t.WaitingOnCollection is { } c && named.TryGetValue(c.Collection.Address, out var n) ? t with { WaitingOnCollection = c with { FieldName = n.Name } } : t)
+            .Select(t => t.WaitingForPulse is { } w && named.TryGetValue(w.Object.Address, out var n) ? t with { WaitingForPulse = w with { FieldName = n.Name } } : t)
+            .ToList();
         var lockList = locks.Values
             .Select(l => l with
             {
@@ -132,6 +142,7 @@ public sealed partial class SnapshotBuilder
             Locks = lockList,
             Semaphores = semaphores,
             ThreadPool = ReadThreadPool(),
+            AsyncPoolWaits = ReadAsyncPoolWaits(),
             Warnings = _warnings,
         };
     }
@@ -356,7 +367,10 @@ public sealed partial class SnapshotBuilder
         {
             var target = action.IsDelegate ? action.AsDelegate().GetDelegateTarget()?.Method : null;
             var name = target is null ? "a delegate" : Names.ShortMethod(target.Type?.Name ?? "", target.Name ?? "?");
-            return info with { Kind = TaskKind.Delegate, Description = $"Task.Run({name})" };
+            var description = target?.Type?.Name?.StartsWith("System.Threading.Tasks.TaskReplicator", StringComparison.Ordinal) == true
+                ? "a Parallel.For/ForEach worker"
+                : $"Task.Run({name})";
+            return info with { Kind = TaskKind.Delegate, Description = description };
         }
 
         var generic = GenericArgument(typeName, "Task<");

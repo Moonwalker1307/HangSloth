@@ -12,6 +12,9 @@ public sealed record ProcessSnapshot
     public IReadOnlyList<MonitorLock> Locks { get; init; } = [];
     public IReadOnlyList<SemaphoreInfo> Semaphores { get; init; } = [];
     public ThreadPoolSnapshot? ThreadPool { get; init; }
+    /// Connection pools that are full with async callers queued for a connection. Async waiters don't
+    /// block a thread, so they don't show up in any stack.
+    public IReadOnlyList<AsyncPoolWait> AsyncPoolWaits { get; init; } = [];
     public IReadOnlyList<string> Warnings { get; init; } = [];
 
     public ThreadSnapshot? FindThread(int managedId) => Threads.FirstOrDefault(t => t.ManagedId == managedId);
@@ -44,8 +47,18 @@ public sealed record ThreadSnapshot
     /// Address of the SemaphoreSlim this thread is synchronously waiting on (SemaphoreSlim.Wait), if any.
     public ulong? WaitingForSemaphore { get; init; }
 
+    /// The object this thread is waiting on with a direct Monitor.Wait from app code, if any.
+    public PulseWait? WaitingForPulse { get; init; }
+
+    /// The BlockingCollection this thread is waiting to add to (it is full) or take from (it is empty), if any.
+    public CollectionWait? WaitingOnCollection { get; init; }
+
     /// The managed id of the thread this one is waiting for with Thread.Join, if any.
     public int? JoiningThreadId { get; init; }
+
+    /// The SynchronizationContext this thread is synchronously Sending a callback to (Control.Invoke style), if any.
+    /// The thread whose SynchronizationContext it is has to run the callback before this one can continue.
+    public ObjectRef? SendingTo { get; init; }
 
     /// The task whose delegate this thread is currently running (a Task.Run body), if any.
     public ulong? RunningTask { get; init; }
@@ -166,6 +179,32 @@ public sealed record MonitorLock
     public IReadOnlyList<int> WaiterThreadIds { get; init; } = [];
 }
 
+/// A thread in Monitor.Wait(obj), waiting for another thread to call Monitor.Pulse(obj).
+public sealed record PulseWait
+{
+    public required ObjectRef Object { get; init; }
+    /// The field that holds the object, e.g. "WorkQueue._sync", when found.
+    public string? FieldName { get; init; }
+    public string DisplayName => FieldName ?? Names.ShortType(Object.TypeName);
+    /// Collections in the same object that already hold items, e.g. "WorkQueue._items (1 item)":
+    /// work is there, yet the thread waits to be told about it.
+    public IReadOnlyList<string> PendingWork { get; init; } = [];
+}
+
+/// A thread blocked in BlockingCollection.Add (no room) or Take (nothing to take).
+public sealed record CollectionWait
+{
+    public required ObjectRef Collection { get; init; }
+    public bool Adding { get; init; }
+    /// The bounded capacity, or null for an unbounded collection.
+    public int? Capacity { get; init; }
+    /// Items currently in the collection, when it could be read.
+    public int? Count { get; init; }
+    /// The field that holds the collection, e.g. "EventBus._queue", when found.
+    public string? FieldName { get; init; }
+    public string DisplayName => FieldName ?? Names.ShortType(Collection.TypeName);
+}
+
 public sealed record ThreadPoolSnapshot
 {
     public int MinThreads { get; init; }
@@ -223,6 +262,23 @@ public sealed record DatabaseActivity
     public ConnectionPoolInfo? Pool { get; init; }
 }
 
-public sealed record DatabaseConnection(int? SessionId, bool InTransaction);
+/// <param name="Field">Set when the connection was found in a field of an object on the stack
+/// (e.g. "NightlyJob._leaderConnection") rather than as a local: it outlives the current call.</param>
+public sealed record DatabaseConnection(int? SessionId, bool InTransaction, string? Field = null);
 
 public sealed record ConnectionPoolInfo(int MaxSize, int OpenConnections, int IdleConnections);
+
+public sealed record AsyncPoolWait
+{
+    public required string Provider { get; init; }
+    public required ConnectionPoolInfo Pool { get; init; }
+    /// Callers queued inside the pool for a connection (OpenAsync).
+    public int QueuedOpens { get; init; }
+    /// The app's paused async methods that use this pool.
+    public IReadOnlyList<AsyncConnectionUser> Methods { get; init; } = [];
+}
+
+/// <param name="HoldsConnection">One of its locals is an open connection from the pool.</param>
+/// <param name="WaitingForConnection">It is awaiting, directly or through other async methods, an OpenAsync on the pool.</param>
+/// <param name="OpeningIn">The app method in its await chain that calls OpenAsync, with where, e.g. "AuditLog.WriteAsync (Audit.cs:12)".</param>
+public sealed record AsyncConnectionUser(string Method, SourceLocation? PausedAt, bool HoldsConnection, bool WaitingForConnection, string? OpeningIn = null);

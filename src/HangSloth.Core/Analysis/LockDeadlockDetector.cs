@@ -58,6 +58,8 @@ public sealed class LockDeadlockDetector : IDetector
             details.Add($"{t.Label} {holds}is waiting in {Describe.Where(FrameClassifier.BestUserFrame(t.Frames))} " +
                         $"for {Describe.Wanted(wanted)}, which {snapshot.FindThread(owner)?.Label ?? $"thread {owner}"} holds.");
         }
+        var inline = threads.Select(Describe.InlineContinuation).OfType<string>().ToList();
+        details.AddRange(inline);
 
         var labels = threads.Select(t => t.Label).ToList();
         var summary = threads.Count == 2
@@ -79,7 +81,7 @@ public sealed class LockDeadlockDetector : IDetector
             Title = "Deadlock: threads waiting on each other's locks",
             Summary = summary + (first?.Source is null ? "" : $" Start at {first.Source}."),
             Details = details,
-            Advice = advice,
+            Advice = advice + (inline.Count > 0 ? Describe.InlineContinuationAdvice : ""),
             ThreadIds = cycle,
             Location = first?.Source,
         };

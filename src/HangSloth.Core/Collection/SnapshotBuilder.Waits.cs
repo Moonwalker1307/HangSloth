@@ -28,6 +28,21 @@ public sealed partial class SnapshotBuilder
         return null;
     }
 
+    /// A SynchronizationContext.Send override on the stack, and the context it was called on. Send runs the
+    /// callback on the context's thread and waits for it, like Control.Invoke and Dispatcher.Invoke.
+    private static ObjectRef? FindSendTarget(List<ClrStackRoot> roots)
+    {
+        foreach (var root in roots)
+        {
+            if (root.StackFrame?.Method is not { Name: "Send" } m || m.Type?.Name == SyncContextType || !DerivesFrom(m.Type, SyncContextType)) continue;
+            if (!root.Object.IsNull && DerivesFrom(root.Object.Type, SyncContextType))
+                return new ObjectRef(root.Object.Address, root.Object.Type?.Name ?? SyncContextType);
+        }
+        return null;
+    }
+
+    private const string SyncContextType = "System.Threading.SynchronizationContext";
+
     private static int? FindJoinTarget(List<ClrStackRoot> roots, int self)
     {
         foreach (var root in roots)
@@ -77,6 +92,64 @@ public sealed partial class SnapshotBuilder
         return null;
     }
 
+    private static readonly string[] WorkCollections =
+        ["System.Collections.Generic.Queue<", "System.Collections.Generic.Stack<", "System.Collections.Generic.List<",
+         "System.Collections.Generic.LinkedList<", "System.Collections.Generic.PriorityQueue<"];
+
+    /// Monitor.Wait called directly from app code (not from inside ManualResetEventSlim, SemaphoreSlim...):
+    /// the object passed to it, and any collection next to it that already holds work.
+    private static PulseWait? FindPulseWait(List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
+    {
+        var prefix = FrameClassifier.FrameworkPrefix(frames);
+        if (prefix.Any(f => f.TypeName != "System.Threading.Monitor")) return null;
+
+        var target = roots.FirstOrDefault(r => r.StackFrame?.Method is { Name: "Wait" or "ObjWait", Type.Name: "System.Threading.Monitor" } && !r.Object.IsNull)?.Object;
+        if (target is not { } obj) return null;
+
+        var pending = new List<string>();
+        foreach (var root in roots)
+        {
+            var owner = root.Object;
+            if (owner.IsNull || owner.Type is null || FrameClassifier.IsFrameworkType(owner.Type.Name ?? "")) continue;
+            if (!owner.Type.Fields.Any(f => f.IsObjectReference && owner.ReadObjectField(f).Address == obj.Address)) continue;
+            foreach (var field in owner.Type.Fields)
+            {
+                if (!field.IsObjectReference) continue;
+                var value = owner.ReadObjectField(field);
+                if (value.IsNull || value.Address == obj.Address || value.Type?.Name is not { } typeName || !WorkCollections.Any(c => typeName.StartsWith(c, StringComparison.Ordinal))) continue;
+                var count = value.ReadInt("_size") ?? value.ReadInt("count");
+                if (count is > 0)
+                    pending.Add($"{Names.ShortType(owner.Type.Name ?? "")}.{CleanFieldName(field.Name)} ({count} {(count == 1 ? "item" : "items")})");
+            }
+            break;
+        }
+        return new PulseWait { Object = new ObjectRef(obj.Address, obj.Type?.Name ?? "System.Object"), PendingWork = pending };
+    }
+
+    /// BlockingCollection.Add and Take wait on one of its two internal semaphores: free slots and occupied slots.
+    private static CollectionWait? FindCollectionWait(List<ClrStackRoot> roots)
+    {
+        foreach (var root in roots)
+        {
+            var method = root.StackFrame?.Method;
+            if (method?.Type?.Name?.StartsWith("System.Collections.Concurrent.BlockingCollection<", StringComparison.Ordinal) != true) continue;
+            var adding = method.Name == "TryAddWithNoTimeValidation";
+            if (!adding && method.Name != "TryTakeWithNoTimeValidation") continue;
+            var c = root.Object;
+            if (c.IsNull || c.Type?.Name?.StartsWith("System.Collections.Concurrent.BlockingCollection<", StringComparison.Ordinal) != true) continue;
+            var capacity = c.ReadInt("_boundedCapacity");
+            int? count = c.TryReadObjectField("_occupiedNodes", out var occupied) && !occupied.IsNull ? occupied.ReadInt("m_currentCount") : null;
+            return new CollectionWait
+            {
+                Collection = new ObjectRef(c.Address, c.Type.Name),
+                Adding = adding,
+                Capacity = capacity is > 0 ? capacity : null,
+                Count = count,
+            };
+        }
+        return null;
+    }
+
     /// WaitAsync queues a TaskNode on the semaphore; the node doesn't point back, so map nodes to semaphores once.
     private ulong? FindSemaphoreOfTaskNode(ClrObject node)
     {
@@ -109,7 +182,10 @@ public sealed partial class SnapshotBuilder
         for (var guard = 0; !node.IsNull && guard < 10_000; guard++)
         {
             yield return node.Address;
-            if (!node.TryReadObjectField("Next", out node)) yield break;
+            // Next is declared on TaskNode itself; look it up on the node's own type.
+            var next = node.Type?.GetFieldByName("Next");
+            if (next is null || !next.IsObjectReference) yield break;
+            node = node.ReadObjectField(next);
         }
     }
 
@@ -150,7 +226,26 @@ public sealed partial class SnapshotBuilder
             else if (DerivesFrom(obj.Type, "System.Data.Common.DbConnection")) connections.Add(obj);
         }
 
-        var open = connections.Select(ReadConnection).OfType<DatabaseConnection>().ToList();
+        // A connection kept in a field of the app's own objects (a "leader" connection, a cached one) is
+        // held for as long as that object lives, even while the thread does something else.
+        var kept = new List<(ClrObject Connection, string Field)>();
+        var scanned = new HashSet<ulong>();
+        foreach (var root in roots)
+        {
+            var owner = root.Object;
+            if (owner.IsNull || owner.Type is null || FrameClassifier.IsFrameworkType(owner.Type.Name ?? "") || !scanned.Add(owner.Address)) continue;
+            foreach (var field in owner.Type.Fields)
+            {
+                if (!field.IsObjectReference) continue;
+                var value = owner.ReadObjectField(field);
+                if (!value.IsNull && seen.Add(value.Address) && DerivesFrom(value.Type, "System.Data.Common.DbConnection"))
+                    kept.Add((value, $"{Names.ShortType(owner.Type.Name ?? "")}.{CleanFieldName(field.Name)}"));
+            }
+        }
+
+        var open = connections.Select(ReadConnection).OfType<DatabaseConnection>()
+            .Concat(kept.Select(k => ReadConnection(k.Connection) is { } c ? c with { Field = k.Field } : null).OfType<DatabaseConnection>())
+            .ToList();
         var waiting = kind switch
         {
             BlockingKind.Database => DatabaseWaitKind.Query,
@@ -160,7 +255,7 @@ public sealed partial class SnapshotBuilder
         if (waiting == DatabaseWaitKind.None && open.Count == 0) return null;
 
         var command = waiting == DatabaseWaitKind.Query ? commands.FirstOrDefault() : default;
-        var typeName = (commands.Concat(connections).FirstOrDefault().Type?.Name) ?? "";
+        var typeName = (commands.Concat(connections).Concat(kept.Select(k => k.Connection)).FirstOrDefault().Type?.Name) ?? "";
         return new DatabaseActivity
         {
             Provider = FrameClassifier.DatabaseProvider(typeName) ?? "the database",

@@ -53,6 +53,31 @@ public static class FrameClassifier
         return BlockingKind.None;
     }
 
+    private static readonly HashSet<string> CompletionMethods =
+        ["SetResult", "TrySetResult", "SetException", "TrySetException", "SetCanceled", "TrySetCanceled", "TrySetCanceledCore"];
+
+    /// An async method's continuation running inline, inside the SetResult (or Cancel) call that completed the
+    /// task it awaited: the awaiting code and the completing code share one thread, and the completer's locks.
+    /// Returns the async method's frame and the app frame that completed the task.
+    public static (StackFrameInfo Continuation, StackFrameInfo Completer)? InlineContinuation(IReadOnlyList<StackFrameInfo> frames)
+    {
+        var first = frames.ToList().FindIndex(IsUserFrame);
+        if (first < 0) return null;
+        var completedAt = -1;
+        for (var i = first + 1; i < frames.Count; i++)
+        {
+            if (IsUserFrame(frames[i]))
+            {
+                if (completedAt < 0) return null;
+                return (frames[first], frames[i]);
+            }
+            if (frames[i].TypeName.StartsWith("System.Threading.Tasks.", StringComparison.Ordinal) && CompletionMethods.Contains(frames[i].MethodName)
+                || frames[i].TypeName == "System.Threading.CancellationTokenSource" && frames[i].MethodName.StartsWith("Cancel", StringComparison.Ordinal))
+                completedAt = i;
+        }
+        return null;
+    }
+
     public static bool IsBlocked(BlockingKind kind) => kind is not (BlockingKind.None or BlockingKind.Idle);
 
     /// The framework frames at the top of the stack, above the first frame of the app's own code.
