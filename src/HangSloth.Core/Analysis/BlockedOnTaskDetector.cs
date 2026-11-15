@@ -78,13 +78,18 @@ public sealed class BlockedOnTaskDetector : IDetector
             details.Add($"{Describe.JoinAnd(sameOwner.Select(t => t.Description))}, earlier in this same async chain, runs on the same object that owns {name}. " +
                         $"If it took {name} before calling {waiting!.Description}, the chain is waiting for itself: SemaphoreSlim isn't reentrant, so the second WaitAsync never completes.");
         }
+        // A throttle (max N) where every slot is held by a call waiting for a nested slot: N nested waiters, 0 free.
+        var throttle = sameOwner.Count > 0 && semaphore is { MaxCount: > 1 and < int.MaxValue, CurrentCount: 0 } t && t.AsyncWaiters >= t.MaxCount;
+        if (throttle)
+            details.Add($"{name} has {semaphore!.MaxCount} slots and {semaphore.AsyncWaiters} async callers waiting for one. If each of them is a nested call like this one, " +
+                        $"every slot is held by a call that waits for another slot: a throttle deadlock that needs only {semaphore.MaxCount} concurrent calls.");
         if (semaphore is not null) details.Add(SemaphoreFacts.NoOwner(semaphore));
 
         return new Finding
         {
             Id = "semaphore-wait",
             // Paused past its own WaitAsync and waiting on the same one-slot semaphore: as good as proof.
-            Severity = sameOwner.Count > 0 && semaphore is { MaxCount: 1, CurrentCount: 0 } ? Severity.Critical : Severity.Warning,
+            Severity = sameOwner.Count > 0 && (semaphore is { MaxCount: 1, CurrentCount: 0 } || throttle) ? Severity.Critical : Severity.Warning,
             Title = sameOwner.Count > 0 ? "Deadlock: async code waiting for a SemaphoreSlim it already holds" : "Waiting for a SemaphoreSlim nobody releases",
             Summary = $"{thread.Label} is blocked in {call} at {Describe.Spot(site)}, waiting for {Path(chain, leafText)}.",
             Details = details,

@@ -20,7 +20,7 @@ dotnet build "$repo_root/samples/DeadlockLab" -c Release -o "$work/lab" -v quiet
 mapfile -t rows < <(dotnet "$work/lab/DeadlockLab.dll" --list)
 wanted=("$@")
 pass=0; fail=0; skipped=0
-printf '\n%-26s %-9s %-8s %-28s %s\n' SCENARIO AREA KIND EXPECTED FOUND
+printf '\n%-28s %-9s %-8s %-28s %s\n' SCENARIO AREA KIND EXPECTED FOUND
 for row in "${rows[@]}"; do
   IFS=$'\t' read -r name area difficulty expected story <<< "$row"
   [ "$expected" = - ] && expected=
@@ -32,7 +32,7 @@ for row in "${rows[@]}"; do
   app=$!
   for _ in $(seq 150); do grep -q '^READY$' "$log" && break; kill -0 $app 2>/dev/null || break; sleep 0.2; done
   if ! grep -q '^READY$' "$log"; then
-    printf '%-26s %-9s %-8s %-28s %s\n' "$name" "$area" "$difficulty" "${expected:--}" "ERROR: never became ready (see $log)"
+    printf '%-28s %-9s %-8s %-28s %s\n' "$name" "$area" "$difficulty" "${expected:--}" "ERROR: never became ready (see $log)"
     kill -9 $app 2>/dev/null; fail=$((fail+1)); continue
   fi
 
@@ -54,7 +54,7 @@ print(",".join(dict.fromkeys(ids)))')
   for id in ${expected//,/ }; do [[ ",$found," == *",$id,"* ]] || ok=no; done
   [ -z "$expected" ] && [ -n "$found" ] && ok=no
   [ $ok = yes ] && pass=$((pass+1)) || fail=$((fail+1))
-  printf '%-26s %-9s %-8s %-28s %s %s\n' "$name" "$area" "$difficulty" "${expected:--}" "${found:--}" "$([ $ok = yes ] && echo '✔' || echo '✖')"
+  printf '%-28s %-9s %-8s %-28s %s %s\n' "$name" "$area" "$difficulty" "${expected:--}" "${found:--}" "$([ $ok = yes ] && echo '✔' || echo '✖')"
 done
 echo
 echo "$pass caught, $fail missed or wrong, $skipped skipped. Logs in $work"

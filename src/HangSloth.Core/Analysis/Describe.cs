@@ -24,6 +24,8 @@ internal static class Describe
     {
         var kind = FrameClassifier.Classify(thread.Frames);
         var at = withMethod ? Where(FrameClassifier.BestUserFrame(thread.Frames)) : Spot(FrameClassifier.BestUserFrame(thread.Frames));
+        if (thread.WaitingOnCollection is { } c)
+            return $"waiting to {(c.Adding ? "add to" : "take from")} {c.DisplayName} ({(c.Adding ? "full" : "empty")} BlockingCollection) in {at}";
         return kind switch
         {
             BlockingKind.Sleep => $"sleeping (Thread.Sleep) in {at}",
@@ -81,6 +83,17 @@ internal static class Describe
     }
 
     /// An async method of the app itself (not of the BCL or a library like a database driver).
+    /// "Thread 5 is running X's continuation inline, inside the SetResult call in Y (file:line)."
+    public static string? InlineContinuation(ThreadSnapshot t) =>
+        FrameClassifier.InlineContinuation(t.Frames) is var (continuation, completer)
+            ? $"{t.Label} is running the rest of {Names.ShortMethod(continuation.TypeName, continuation.MethodName)} inline: {Where(completer)} completed the task it was awaiting, " +
+              "and the await continued right there, on the same thread, with every lock the completing code holds."
+            : null;
+
+    public const string InlineContinuationAdvice =
+        " The second lock is taken by an await continuation that ran inline inside SetResult: create the TaskCompletionSource with " +
+        "TaskCreationOptions.RunContinuationsAsynchronously, or complete it after releasing the lock.";
+
     public static bool IsAppAsyncMethod(TaskInfo task)
     {
         if (task.Kind != TaskKind.AsyncMethod) return false;

@@ -38,7 +38,17 @@ public sealed class ThreadPoolStarvationDetector : IDetector
 
         var details = new List<string>();
         foreach (var g in groups.Take(5))
-            details.Add($"{Describe.Plural(g.Count(), "thread")}: {g.Key.Call} at {g.Key.Site}.");
+            details.Add($"{Describe.Plural(g.Count(), "thread")}: {g.Key.Call} at {Describe.Where(FrameClassifier.BestUserFrame(g.First().Thread.Frames))}.");
+
+        // Blocked on async database calls: say what they wait for, since the stack only shows .Result.
+        var onDatabase = blocked.Where(x => x.Thread.Database?.Waiting == DatabaseWaitKind.Query).Select(x => x.Thread.Database!).ToList();
+        if (onDatabase.Count > 0)
+        {
+            var sql = onDatabase.Select(d => d.CommandText).OfType<string>().GroupBy(q => q).OrderByDescending(g => g.Count()).FirstOrDefault()?.Key;
+            details.Add($"{Describe.Plural(onDatabase.Count, "of them is", "of them are")} waiting, through async code, for {onDatabase[0].Provider}" +
+                        (sql is null ? "." : $" to answer {Describe.Sql(sql)}.") +
+                        " A slow query is enough: each request holds a thread for as long as the query runs.");
+        }
 
         if (pool is not null)
         {

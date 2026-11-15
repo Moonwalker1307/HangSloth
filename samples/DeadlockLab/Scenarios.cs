@@ -72,6 +72,30 @@ public static class Scenarios
             "Stop() holds the buffer lock and waits for the timer to drain its callbacks, but the running callback is waiting for the buffer lock.",
             ["lock-contention"], MetricsScenario.Run),
 
+        new("parallel-foreach-under-lock", Area.Code, Difficulty.Hidden,
+            "A thread holds a lock and runs Parallel.ForEach; the loop body, running on other threads, takes the same lock.",
+            ["wait-cycle"], ParallelScenario.Run),
+
+        new("ui-invoke", Area.Code, Difficulty.Hidden,
+            "The UI thread waits for a background export, which synchronously Sends a status update to the UI thread (Control.Invoke style).",
+            ["wait-cycle"], UiInvokeScenario.Run),
+
+        new("inline-continuation", Area.Code, Difficulty.Hidden,
+            "TaskCompletionSource.SetResult under a lock runs the awaiting method inline; that continuation needs a lock another thread holds while it waits for the first lock.",
+            ["lock-deadlock"], InlineContinuationScenario.Run),
+
+        new("throttle-reentry", Area.Code, Difficulty.Hidden,
+            "A SemaphoreSlim(3) throttle: each call holds a slot and makes a nested call through the same throttle. Three concurrent calls use every slot.",
+            ["semaphore-wait"], ThrottleScenario.Run),
+
+        new("bounded-queue", Area.Code, Difficulty.Hidden,
+            "A publisher holds a lock while adding to a full BlockingCollection; the only consumer needs that lock before it takes the next item.",
+            ["bounded-queue-deadlock"], BoundedQueueScenario.Run),
+
+        new("lost-pulse", Area.Code, Difficulty.Hidden,
+            "A hand-rolled queue pulses only when the consumer is already waiting; the item arrived first, so the consumer waits forever.",
+            ["monitor-wait"], LostPulseScenario.Run),
+
         new("healthy", Area.Code, Difficulty.Obvious,
             "Control: background workers ticking along with short locks and a timer. Nothing is wrong.",
             [], HealthyScenario.Run),
@@ -96,6 +120,22 @@ public static class Scenarios
         new("db-async-row-lock", Area.Database, Difficulty.Hidden,
             "Like the forgotten transaction, but the blocked update is async and the caller blocks on it with .GetAwaiter().GetResult().",
             ["database-wait"], AsyncRowLockScenario.Run),
+
+        new("db-migration-lock", Area.Database, Difficulty.Hidden,
+            "A schema migration runs ALTER TABLE in a transaction and waits before committing; plain SELECTs on that table queue behind its lock.",
+            ["database-wait"], MigrationLockScenario.Run),
+
+        new("db-advisory-lock", Area.Database, Difficulty.Hidden,
+            "A job takes a session-level pg_advisory_lock and keeps the connection open without unlocking; the next scheduler waits for it forever. No transaction is involved.",
+            ["database-wait"], AdvisoryLockScenario.Run),
+
+        new("db-starvation", Area.Database, Difficulty.Obvious,
+            "Controller actions block on async database calls with .Result; requests hold every thread pool thread while they wait.",
+            ["threadpool-starvation"], DbStarvationScenario.Run),
+
+        new("db-async-pool-exhaustion", Area.Database, Difficulty.Hidden,
+            "The async version of the nested-connection pool deadlock: every request awaits a second connection while holding one. No thread is blocked except the one waiting for all of them.",
+            ["connection-pool-exhausted"], AsyncPoolExhaustionScenario.Run),
 
         new("db-healthy", Area.Database, Difficulty.Obvious,
             "Control: an idle app with a warm connection pool. Nothing is wrong.",

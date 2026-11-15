@@ -18,6 +18,8 @@ public sealed class HangAnalyzer
             new DatabaseDeadlockDetector(),
             new ConnectionPoolDetector(),
             new SemaphoreDeadlockDetector(),
+            new BoundedQueueDeadlockDetector(),
+            new MonitorWaitDetector(),
             new ThreadPoolStarvationDetector(),
             new DatabaseWaitDetector(),
             new LockContentionDetector(),
