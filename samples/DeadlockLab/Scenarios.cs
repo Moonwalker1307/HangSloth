@@ -1,10 +1,12 @@
 using DeadlockLab.Code;
 using DeadlockLab.Database;
 using DeadlockLab.Http;
+using DeadlockLab.SqlServer;
 
 namespace DeadlockLab;
 
-public enum Area { Code, Database }
+/// Database scenarios need PostgreSQL; SqlServer scenarios need SQL Server.
+public enum Area { Code, Database, SqlServer }
 
 public enum Difficulty
 {
@@ -170,9 +172,30 @@ public static class Scenarios
             "EF Core: a checkout holds a DbContext transaction and logs through an audit service that creates its own DbContext. Three checkouts, two pooled connections.",
             ["connection-pool-exhausted"], EfNestedContextScenario.Run),
 
+        new("db-large-select", Area.Database, Difficulty.Obvious,
+            "A cache refresh loads a whole table (millions of rows) into a list while holding the cache lock; every request queues behind it. Slow, not deadlocked.",
+            ["lock-contention"], LargeSelectScenario.Run),
+
+        new("db-select-blocks-alter", Area.Database, Difficulty.Hidden,
+            "A slow export keeps a big SELECT open (ACCESS SHARE); a migration's ALTER TABLE queues behind it, and every later query on the table queues behind the ALTER.",
+            ["database-wait"], SelectBlocksAlterScenario.Run),
+
+        new("db-select-for-update", Area.Database, Difficulty.Hidden,
+            "A batch job locks a whole date range with SELECT ... FOR UPDATE and processes the rows one per second in the transaction; a checkout updating one of them waits for the whole batch.",
+            ["database-wait"], SelectForUpdateScenario.Run),
+
         new("db-healthy", Area.Database, Difficulty.Obvious,
             "Control: an idle app with a warm connection pool. Nothing is wrong.",
             [], HealthyDbScenario.Run),
+
+        // ---------------------------------------------------------------- SQL Server
+        new("sqlserver-lock-escalation", Area.SqlServer, Difficulty.Hidden,
+            "A report reads 20,000 rows under REPEATABLE READ and renders a PDF before committing; SQL Server escalates the row locks to a table lock, so an update of a row outside the report waits.",
+            ["database-wait"], LockEscalationScenario.Run),
+
+        new("sqlserver-read-blocked", Area.SqlServer, Difficulty.Obvious,
+            "A stock adjustment updates a row and waits for a scanner without committing; under SQL Server's default READ COMMITTED, a plain SELECT of that row waits too.",
+            ["database-wait"], ReadBlockedScenario.Run),
     ];
 }
 

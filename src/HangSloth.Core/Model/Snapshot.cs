@@ -265,6 +265,8 @@ public enum DatabaseWaitKind
     Query,
     /// Waiting for a free connection from the connection pool.
     ConnectionPool,
+    /// Reading the rows of a result (DbDataReader.Read): the query is answering, but the result is big or slow.
+    ReadingRows,
 }
 
 public sealed record DatabaseActivity
@@ -284,6 +286,19 @@ public sealed record DatabaseActivity
 
     /// For ConnectionPool waits: the pool being waited on.
     public ConnectionPoolInfo? Pool { get; init; }
+
+    /// The SQL of a data reader that is still open on this thread's stack, even while the thread does something else.
+    /// An open reader keeps its statement running, with its locks.
+    public string? OpenQuery { get; init; }
+
+    /// For ReadingRows: rows collected so far, from the biggest list on the reading code's stack.
+    public int? RowsRead { get; init; }
+
+    /// The isolation level of a transaction object on this thread's stack ("RepeatableRead", "Serializable"...), when known.
+    public string? Isolation { get; init; }
+
+    /// SQL of the commands on this thread's stack that aren't running now (what an open transaction already did).
+    public IReadOnlyList<string> StackCommands { get; init; } = [];
 }
 
 /// <param name="Field">Set when the connection was found in a field of an object on the stack

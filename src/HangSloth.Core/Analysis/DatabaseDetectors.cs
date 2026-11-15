@@ -2,7 +2,7 @@ using HangSloth.Model;
 
 namespace HangSloth.Analysis;
 
-internal static class Db
+internal static partial class Db
 {
     public static bool WaitingForQuery(ThreadSnapshot t) => t.Database?.Waiting == DatabaseWaitKind.Query;
 
@@ -25,6 +25,38 @@ internal static class Db
         }
         return $"is waiting in {Describe.Where(FrameClassifier.BestUserFrame(t.Frames))} {answer}";
     }
+
+    /// The table a DDL statement needs an exclusive lock on: ALTER TABLE, DROP TABLE, TRUNCATE, CREATE INDEX ... ON, LOCK TABLE, VACUUM FULL.
+    public static string? DdlTable(string? sql)
+    {
+        if (sql is null) return null;
+        var m = DdlRegex().Match(sql);
+        return m.Success ? m.Groups["table"].Value : null;
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"^\s*(ALTER\s+TABLE(\s+IF\s+EXISTS)?(\s+ONLY)?|DROP\s+TABLE(\s+IF\s+EXISTS)?|TRUNCATE(\s+TABLE)?|LOCK(\s+TABLE)?|VACUUM\s+FULL|REINDEX\s+TABLE|CREATE\s+(UNIQUE\s+)?INDEX\s+(?!CONCURRENTLY)(\w+\s+)?ON)\s+(?<table>[\w.""]+)",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
+    private static partial System.Text.RegularExpressions.Regex DdlRegex();
+
+    public static string IsolationName(string? level) => level switch
+    {
+        "RepeatableRead" => "REPEATABLE READ",
+        "Serializable" => "SERIALIZABLE",
+        "ReadCommitted" => "READ COMMITTED",
+        "Snapshot" => "SNAPSHOT",
+        _ => level ?? "an unknown isolation level",
+    };
+
+    public static string Verb(string? sql) => sql?.TrimStart().Split(' ', 2)[0].ToUpperInvariant() ?? "statement";
+
+    /// Does the SQL name this table (as a whole word)?
+    public static bool Mentions(string? sql, string table) =>
+        sql is not null && System.Text.RegularExpressions.Regex.IsMatch(sql, $@"\b{System.Text.RegularExpressions.Regex.Escape(table.Trim('"'))}\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// SELECT ... FOR UPDATE / FOR SHARE (and the KEY variants): locks every row it returns.
+    public static bool LocksRows(string? sql) =>
+        sql is not null && sql.TrimStart().StartsWith("SELECT", StringComparison.OrdinalIgnoreCase)
+        && System.Text.RegularExpressions.Regex.IsMatch(sql, @"\bFOR\s+(NO\s+KEY\s+)?(UPDATE|SHARE|KEY\s+SHARE)\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     /// A SELECT without FOR UPDATE/SHARE: it never waits for a row lock, only for a table lock.
     public static bool IsPlainSelect(string? sql) =>
@@ -244,30 +276,100 @@ public sealed class DatabaseWaitDetector : IDetector
         var details = waiting.Select(t => $"{t.Label} {Db.WaitPhrase(t)}" + (Db.InTransaction(t) ? ", inside an open transaction." : ".")).ToList();
         var sessions = waiting.Select(t => t.Database!.SessionId).Concat(idleTx.Select(Db.TransactionSession)).Concat(inTx.Select(Db.TransactionSession));
 
-        if (idleTx.Count > 0)
+        // DDL waiting for a table lock: everything that arrives after it on that table queues behind it.
+        if (waiting.FirstOrDefault(t => Db.DdlTable(t.Database!.CommandText) is not null) is { } ddl)
         {
-            foreach (var t in idleTx)
-                details.Add($"{t.Label} has an open transaction{Db.Session(Db.TransactionSession(t))} but isn't talking to the database: it is {Describe.Activity(t, withMethod: true)}. " +
-                            "Every row that transaction has changed stays locked until it commits or rolls back.");
-            if (Db.ConfirmOnServer(provider, sessions) is { } confirm) details.Add(confirm);
-            var blocker = idleTx[0];
-            // In PostgreSQL (and with snapshot isolation elsewhere) a plain read never waits for a row lock;
-            // if only reads are stuck, the transaction holds a table lock, typically from DDL.
-            var tableLock = waiting.All(t => Db.IsPlainSelect(t.Database!.CommandText));
+            var table = Db.DdlTable(ddl.Database!.CommandText)!;
+            var queued = waiting.Where(t => t != ddl && Db.Mentions(t.Database!.CommandText, table)).ToList();
+            var holders = snapshot.Threads
+                .Where(t => t != ddl && !queued.Contains(t) && t.Database is { } d
+                            && (Db.Mentions(d.OpenQuery, table) || (d.Waiting == DatabaseWaitKind.ReadingRows && Db.Mentions(d.CommandText, table))
+                                || (Db.InTransaction(t) && d.StackCommands.Any(c => Db.Mentions(c, table)))))
+                .ToList();
+            var holderDetails = holders.Select(h => h.Database!.Waiting == DatabaseWaitKind.ReadingRows
+                ? $"{h.Label} is {Describe.Activity(h, withMethod: true)}: its statement holds a lock on {table} until the last row is read."
+                : h.Database!.OpenQuery is { } q && Db.Mentions(q, table)
+                    ? $"{h.Label} still has a reader open on {Describe.Sql(q)} and is {Describe.Activity(h, withMethod: true)}. An open reader keeps its statement, and its lock on {table}, alive."
+                    : $"{h.Label} has an open transaction that used {table} and is {Describe.Activity(h, withMethod: true)}.").ToList();
+            var lockDetails = new List<string> { $"{ddl.Label} {Db.WaitPhrase(ddl)}. It needs an exclusive lock on {table}, so it waits for every statement that is already using the table." };
+            lockDetails.AddRange(holderDetails);
+            if (queued.Count > 0)
+                lockDetails.Add($"{Describe.JoinAnd(queued.Select(t => t.Label))} {(queued.Count == 1 ? "is" : "are")} waiting to run {Describe.Sql(queued[0].Database!.CommandText)}{(queued.Select(t => t.Database!.CommandText).Distinct().Count() > 1 ? " and other queries" : "")} on {table}: " +
+                                "even a plain SELECT queues behind a waiting ALTER, so the table is frozen for everyone.");
+            if (Db.ConfirmOnServer(provider, sessions.Concat(holders.SelectMany(h => h.Database!.Connections.Select(c => c.SessionId)))) is { } confirmQueue) lockDetails.Add(confirmQueue);
+            var holder = holders.FirstOrDefault();
             yield return new Finding
             {
                 Id = "database-wait",
                 Severity = Severity.Warning,
-                Title = tableLock ? "Database reads blocked by a table lock in an idle transaction" : "Database query blocked by an idle transaction",
+                Title = $"Lock queue on {table}: schema change waiting behind a running query",
+                Summary = $"{ddl.Label} is waiting to change {table} ({Describe.Sql(ddl.Database!.CommandText)}), which needs the whole table to itself" +
+                          (holder is null ? "" : $", and {holder.Label} is still {(holder.Database!.Waiting == DatabaseWaitKind.ReadingRows ? "reading" : "using")} it") + "." +
+                          (queued.Count > 0 ? $" {Describe.Plural(queued.Count, "query", "queries")} that came later {(queued.Count == 1 ? "is" : "are")} queued behind the {Db.Verb(ddl.Database.CommandText)}, so nothing can use {table} until the first statement finishes." : ""),
+                Details = lockDetails,
+                Advice = "Run schema changes with a short lock_timeout (SET lock_timeout = '2s') and retry, so a long-running query makes the migration fail fast instead of freezing the table. " +
+                         "Don't keep a reader open while doing slow work per row: page through big results (keyset pagination), or copy what you need and close the reader first.",
+                ThreadIds = [ddl.ManagedId, .. queued.Select(t => t.ManagedId), .. holders.Select(t => t.ManagedId)],
+                Location = FrameClassifier.BestUserFrame((holder ?? ddl).Frames)?.Source ?? site?.Source,
+            };
+            yield break;
+        }
+
+        if (idleTx.Count > 0)
+        {
+            foreach (var t in idleTx)
+            {
+                details.Add($"{t.Label} has an open transaction{Db.Session(Db.TransactionSession(t))} but isn't talking to the database: it is {Describe.Activity(t, withMethod: true)}. " +
+                            "Every row that transaction has changed stays locked until it commits or rolls back.");
+                if (t.Database!.StackCommands.Count > 0)
+                    details.Add($"Commands still on {t.Label}'s stack: {Describe.JoinAnd(t.Database.StackCommands.Take(3).Select(Describe.Sql))}.");
+            }
+            var forUpdate = idleTx.SelectMany(t => t.Database!.StackCommands).FirstOrDefault(Db.LocksRows);
+            if (Db.ConfirmOnServer(provider, sessions) is { } confirm) details.Add(confirm);
+            var blocker = idleTx[0];
+            // In PostgreSQL (and with snapshot isolation elsewhere) a plain read never waits for a row lock;
+            // if only reads are stuck, the transaction holds a table lock, typically from DDL.
+            var sqlServer = provider == "SQL Server";
+            var readsOnly = waiting.All(t => Db.IsPlainSelect(t.Database!.CommandText));
+            var tableLock = readsOnly && !sqlServer;
+            // SQL Server keeps shared locks until commit under REPEATABLE READ / SERIALIZABLE, and escalates
+            // to a table lock past ~5,000 locks: a big read can then block writers anywhere in the table.
+            var escalation = sqlServer && blocker.Database!.Isolation is "RepeatableRead" or "Serializable"
+                             && blocker.Database.StackCommands.Any(Db.IsPlainSelect);
+            yield return new Finding
+            {
+                Id = "database-wait",
+                Severity = Severity.Warning,
+                Title = escalation ? "Database writes blocked by a big read holding its locks (lock escalation)"
+                    : tableLock ? "Database reads blocked by a table lock in an idle transaction"
+                    : forUpdate is not null ? "Database query blocked by rows locked with SELECT ... FOR UPDATE"
+                    : "Database query blocked by an idle transaction",
                 Summary = $"{(waiting.Count == 1 ? $"{waiting[0].Label} is" : $"{waiting.Count} threads are")} waiting for {provider}, while {blocker.Label} keeps a transaction open and waits for something else " +
                           $"in {Describe.Spot(FrameClassifier.BestUserFrame(blocker.Frames))}. " +
-                          (tableLock
+                          (escalation
+                              ? $"That transaction runs under {Db.IsolationName(blocker.Database.Isolation)} and read rows with {Describe.Sql(blocker.Database.StackCommands.First(Db.IsPlainSelect))}. " +
+                                "SQL Server keeps shared locks on everything it read until the transaction ends, and once a statement holds more than about 5,000 row locks it escalates them to one lock on the whole table, " +
+                                "so writers wait even for rows the report never read."
+                              : readsOnly && sqlServer
+                              ? "Under SQL Server's default READ COMMITTED (without READ_COMMITTED_SNAPSHOT), a plain SELECT waits for rows another transaction has changed and not committed, so the read is most likely waiting for that transaction."
+                              : tableLock
                               ? "A plain SELECT doesn't wait for row locks, so that transaction most likely holds a lock on the whole table: ALTER TABLE, DROP, TRUNCATE, CREATE INDEX (without CONCURRENTLY) or LOCK TABLE."
-                              : "The query is most likely waiting for a row lock held by that transaction."),
+                              : forUpdate is not null
+                                  ? $"That transaction ran {Describe.Sql(forUpdate)}, which locks every row it returns until the transaction ends, so the query is most likely waiting for one of those rows."
+                                  : "The query is most likely waiting for a row lock held by that transaction."),
                 Details = details,
-                Advice = tableLock
+                Advice = escalation
+                    ? "Don't hold REPEATABLE READ or SERIALIZABLE locks across slow work: read the data, commit, then render. If you need a consistent snapshot, use SNAPSHOT isolation " +
+                      "(ALLOW_SNAPSHOT_ISOLATION ON), which doesn't lock what it reads. Page through big ranges to stay under the escalation threshold, and give writers a SET LOCK_TIMEOUT."
+                    : readsOnly && sqlServer
+                    ? "Commit before waiting for anything slow. To stop readers waiting for writers at all, enable READ_COMMITTED_SNAPSHOT on the database (ALTER DATABASE ... SET READ_COMMITTED_SNAPSHOT ON); " +
+                      "SET LOCK_TIMEOUT makes a blocked read fail instead of hanging."
+                    : tableLock
                     ? "Keep schema changes in short transactions that commit right away, and run them with a lock_timeout (SET lock_timeout = '5s') so a migration gives up instead of freezing the table. " +
                       "Don't wait for anything else between the DDL and the commit."
+                    : forUpdate is not null
+                        ? "Lock only what you process right now: claim small batches (ORDER BY ... LIMIT 100 FOR UPDATE SKIP LOCKED), commit after each batch, and do slow work (rendering, email, HTTP) outside the transaction. " +
+                          "A lock_timeout makes the blocked update fail instead of hanging."
                     : "Don't wait for anything slow (user input, HTTP calls, other threads, sleeps) inside a database transaction: do that first, then open the transaction, write, and commit. " +
                       "A lock_timeout or command timeout makes the blocked query fail instead of hanging.",
                 ThreadIds = [.. waiting.Select(t => t.ManagedId), .. idleTx.Select(t => t.ManagedId)],
@@ -355,4 +457,28 @@ public sealed class DatabaseWaitDetector : IDetector
     private static bool RunsOwnerCode(ThreadSnapshot t) =>
         Held(t).Field is { } f && f.LastIndexOf('.') is var i and > 0
         && FrameClassifier.BestUserFrame(t.Frames) is { } frame && Names.ShortType(frame.TypeName) == f[..i];
+}
+
+/// A thread reading the rows of a query: not blocked, but a big result read row by row can take minutes,
+/// and everything that waits for this thread waits that long too.
+public sealed class DatabaseReadDetector : IDetector
+{
+    public IEnumerable<Finding> Detect(ProcessSnapshot snapshot, IReadOnlySet<int> claimed)
+    {
+        foreach (var t in snapshot.Threads.Where(t => t.Database?.Waiting == DatabaseWaitKind.ReadingRows && !claimed.Contains(t.ManagedId)))
+        {
+            var site = FrameClassifier.BestUserFrame(t.Frames);
+            yield return new Finding
+            {
+                Id = "database-read",
+                Severity = Severity.Info,
+                Title = "Reading a large query result",
+                Summary = $"{t.Label} is {Describe.Activity(t, withMethod: true)}. That's work in progress, not a hang, but a result this big can take minutes, and keeps the statement (and its locks) open until the last row.",
+                Details = [],
+                Advice = "Select only the rows and columns you need (WHERE, LIMIT, keyset pagination), or aggregate in SQL instead of in memory.",
+                ThreadIds = [t.ManagedId],
+                Location = site?.Source,
+            };
+        }
+    }
 }

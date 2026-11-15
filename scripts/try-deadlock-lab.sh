@@ -26,6 +26,7 @@ for row in "${rows[@]}"; do
   [ "$expected" = - ] && expected=
   if [ ${#wanted[@]} -gt 0 ] && [[ ! " ${wanted[*]} " == *" $name "* ]]; then continue; fi
   if [ "$area" = Database ] && [ -n "${SKIP_DB:-}" ]; then skipped=$((skipped+1)); continue; fi
+  if [ "$area" = SqlServer ] && [ -n "${SKIP_SQLSERVER:-}" ]; then skipped=$((skipped+1)); continue; fi
 
   log="$work/$name.log"
   dotnet "$work/lab/DeadlockLab.dll" "$name" > "$log" 2>&1 &

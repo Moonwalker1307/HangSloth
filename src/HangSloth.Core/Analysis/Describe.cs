@@ -24,6 +24,9 @@ internal static class Describe
     {
         var kind = FrameClassifier.Classify(thread.Frames);
         var at = withMethod ? Where(FrameClassifier.BestUserFrame(thread.Frames)) : Spot(FrameClassifier.BestUserFrame(thread.Frames));
+        if (thread.Database is { Waiting: DatabaseWaitKind.ReadingRows } reading)
+            return $"reading the rows of {Sql(reading.CommandText)} from {reading.Provider}" +
+                   (reading.RowsRead is { } rows ? $" ({rows:N0} rows so far)" : "") + $" in {at}";
         if (thread.WaitingOnCollection is { } c)
             return $"waiting to {(c.Adding ? "add to" : "take from")} {c.DisplayName} ({(c.Adding ? "full" : "empty")} BlockingCollection) in {at}";
         return kind switch

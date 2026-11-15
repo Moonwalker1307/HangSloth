@@ -82,7 +82,7 @@ public sealed partial class SnapshotBuilder
                 SendingTo = FindSendTarget(roots),
                 WaitingForCallbackOnThread = FindCallbackThread(roots, snapshot.Frames, clr.ManagedThreadId),
                 WaitingForProcess = FindProcessWait(roots, snapshot.Frames),
-                Database = ReadDatabaseActivity(roots, BlockingKind.None),
+                Database = ReadDatabaseActivity(roots, FrameClassifier.Classify(snapshot.Frames)),
             };
             var kind = FrameClassifier.Classify(snapshot.Frames);
             switch (kind)

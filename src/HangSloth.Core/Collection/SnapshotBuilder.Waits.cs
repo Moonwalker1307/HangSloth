@@ -217,11 +217,27 @@ public sealed partial class SnapshotBuilder
     {
         var commands = new List<ClrObject>();
         var connections = new List<ClrObject>();
+        var readers = new List<(ClrObject Reader, bool Reading)>();
+        var lists = new List<int>();
+        string? isolation = null;
         var seen = new HashSet<ulong>();
         foreach (var root in roots)
         {
             var obj = root.Object;
+            if (!obj.IsNull && root.StackFrame?.Method?.Type?.Name is { } frameType && !FrameClassifier.IsFrameworkType(frameType)
+                && obj.Type?.Name?.StartsWith("System.Collections.Generic.List<", StringComparison.Ordinal) == true && obj.ReadInt("_size") is { } size)
+                lists.Add(size);
+            if (!obj.IsNull && DerivesFrom(obj.Type, "System.Data.Common.DbDataReader"))
+            {
+                var reading = root.StackFrame?.Method is { Name: "Read" or "ReadAsync" } m && DerivesFrom(m.Type, "System.Data.Common.DbDataReader");
+                var i = readers.FindIndex(r => r.Reader.Address == obj.Address);
+                if (i < 0) readers.Add((obj, reading));
+                else if (reading) readers[i] = (obj, true);
+            }
             if (obj.IsNull || !seen.Add(obj.Address)) continue;
+            if (isolation is null && DerivesFrom(obj.Type, "System.Data.Common.DbTransaction") && obj.ReadInt("_isolationLevel") is { } level
+                && Enum.IsDefined(typeof(System.Data.IsolationLevel), level))
+                isolation = ((System.Data.IsolationLevel)level).ToString();
             if (DerivesFrom(obj.Type, "System.Data.Common.DbCommand")) commands.Add(obj);
             else if (DerivesFrom(obj.Type, "System.Data.Common.DbConnection")) connections.Add(obj);
             else if (EfConnection(obj) is { } wrapped && seen.Add(wrapped.Address)) connections.Add(wrapped);
@@ -255,7 +271,20 @@ public sealed partial class SnapshotBuilder
         };
         if (waiting == DatabaseWaitKind.None && open.Count == 0) return null;
 
-        var command = waiting == DatabaseWaitKind.Query ? commands.FirstOrDefault() : default;
+        var openReaders = readers.Where(r => ReaderIsOpen(r.Reader)).ToList();
+        var readingRows = openReaders.FirstOrDefault(r => r.Reading).Reader;
+        if (waiting == DatabaseWaitKind.Query && !readingRows.IsNull) waiting = DatabaseWaitKind.ReadingRows;
+        // Running app code (not blocked) with a reader open: processing rows between Read() calls.
+        if (waiting == DatabaseWaitKind.None && kind == BlockingKind.None && openReaders.Count > 0)
+        {
+            waiting = DatabaseWaitKind.ReadingRows;
+            readingRows = openReaders[0].Reader;
+        }
+        var openQuery = openReaders.Select(r => ReaderCommand(r.Reader)).OfType<ClrObject>().Select(DatabaseCommandText).FirstOrDefault(q => q is not null);
+
+        var command = waiting == DatabaseWaitKind.Query ? commands.FirstOrDefault()
+            : waiting == DatabaseWaitKind.ReadingRows ? ReaderCommand(readingRows) ?? commands.FirstOrDefault()
+            : default;
         var typeName = (commands.Concat(connections).Concat(kept.Select(k => k.Connection)).FirstOrDefault().Type?.Name) ?? "";
         return new DatabaseActivity
         {
@@ -265,8 +294,26 @@ public sealed partial class SnapshotBuilder
             SessionId = command.IsNull ? null : CommandSession(command),
             Connections = open,
             Pool = waiting == DatabaseWaitKind.ConnectionPool ? connections.Select(ReadPool).FirstOrDefault(p => p is not null) : null,
+            OpenQuery = openQuery,
+            Isolation = isolation,
+            RowsRead = waiting == DatabaseWaitKind.ReadingRows && lists.Count > 0 ? lists.Max() : null,
+            StackCommands = waiting == DatabaseWaitKind.None
+                ? commands.Select(DatabaseCommandText).OfType<string>().Distinct().ToList()
+                : [],
         };
     }
+
+    /// Npgsql: State is BeforeResult (0), InResult (1) or BetweenResults (2) while open. SqlClient: _isClosed.
+    private static bool ReaderIsOpen(ClrObject reader) =>
+        reader.ReadInt("State") is { } state ? state <= 2
+        : reader.TryReadField<bool>("_isClosed", out var closed) ? !closed
+        : false;
+
+    private static ClrObject? ReaderCommand(ClrObject reader) =>
+        reader.IsNull ? null
+        : reader.TryReadObjectField("<Command>k__BackingField", out var c) && !c.IsNull ? c
+        : reader.TryReadObjectField("_command", out c) && !c.IsNull ? c
+        : null;
 
     /// EF Core keeps the ADO.NET connection inside its own wrappers: a RelationalTransaction (what
     /// BeginTransaction returns) points at a RelationalConnection, which holds the DbConnection.
@@ -283,6 +330,7 @@ public sealed partial class SnapshotBuilder
 
     private static DatabaseConnection? ReadConnection(ClrObject connection)
     {
+        if (connection.Type?.Name?.EndsWith(".SqlConnection", StringComparison.Ordinal) == true) return ReadSqlConnection(connection);
         // Npgsql: NpgsqlConnection._fullState (ConnectionState flags) and its connector's session state.
         if (!connection.TryReadField<int>("_fullState", out var state) || (state & ConnectionStateOpen) == 0) return null;
         if (!connection.TryReadObjectField("<Connector>k__BackingField", out var connector) || connector.IsNull) return null;
@@ -296,8 +344,29 @@ public sealed partial class SnapshotBuilder
         connector.TryReadField<byte>("<TransactionStatus>k__BackingField", out var status)
         && status is PgTransactionInBlock or PgTransactionFailed;
 
+    // SqlClient: SqlConnection._innerConnection (State 1 = open) -> _parser (TdsParser), whose _currentTransaction
+    // is the open transaction (_transactionState 1 = active) and whose physical state object knows the SPID.
+    private const int SqlInternalStateOpen = 1;
+    private const int SqlTransactionActive = 1;
+
+    private static DatabaseConnection? ReadSqlConnection(ClrObject connection)
+    {
+        if (!connection.TryReadObjectField("_innerConnection", out var inner) || inner.IsNull) return null;
+        if (inner.ReadInt("<State>k__BackingField") is { } state && state != SqlInternalStateOpen) return null;
+        if (!inner.TryReadObjectField("_parser", out var parser) || parser.IsNull) return null;
+        var inTx = parser.TryReadObjectField("_currentTransaction", out var tx) && !tx.IsNull && tx.ReadInt("_transactionState") == SqlTransactionActive;
+        return new DatabaseConnection(SqlSpid(parser), inTx);
+    }
+
+    private static int? SqlSpid(ClrObject parser) =>
+        parser.TryReadObjectField("_physicalStateObj", out var state) && !state.IsNull && state.ReadInt("_spid") is > 0 and var spid ? spid : null;
+
     private static int? CommandSession(ClrObject command)
     {
+        if (command.TryReadObjectField("_activeConnection", out var sql) && !sql.IsNull
+            && sql.TryReadObjectField("_innerConnection", out var inner) && !inner.IsNull
+            && inner.TryReadObjectField("_parser", out var parser) && !parser.IsNull)
+            return SqlSpid(parser);
         if (command.TryReadObjectField("<InternalConnection>k__BackingField", out var connection) && !connection.IsNull
             && connection.TryReadObjectField("<Connector>k__BackingField", out var connector) && !connector.IsNull)
             return BackendPid(connector);

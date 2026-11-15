@@ -25,6 +25,7 @@ public sealed class HangAnalyzer
             new ThreadPoolStarvationDetector(),
             new DatabaseWaitDetector(),
             new LockContentionDetector(),
+            new DatabaseReadDetector(),
             new SemaphoreWaitDetector(),
             new BlockedOnTaskDetector(),
         ];
