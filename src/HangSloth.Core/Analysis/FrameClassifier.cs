@@ -33,6 +33,9 @@ public enum BlockingKind
     CancellationCallback,
     /// Process.WaitForExit.
     ProcessExit,
+    /// Blocked in a synchronous network, pipe or console call (Socket.Receive, NetworkStream.Read, Console.ReadLine...).
+    /// It can still return and carry on, so it doesn't rule the thread out as one that may release something.
+    SyncIO,
 }
 
 public static class FrameClassifier
@@ -58,12 +61,96 @@ public static class FrameClassifier
         if (prefix.Any(f => f.TypeName == "System.Diagnostics.Process" && f.MethodName.StartsWith("WaitForExit", StringComparison.Ordinal))) return BlockingKind.ProcessExit;
         if (prefix.Any(f => f.TypeName == "System.Threading.ReaderWriterLockSlim")) return BlockingKind.ReaderWriterLock;
         if (prefix.Any(f => f.TypeName == "System.Threading.SemaphoreSlim" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.SemaphoreWait;
+        // A synchronous call on a non-blocking socket (HttpClient.Send, or a socket that was used async) waits for
+        // the socket's event in Monitor.Wait: name it as the I/O it is.
+        if (prefix.Any(IsSyncSocketOperation) && SyncIoFrame(prefix) is not null) return BlockingKind.SyncIO;
         if (prefix.Any(f => f.TypeName == "System.Threading.Monitor" && f.MethodName is "Wait" or "ObjWait")) return BlockingKind.MonitorWait;
         if (prefix.Any(f => f.TypeName == "System.Threading.Thread" && f.MethodName is "Sleep" or "SleepInternal")) return BlockingKind.Sleep;
         if (prefix.Any(f => f.TypeName == "System.Threading.Thread" && f.MethodName == "Join")) return BlockingKind.Join;
         if (prefix.Any(f => f.TypeName == "System.Threading.WaitHandle" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.WaitHandle;
+        // Last: a driver, a lock or a task wait above the I/O says more about what the thread waits for.
+        if (SyncIoFrame(prefix) is not null) return BlockingKind.SyncIO;
         return BlockingKind.None;
     }
+
+    /// A synchronous I/O call: what it does in words, and the async method to use instead (null when there is none).
+    private sealed record SyncIoCall(string What, string? Async);
+
+    /// The public synchronous I/O methods, which are the same on every OS (the Interop frames below them aren't).
+    private static SyncIoCall? SyncIoOperation(StackFrameInfo f)
+    {
+        var m = f.MethodName;
+        // The async methods and their internal helpers (SslStream.WriteAsyncInternal, Socket.SendAsyncForNetworkStream).
+        if (m.Contains("Async", StringComparison.Ordinal)) return null;
+        bool Is(string stem) => m.StartsWith(stem, StringComparison.Ordinal);
+        SyncIoCall Call(string what, string? async) => new(what, async is null ? null : Names.ShortMethod(f.TypeName, async));
+        switch (f.TypeName)
+        {
+            case "System.Net.Sockets.Socket":
+                return Is("Receive") ? Call("socket read", m is "ReceiveFrom" or "ReceiveMessageFrom" ? m + "Async" : "ReceiveAsync")
+                    : Is("Send") ? Call("socket write", m is "SendTo" or "SendFile" ? m + "Async" : "SendAsync")
+                    : m == "Accept" ? Call("socket accept", "AcceptAsync")
+                    : m == "Connect" ? Call("socket connect", "ConnectAsync")
+                    : null;
+            case "System.Net.Sockets.TcpClient":
+                return m == "Connect" ? Call("socket connect", "ConnectAsync") : null;
+            case "System.Net.Sockets.TcpListener":
+                return Is("Accept") ? Call("socket accept", m is "AcceptSocket" ? "AcceptSocketAsync" : "AcceptTcpClientAsync") : null;
+            case "System.Net.Sockets.NetworkStream":
+                return Is("Read") ? Call("network read", "ReadAsync") : Is("Write") ? Call("network write", "WriteAsync") : null;
+            case "System.Net.Security.SslStream":
+                return Is("Read") ? Call("TLS read", "ReadAsync")
+                    : Is("Write") ? Call("TLS write", "WriteAsync")
+                    : Is("AuthenticateAs") ? Call("TLS handshake", m + "Async")
+                    : null;
+            case "System.Net.Dns":
+                // Not GetHostName: that's the local machine's name, no lookup.
+                return m is "GetHostAddresses" ? Call("DNS lookup", "GetHostAddressesAsync")
+                    : m is "GetHostEntry" or "GetHostByName" or "GetHostByAddress" or "Resolve" ? Call("DNS lookup", "GetHostEntryAsync")
+                    : null;
+            case "System.Net.Http.HttpClient":
+                return m == "Send" ? Call("HTTP request", "SendAsync") : null;
+            case "System.Console":
+                // No async alternative: Console.In.ReadLineAsync blocks the calling thread just like ReadLine.
+                return m is "ReadLine" or "Read" or "ReadKey" ? new SyncIoCall("console read", null)
+                    : null;
+        }
+        if (f.TypeName.StartsWith("System.IO.Pipes.", StringComparison.Ordinal))
+            return Is("Read") ? Call("pipe read", "ReadAsync")
+                : Is("Write") ? Call("pipe write", "WriteAsync")
+                : m == "WaitForConnection" ? Call("wait for a pipe client", "WaitForConnectionAsync")
+                : m == "Connect" ? Call("pipe connect", "ConnectAsync")
+                : null;
+        return null;
+    }
+
+    /// The synchronous I/O call the thread is blocked in: the outermost one in the framework part of the stack,
+    /// which is the one the app made (NetworkStream.Read rather than the Socket.Receive inside it).
+    /// A database driver's own I/O is left to the database waits.
+    public static StackFrameInfo? SyncIoFrame(IReadOnlyList<StackFrameInfo> frames)
+    {
+        var prefix = FrameworkPrefix(frames);
+        if (prefix.Any(f => DatabaseProvider(f.TypeName) is not null)) return null;
+        return prefix.LastOrDefault(f => SyncIoOperation(f) is not null);
+    }
+
+    /// "a synchronous socket read (Socket.Receive)".
+    public static string DescribeSyncIo(IReadOnlyList<StackFrameInfo> frames) =>
+        SyncIoFrame(frames) is { } f && SyncIoOperation(f) is { } call
+            ? $"a synchronous {call.What} ({Names.ShortMethod(f.TypeName, f.MethodName)})"
+            : "synchronous I/O";
+
+    /// The synchronous I/O method the thread is blocked in ("Socket.Receive"), or null.
+    public static string? SyncIoMethod(IReadOnlyList<StackFrameInfo> frames) =>
+        SyncIoFrame(frames) is { } f ? Names.ShortMethod(f.TypeName, f.MethodName) : null;
+
+    /// The async method to await instead of the synchronous I/O call ("Socket.ReceiveAsync"), or null when there is none.
+    public static string? SyncIoAsyncAlternative(IReadOnlyList<StackFrameInfo> frames) =>
+        SyncIoFrame(frames) is { } f ? SyncIoOperation(f)?.Async : null;
+
+    /// Linux runs a synchronous call on a non-blocking socket as a wait for the socket's event.
+    private static bool IsSyncSocketOperation(StackFrameInfo f) =>
+        f.TypeName == "System.Net.Sockets.SocketAsyncContext" && f.MethodName.StartsWith("PerformSyncOperation", StringComparison.Ordinal);
 
     private static readonly HashSet<string> CompletionMethods =
         ["SetResult", "TrySetResult", "SetException", "TrySetException", "SetCanceled", "TrySetCanceled", "TrySetCanceledCore"];

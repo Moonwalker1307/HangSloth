@@ -274,8 +274,9 @@ public sealed partial class SnapshotBuilder
         var openReaders = readers.Where(r => ReaderIsOpen(r.Reader)).ToList();
         var readingRows = openReaders.FirstOrDefault(r => r.Reading).Reader;
         if (waiting == DatabaseWaitKind.Query && !readingRows.IsNull) waiting = DatabaseWaitKind.ReadingRows;
-        // Running app code (not blocked) with a reader open: processing rows between Read() calls.
-        if (waiting == DatabaseWaitKind.None && kind == BlockingKind.None && openReaders.Count > 0)
+        // Running app code (not blocked) with a reader open: processing rows between Read() calls,
+        // which can include the app's own I/O (writing each row to a socket or a pipe).
+        if (waiting == DatabaseWaitKind.None && kind is BlockingKind.None or BlockingKind.SyncIO && openReaders.Count > 0)
         {
             waiting = DatabaseWaitKind.ReadingRows;
             readingRows = openReaders[0].Reader;

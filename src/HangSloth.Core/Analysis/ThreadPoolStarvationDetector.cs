@@ -70,6 +70,10 @@ public sealed class ThreadPoolStarvationDetector : IDetector
                         "when the callback takes longer than the period, every tick takes another thread pool thread.");
         if (blocked.Any(x => x.Kind == BlockingKind.TaskWait))
             details.Add("Threads blocked on .Result/.Wait() are usually waiting for a task whose continuation needs a free thread pool thread to finish, which is exactly what's missing.");
+        if (blocked.Any(x => x.Kind == BlockingKind.SyncIO))
+            details.Add("A thread in synchronous I/O keeps its thread pool thread for as long as the other side takes to answer, and forever when it never does.");
+        var syncIo = top.IoFrames is null ? null : FrameClassifier.SyncIoMethod(top.IoFrames);
+        var asyncIo = top.IoFrames is null ? null : FrameClassifier.SyncIoAsyncAlternative(top.IoFrames);
 
         yield return new Finding
         {
@@ -83,6 +87,10 @@ public sealed class ThreadPoolStarvationDetector : IDetector
                   "a PeriodicTimer loop, or skip the tick when the previous one is still running (Monitor.TryEnter / Interlocked). And keep slow work out of the lock."
                 : top.Kind == BlockingKind.TaskWait && (top.Call.StartsWith('.') || top.Call.StartsWith("Task.", StringComparison.Ordinal))
                 ? $"Stop blocking on async code in thread pool work: await instead of {top.Call} in {top.Spot}. Raising ThreadPool.SetMinThreads only hides the problem."
+                : syncIo is not null && asyncIo is not null
+                ? $"Don't do synchronous I/O on thread pool threads: await {asyncIo} instead of calling {syncIo} in {top.Spot}. Raising ThreadPool.SetMinThreads only hides the problem."
+                : syncIo is not null
+                ? $"Don't do synchronous I/O on thread pool threads ({syncIo} in {top.Spot}): do it on one dedicated thread and hand the results over. Raising ThreadPool.SetMinThreads only hides the problem."
                 : $"Avoid blocking thread pool threads ({top.Call} at {top.Spot}); move long blocking work to a dedicated thread or make it async.",
             ThreadIds = blocked.Select(x => x.Thread.ManagedId).ToList(),
             Location = top.Location,
@@ -90,7 +98,9 @@ public sealed class ThreadPoolStarvationDetector : IDetector
     }
 
     /// Blocked threads in one method, with the call and line most of them agree on.
-    private sealed record Site(BlockingKind Kind, List<(ThreadSnapshot Thread, BlockingKind Kind)> Threads, string Call, string Spot, string Where, SourceLocation? Location)
+    /// IoFrames: the stack of a thread in the synchronous I/O call named in Call, so the advice names the same call.
+    private sealed record Site(BlockingKind Kind, List<(ThreadSnapshot Thread, BlockingKind Kind)> Threads, string Call, string Spot, string Where, SourceLocation? Location,
+        IReadOnlyList<StackFrameInfo>? IoFrames)
     {
         public static Site Of(BlockingKind kind, List<(ThreadSnapshot Thread, BlockingKind Kind)> threads)
         {
@@ -101,7 +111,10 @@ public sealed class ThreadPoolStarvationDetector : IDetector
 
             var calls = basis.Select(x => FrameClassifier.DescribeTaskWait(x.Thread.Frames)).ToList();
             var known = calls.Where(c => c != FrameClassifier.UnknownTaskWait).ToList();
-            var call = kind == BlockingKind.TaskWait ? MostCommon(known.Count > 0 ? known : calls)! : KindName(kind);
+            var call = kind == BlockingKind.TaskWait ? MostCommon(known.Count > 0 ? known : calls)!
+                : kind == BlockingKind.SyncIO ? MostCommon(basis.Select(x => FrameClassifier.DescribeSyncIo(x.Thread.Frames)))!
+                : KindName(kind);
+            var io = kind == BlockingKind.SyncIO ? basis.First(x => FrameClassifier.DescribeSyncIo(x.Thread.Frames) == call).Thread.Frames : null;
 
             var sources = basis.Select(x => x.Frame?.Source).Distinct().ToList();
             var frame = basis[0].Frame;
@@ -109,11 +122,11 @@ public sealed class ThreadPoolStarvationDetector : IDetector
             {
                 var source = MostCommon(basis.Select(x => x.Frame?.Source));
                 frame = basis.First(x => Equals(x.Frame?.Source, source)).Frame;
-                return new Site(kind, threads, call, Describe.Spot(frame), Describe.Where(frame), frame?.Source);
+                return new Site(kind, threads, call, Describe.Spot(frame), Describe.Where(frame), frame?.Source, io);
             }
             // The threads disagree on the line and nothing confirms one: name the method rather than a line that may be wrong.
             var method = frame is null ? null : frame with { Source = null };
-            return new Site(kind, threads, call, Describe.Spot(method), Describe.Where(method), null);
+            return new Site(kind, threads, call, Describe.Spot(method), Describe.Where(method), null, io);
         }
 
         private static T? MostCommon<T>(IEnumerable<T> values) =>
@@ -135,6 +148,7 @@ public sealed class ThreadPoolStarvationDetector : IDetector
         BlockingKind.ProcessExit => "Process.WaitForExit",
         BlockingKind.Database => "a database call",
         BlockingKind.ConnectionPool => "the connection pool",
+        BlockingKind.SyncIO => "synchronous I/O",
         _ => kind.ToString(),
     };
 }
