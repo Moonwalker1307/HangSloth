@@ -242,8 +242,8 @@ public class SyncIoDetectorTests
         SemaphoreInfo Sem(ulong address, string name, int waiter) =>
             new() { Object = new ObjectRef(address, "System.Threading.SemaphoreSlim"), FieldName = name, CurrentCount = 0, MaxCount = 1, WaiterThreadIds = [waiter] };
         var snapshot = Process(
-            Thread(4, [.. semaphoreWait, App("A", "M", "A.cs", 1)]) with { WaitingForSemaphore = 0x200 },
-            Thread(5, [.. semaphoreWait, App("B", "M", "B.cs", 1)]) with { WaitingForSemaphore = 0x100 },
+            Thread(4, [.. semaphoreWait, App("A", "M", "A.cs", 1)]) with { WaitingForSemaphore = 0x200, SemaphoreUse = new() { Holds = [new HeldSemaphore(0x100, "A.M", null)] } },
+            Thread(5, [.. semaphoreWait, App("B", "M", "B.cs", 1)]) with { WaitingForSemaphore = 0x100, SemaphoreUse = new() { Holds = [new HeldSemaphore(0x200, "B.M", null)] } },
             reading) with
         {
             Semaphores = [Sem(0x100, "S.A", 5), Sem(0x200, "S.B", 4)],

@@ -1,6 +1,6 @@
 # DeadlockLab
 
-A small, deliberately broken "shop" app with 51 ways to hang: textbook lock-ordering deadlocks, the
+A small, deliberately broken "shop" app with 61 ways to hang: textbook lock-ordering deadlocks, the
 hidden kind that hide in callbacks, libraries, initializers, semaphores, queues, UI dispatching, HTTP
 clients, finalizers and child processes, and deadlocks that involve a real database: PostgreSQL (with and
 without EF Core, including large selects that hold locks) and SQL Server. It's HangSloth's test bed: every scenario declares which finding HangSloth
@@ -55,6 +55,15 @@ same connection settings as the scenarios.
 | `ui-invoke` | hidden | The UI thread `.Wait()`s for a background export, which `Send`s a status update to the UI thread (`Control.Invoke` style). | `wait-cycle` (task + `SynchronizationContext.Send`) |
 | `inline-continuation` | hidden | `TaskCompletionSource.SetResult` under a lock runs the awaiting method inline; that continuation needs a lock another thread holds while it waits for the first. | `lock-deadlock`, pointing out the continuation that ran inside `SetResult` |
 | `throttle-reentry` | hidden | A `SemaphoreSlim(3)` throttle: each call holds a slot and makes a nested call through the same throttle. Three concurrent calls use every slot. | `semaphore-wait` (Critical: every slot held by a nested waiter) |
+| `semaphore-leak` | obvious | An export takes its `SemaphoreSlim(1, 1)` and returns early without `Release()`; the next two exports wait forever. | `semaphore-wait` (Warning: no free slots, nothing else running) |
+| `semaphore-slow-holder` | hidden | A cache's `LoadAsync` holds its gate while a carrier call takes minutes; the next lookup blocks on `.Result` behind it. The outer `GetAsync` never takes the gate, so this is a slow holder, not a re-entry. | `semaphore-wait` (Warning, not "already holds") |
+| `semaphore-transfer` | obvious | Two warehouses move stock to each other at once; each move takes its own warehouse's `SemaphoreSlim(1, 1)`, then the other one's. | `semaphore-deadlock`, with the semaphore each thread took |
+| `semaphore-fast-path` | hidden | Freight quotes try their gate with `WaitAsync(0)` and wait for it on a slow path when it's busy; the first quote holds it for minutes. The failed `WaitAsync(0)` took nothing. | `semaphore-wait` (Warning, not "already holds") |
+| `semaphore-lock-class` | hidden | Picking and packing take two locks of a small lock class around a `SemaphoreSlim(1, 1)` (`Enter()`, `Exit()`) in opposite order. | `semaphore-wait` (two Warnings: the wait is in `Enter()`, which took nothing). In optimized code, where `Enter()` is inlined, `semaphore-deadlock` as a possible deadlock (Warning) |
+| `semaphore-injected-lock` | hidden | Billing takes two gates of a small lock class that is handed its `SemaphoreSlim(1, 1)` in opposite order. | `semaphore-deadlock` (Warning, "Possible deadlock": the wait is in `Enter()`, which took nothing, and the code that made the semaphores isn't in the class) |
+| `semaphore-optional-lock` | hidden | A rebuild holds the row lock and waits for a table lock a truncate never released; a plain save, which takes the table lock only when it's exclusive, waits for the row lock. | `semaphore-wait`; must not report `semaphore-deadlock` |
+| `semaphore-queued-moves` | hidden | Loading bays move pallets into two dispatch bays that are closed for a stocktake; each move keeps its own bay's `SemaphoreSlim(1, 1)` and waits for the dispatch bay's. Four moves queue behind two stocktakes. | `semaphore-wait`; must not report `semaphore-deadlock`, also not in optimized code, where the frame of the move keeps only the dispatch bay alive (two of the moves name it by its own class, derived from the loading bay's) |
+| `semaphore-release-helper` | hidden | Counting and packing each take one of a depot's two locks and give it back through an extension method (`ReleaseQuietly()`) before they take the other one; the month-end closing then takes both and never finishes. | `semaphore-wait`; must not report `semaphore-deadlock` (a release through a method of another class is still a release) |
 | `bounded-queue` | hidden | A publisher holds a lock while adding to a full `BlockingCollection`; the only consumer needs that lock before it takes the next item. | `bounded-queue-deadlock` |
 | `lost-pulse` | hidden | A hand-rolled queue pulses only when the consumer is already waiting; the item arrived first, so the consumer waits forever. | `monitor-wait`, noting the queue already holds an item |
 | `idle-monitor-consumer` | control | A mail sender waits in `Monitor.Wait` for its empty outbox, in the textbook loop, and a receipt printer waits while its counter of due receipts is 0; their logs of sent mails and printed receipts aren't empty. | nothing |
@@ -70,6 +79,7 @@ same connection settings as the scenarios.
 | `child-process-pipe` | hidden | `WaitForExit` on a child with redirected, unread output; the child fills the pipe and blocks. | `process-pipe-deadlock`, with the child's command line and pid |
 | `test-blocks-on-async` | control | Two tests block on a slow async call with `.Result` under xunit's `AsyncTestSyncContext`, one with `ConfigureAwait(false)` and one without; the context runs continuations on the thread pool. Slow, not deadlocked. | nothing at warning level, and no `sync-over-async-deadlock` or `sync-over-async-risk` |
 | `healthy` | control | Short locks, a timer and idle `BlockingCollection` consumers waiting for work, nothing wrong. | nothing |
+| `healthy-signals` | control | Two flushers wait in a loop on their own `SemaphoreSlim(0, 1)` wake-up signal, and a sender on a `SemaphoreSlim(0)` that an idle timer releases once per message. | nothing |
 | `db-forgotten-transaction` | obvious | One thread updates a row and waits for an approval without committing; another updates the same row. | `database-wait` naming the idle transaction and the blocked SQL |
 | `db-deadlock-retry` | obvious | Two transactions update two rows in opposite order; PostgreSQL aborts one, the app retries the same way. | `database-wait` (possible database deadlock) |
 | `db-app-lock-cycle` | hidden | Thread A holds an app lock and waits for a row lock; thread B holds that row lock in a transaction and waits for the app lock. Neither .NET nor PostgreSQL sees the cycle. | `database-deadlock` |
@@ -105,4 +115,4 @@ When the lab was written, HangSloth explained 7 of the first 19 scenarios, and a
 of fixes, 4 of the 10 added in the second round, and 2 of the 8 in the third. SQL Server connections weren't read at all before the last 5 were added. Most misses were reported as plain
 lock contention ("held by Thread 1, which is blocked on .Wait()"), which is true but doesn't say
 it's a deadlock, or not at all (semaphores, static constructors, everything involving the database).
-It now explains all 51. The changes are described in the pull requests that added the scenarios.
+It now explains all 61. The changes are described in the pull requests that added the scenarios.

@@ -19,6 +19,8 @@ public class DeadlockLabTests
         "rwlock-vs-lock", "rwlock-upgrade-slow-reader", "rwlock-readers-block-writer", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose",
         "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse", "idle-monitor-consumer",
         "http-connection-limit", "http-no-response", "http-connect-stall", "http-busy-connections", "db-connect-stall", "sqlclient-connect-stall", "timer-overlap", "cancellation-dispose", "finalizer-wait", "child-process-pipe", "test-blocks-on-async", "healthy",
+        "semaphore-leak", "semaphore-slow-holder", "semaphore-transfer", "semaphore-fast-path", "semaphore-lock-class", "semaphore-injected-lock", "semaphore-optional-lock", "healthy-signals",
+        "semaphore-queued-moves", "semaphore-release-helper",
     ];
 
     public static TheoryData<string> DatabaseScenarios =>
@@ -120,6 +122,21 @@ public class DeadlockLabTests
         // The test threads wait for async work, which is told as information; under xunit's context that is no deadlock.
         ["test-blocks-on-async"] = "info blocked-on-task",
         ["healthy"] = "",
+        ["semaphore-leak"] = "warning semaphore-wait",
+        ["semaphore-slow-holder"] = "warning semaphore-wait",
+        ["semaphore-transfer"] = "critical semaphore-deadlock",
+        ["semaphore-fast-path"] = "warning semaphore-wait",
+        // Each thread waits inside the lock class's Enter(), whose code doesn't show what its caller took before: two
+        // plain waits here, and a possible deadlock once the JIT has inlined Enter() (SemaphoreOptimizedCodeEndToEndTests).
+        ["semaphore-lock-class"] = "warning semaphore-wait",
+        // The lock class is handed its SemaphoreSlim, so the code shows no role: the circle can't be proven.
+        ["semaphore-injected-lock"] = "warning semaphore-deadlock",
+        ["semaphore-optional-lock"] = "warning semaphore-wait",
+        ["healthy-signals"] = "",
+        // Moves queued behind two stocktakes: each move took its own bay's gate, which nobody waits for.
+        ["semaphore-queued-moves"] = "warning semaphore-wait",
+        // Each worker gave its first lock back through an extension method before it waits for the other one.
+        ["semaphore-release-helper"] = "warning semaphore-wait",
         ["db-forgotten-transaction"] = "warning database-wait",
         ["db-deadlock-retry"] = "warning database-wait",
         ["db-app-lock-cycle"] = "critical database-deadlock",

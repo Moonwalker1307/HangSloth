@@ -41,10 +41,11 @@ public sealed class BlockedOnTaskDetector : IDetector
 
             if (leaf.Kind == TaskKind.SemaphoreWait)
             {
-                var semaphoreWait = SemaphoreWait(snapshot, thread, chain, opening, path, location);
-                yield return mayBeStopSignal && semaphoreWait.Severity == Severity.Warning
-                    ? semaphoreWait with { Details = [.. semaphoreWait.Details, StopSignalDetail] }
-                    : semaphoreWait;
+                // Null for a loop waiting on a signal: an idle pump, not a hang.
+                if (SemaphoreWait(snapshot, thread, chain, opening, path, location) is { } semaphoreWait)
+                    yield return mayBeStopSignal && semaphoreWait.Severity == Severity.Warning
+                        ? semaphoreWait with { Details = [.. semaphoreWait.Details, StopSignalDetail] }
+                        : semaphoreWait;
                 continue;
             }
 
@@ -135,44 +136,62 @@ public sealed class BlockedOnTaskDetector : IDetector
             ? leafText
             : $"{Describe.Task(chain[0])}" + string.Concat(chain.Skip(1).SkipLast(1).Select((t, i) => $", {Describe.Link(chain[i])} {Describe.Task(t)}")) + $", which {leafText}";
 
-    /// An async chain parked in SemaphoreSlim.WaitAsync, often because something further up the same
-    /// chain already holds that semaphore (SemaphoreSlim isn't reentrant).
-    private static Finding SemaphoreWait(ProcessSnapshot snapshot, ThreadSnapshot thread, List<TaskInfo> chain, string opening, List<TaskInfo> path, SourceLocation? location)
+    /// An async chain parked in SemaphoreSlim.WaitAsync. It waits for itself when code further up the same chain took that
+    /// semaphore before the await it is paused at (SemaphoreSlim isn't reentrant); the semaphore can't show that, the
+    /// chain's own code can (<see cref="SemaphoreUse.Holds"/>). Null for a loop waiting on a signal: an idle pump, not a hang.
+    private static Finding? SemaphoreWait(ProcessSnapshot snapshot, ThreadSnapshot thread, List<TaskInfo> chain, string opening, List<TaskInfo> path, SourceLocation? location)
     {
         var semaphore = chain[^1].Semaphore is { } a ? snapshot.FindSemaphore(a) : null;
+        var role = semaphore is null ? SemaphoreRole.Unknown : SemaphoreFacts.Role(thread.SemaphoreUse, semaphore);
+        if (role == SemaphoreRole.Signal) return null;
         var name = semaphore?.DisplayName ?? "a SemaphoreSlim";
         var slots = semaphore is null ? "" : $", {SemaphoreFacts.Slots(semaphore)}";
         var waiting = chain.Count >= 2 ? chain[^2] : null;
         var leafText = path.Count == 1 ? $"SemaphoreSlim.WaitAsync() on {name}{slots}" : $"is waiting to enter {name} (SemaphoreSlim.WaitAsync(){slots})";
+        var held = semaphore is null || waiting is null ? [] : (thread.SemaphoreUse?.Holds ?? []).Where(h => h.Address == semaphore.Object.Address).ToList();
 
         var details = new List<string>();
         var sameOwner = semaphore?.ContainerAddress is { } owner && waiting is not null
             ? chain.SkipLast(2).Where(t => t.ThisAddress == owner).ToList()
             : [];
-        if (sameOwner.Count > 0)
+        // Once the code has been read and shows that none of them took it, the same object is no lead.
+        if (sameOwner.Count > 0 && (held.Count > 0 || thread.SemaphoreUse is null))
         {
             details.Add($"{Describe.JoinAnd(sameOwner.Select(t => t.Description))}, earlier in this same async chain, runs on the same object that owns {name}. " +
                         $"If it took {name} before calling {waiting!.Description}, the chain is waiting for itself: SemaphoreSlim isn't reentrant, so the second WaitAsync never completes.");
         }
+        details.AddRange(held.Select(h => $"{h.Method} took {name} earlier{(h.Location is null ? "" : $" ({h.Location})")} and doesn't release it before the await it is paused at."));
         // A throttle (max N) where every slot is held by a call waiting for a nested slot: N nested waiters, 0 free.
-        var throttle = sameOwner.Count > 0 && semaphore is { MaxCount: > 1 and < int.MaxValue, CurrentCount: 0 } t && t.AsyncWaiters >= t.MaxCount;
+        var throttle = held.Count > 0 && semaphore is { MaxCount: > 1 and < int.MaxValue, CurrentCount: 0 } t && t.AsyncWaiters >= t.MaxCount;
         if (throttle)
             details.Add($"{name} has {semaphore!.MaxCount} slots and {semaphore.AsyncWaiters} async callers waiting for one. If each of them is a nested call like this one, " +
                         $"every slot is held by a call that waits for another slot: a throttle deadlock that needs only {semaphore.MaxCount} concurrent calls.");
         if (semaphore is not null) details.Add(SemaphoreFacts.NoOwner(semaphore));
+        // Code that couldn't be followed keeps the Warning such a wait has always had, and says why it can't say more; so
+        // does code that was read but doesn't show the role, unless it waits in a loop, as a pump waiting for work does.
+        var notFollowed = thread.SemaphoreUse is null && role != SemaphoreRole.Lock;
+        if (notFollowed) details.Add(SemaphoreFacts.NotFollowed(name));
+        else if (held.Count == 0 && role == SemaphoreRole.Unknown && semaphore is not null) details.Add(SemaphoreFacts.MaybeSignal(semaphore));
 
+        // Holds the only slot, or every slot is held like this, and waits for another: it can't go on.
+        var deadlock = held.Count > 0 && (semaphore is { MaxCount: 1, CurrentCount: 0 } || throttle);
         return new Finding
         {
             Id = "semaphore-wait",
-            // Paused past its own WaitAsync and waiting on the same one-slot semaphore: as good as proof.
-            Severity = sameOwner.Count > 0 && (semaphore is { MaxCount: 1, CurrentCount: 0 } || throttle) ? Severity.Critical : Severity.Warning,
-            Title = sameOwner.Count > 0 ? "Deadlock: async code waiting for a SemaphoreSlim it already holds" : "Waiting for a SemaphoreSlim nobody releases",
+            Severity = deadlock ? Severity.Critical
+                : held.Count > 0 || role == SemaphoreRole.Lock || notFollowed || role == SemaphoreRole.Unknown && thread.SemaphoreUse is { WaitsInLoop: false } ? Severity.Warning
+                : Severity.Info,
+            Title = deadlock ? "Deadlock: async code waiting for a SemaphoreSlim it already holds"
+                : held.Count > 0 ? "Async code waiting for a SemaphoreSlim it already holds"
+                : SemaphoreFacts.NoFreeSlots,
             Summary = $"{opening}{Path(path, leafText)}.",
             Details = details,
-            Advice = sameOwner.Count > 0
+            Advice = held.Count > 0
                 ? $"Don't take {name} twice on one call path: give {waiting!.Description} a variant that expects the semaphore to be held already, or release it before calling. " +
                   "A WaitAsync timeout turns this hang into an error you can see."
-                : $"Find the code that took {name} and make sure it calls Release() on every path (try/finally), and that it isn't waiting for this chain while holding it.",
+                : role == SemaphoreRole.Lock || semaphore is null
+                    ? $"Find the code that took {name} and make sure it calls Release() on every path (try/finally), and that it isn't waiting for this chain while holding it."
+                    : SemaphoreFacts.LockOrSignalAdvice(semaphore),
             ThreadIds = [thread.ManagedId],
             Location = location,
         };

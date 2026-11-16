@@ -257,7 +257,7 @@ public class ThrottleTests
         var node = new TaskInfo { Address = 0x300, TypeName = "System.Threading.SemaphoreSlim+TaskNode", Kind = TaskKind.SemaphoreWait, Description = "SemaphoreSlim.WaitAsync()", Semaphore = 0x100 };
         var customer = new TaskInfo { Address = 0x200, TypeName = "Box", Kind = TaskKind.AsyncMethod, Description = "PartnerApi.GetCustomerAsync", ThisAddress = api, Awaiting = node };
         var order = new TaskInfo { Address = 0x150, TypeName = "Box", Kind = TaskKind.AsyncMethod, Description = "PartnerApi.GetOrderAsync", ThisAddress = api, Awaiting = customer };
-        var snapshot = Process(Thread(1, [.. ResultWait, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = order }) with
+        var snapshot = Process(Thread(1, [.. ResultWait, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = order, SemaphoreUse = new() { Holds = [new HeldSemaphore(0x100, "PartnerApi.GetOrderAsync", null)] } }) with
         {
             Semaphores = [new SemaphoreInfo { Object = new ObjectRef(0x100, "System.Threading.SemaphoreSlim"), FieldName = "PartnerApi._throttle", ContainerAddress = api, CurrentCount = 0, MaxCount = 3, AsyncWaiters = 3 }],
         };

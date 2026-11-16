@@ -171,6 +171,7 @@ public sealed partial class SnapshotBuilder
         }
         if (incomplete.Count > 0)
             _warnings.Add(IncompleteThreadsWarning(incomplete));
+        threads = ReadSemaphoreUses(partial, threads);
 
         // Fill in waiters from what each thread is trying to enter, and name each lock after the field holding it.
         var semaphoreAddresses = threads.Select(t => t.WaitingForSemaphore).OfType<ulong>().Concat(_semaphoresInChains).ToHashSet();
