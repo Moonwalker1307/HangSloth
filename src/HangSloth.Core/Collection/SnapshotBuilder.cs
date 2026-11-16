@@ -79,9 +79,10 @@ public sealed partial class SnapshotBuilder
                 Frames = [],
             };
             var id = thread.ManagedThreadId;
+            var roots = SafeRoots(thread);
             snapshot = Step(snapshot, id, s =>
             {
-                var frames = ReadFrames(thread);
+                var frames = ReadFrames(thread, roots);
                 return s with
                 {
                     IsThreadPoolWorker = frames.Any(FrameClassifier.IsThreadPoolDispatchFrame)
@@ -102,7 +103,7 @@ public sealed partial class SnapshotBuilder
                 ThreadReadFault?.Invoke(id, "name");
                 return s with { Name = ReadThreadName(threadObject) };
             });
-            partial.Add((thread, snapshot, SafeRoots(thread)));
+            partial.Add((thread, snapshot, roots));
         }
 
         var locks = ReadLocks(byAddress);
@@ -161,6 +162,8 @@ public sealed partial class SnapshotBuilder
                 }
                 return r;
             });
+            // A handler the JIT inlined into a compiled delegate has no frame of its own: the task it waits for says where it is.
+            result = Step(result, id, r => kind == BlockingKind.TaskWait ? r with { Frames = WithInlinedWaiter(r.Frames, r.BlockedOnTask) } : r);
             result = Step(result, id, r => r.BlockedOnTask is { } task && DatabaseCommandInChain(task) is { } command
                 ? r with { Database = AsyncDatabaseWait(command, r.Database) }
                 : r);
@@ -228,7 +231,7 @@ public sealed partial class SnapshotBuilder
         return new ObjectRef(ctx.Address, ctx.Type.Name ?? "SynchronizationContext");
     }
 
-    private List<StackFrameInfo> ReadFrames(ClrThread thread)
+    private List<StackFrameInfo> ReadFrames(ClrThread thread, List<ClrStackRoot> roots)
     {
         var frames = new List<StackFrameInfo>();
         var code = new List<(ClrMethod? Method, ulong Ip, bool IsLeaf)>();
@@ -270,27 +273,260 @@ public sealed partial class SnapshotBuilder
         {
             _warnings.Add($"Could not fully walk the stack of thread {thread.ManagedThreadId}: {e.Message}");
         }
-        ResolveBlockingCall(frames, code);
+        ResolveCalls(frames, code, roots);
         return frames;
     }
 
-    /// The app frame that blocks on a task: read the blocking call from its IL, which gives the right line and
-    /// the right kind of wait even when optimized code inlined Task&lt;T&gt;.Result and lost its frame.
-    private void ResolveBlockingCall(List<StackFrameInfo> frames, List<(ClrMethod? Method, ulong Ip, bool IsLeaf)> code)
+    /// Lines the stack walk can't give, and the call a task wait is in. ClrMD maps only the code a method was first
+    /// compiled to: a frame in code the JIT compiled again with optimizations (tier 1, or OSR for a hot loop) has no
+    /// IL offset, so its line is read from its IL instead, at the call that leads to the frame above it. When several
+    /// calls can be it, the line is left out and a note names them: a wrong line is worse than none. When the IL or
+    /// the PDB can't be read, the frame keeps what the stack walk gave.
+    private void ResolveCalls(List<StackFrameInfo> frames, List<(ClrMethod? Method, ulong Ip, bool IsLeaf)> code, List<ClrStackRoot> roots)
     {
-        if (FrameClassifier.Classify(frames) != BlockingKind.TaskWait) return;
-        var index = frames.FindIndex(FrameClassifier.IsUserFrame);
-        if (index < 0 || code[index].Method is not { } method || method.Type?.Module is not { IsDynamic: false } module) return;
+        var first = frames.FindIndex(FrameClassifier.IsUserFrame);
+        if (first < 0) return;
+        var taskWait = FrameClassifier.Classify(frames) == BlockingKind.TaskWait;
+        for (var i = first; i < frames.Count; i++)
+        {
+            if (!FrameClassifier.IsUserFrame(frames[i]) || code[i].Method is not { } method || method.Type?.Module is not { IsDynamic: false } module) continue;
+            try
+            {
+                var address = code[i].IsLeaf ? code[i].Ip : code[i].Ip - 1;
+                var mapped = IsMapped(method.ILOffsetMap, address);
+                var callee = i > 0 && frames[i - 1].TypeName.Length > 0 ? frames[i - 1] : null;
+                if (taskWait && i == first)
+                    frames[i] = WithBlockingCall(frames, frames[i], method, module, method.GetILOffset(address), mapped, callee, roots);
+                else if (!mapped && callee is not null && FindCalls(frames[i], method, module, callee, innermost: i == first) is { HasSymbols: true } sites)
+                    frames[i] = WithLines(frames[i], sites);
+            }
+            catch
+            {
+                // Keep what the stack walk gave.
+            }
+        }
+    }
+
+    /// The app frame that blocks on a task: read the blocking call from its IL, which gives the right line and the
+    /// right kind of wait even when optimized code inlined Task&lt;T&gt;.Result and lost its frame. When the frame above
+    /// is another framework method that waits for a task itself (Parallel.ForEach, Process.WaitForExit), that is the call.
+    private StackFrameInfo WithBlockingCall(IReadOnlyList<StackFrameInfo> frames, StackFrameInfo frame, ClrMethod method, ClrModule module, int ilOffset, bool mapped,
+        StackFrameInfo? callee, List<ClrStackRoot> roots)
+    {
+        if (callee is not null && !IsTaskWaitFrame(callee))
+        {
+            var call = CalleeCall(frames, callee);
+            if (mapped) return frame with { BlockingCall = call };
+            if (FindCalls(frame, method, module, callee, innermost: true) is { } calls)
+                return (calls.HasSymbols ? WithLines(frame, calls) : frame) with { BlockingCall = call };
+        }
+        else if (callee is not null && !mapped)
+        {
+            var hint = new TaskWaitHint(WaitCall(callee), ResultType(callee.TypeName) ?? WaitedResultType(roots));
+            if (_sources.ResolveBlockingCall(module.Name, method.MetadataToken, hint, () => module.Pdb?.Guid) is { } sites)
+            {
+                NoteUnknownLine(frame, sites, sites.Call is { } c ? $"blocks with {c}" : "blocks on a task", innermost: true);
+                return (sites.HasSymbols ? WithLines(frame, sites) : frame) with { BlockingCall = sites.Call };
+            }
+        }
+        return _sources.ResolveBlockingCall(module.Name, method.MetadataToken, ilOffset, () => module.Pdb?.Guid) is { } found
+            ? frame with { BlockingCall = found.Call, Source = found.Location ?? frame.Source }
+            : frame;
+    }
+
+    /// The framework method a task-wait thread's app frame called, named as its blocking call. Null for synchronous I/O
+    /// that blocks on a task inside (HttpClient.Send): the detectors name that from the stack and advise its async version.
+    /// Parallel's workers are what is left of Parallel.For and ForEach once optimized code inlined them.
+    internal static string? CalleeCall(IReadOnlyList<StackFrameInfo> frames, StackFrameInfo callee)
+    {
+        if (FrameClassifier.SyncIoFrame(frames) is not null) return null;
+        if (callee.TypeName == "System.Threading.Tasks.Parallel")
+        {
+            if (callee.MethodName.StartsWith("ForEachWorker", StringComparison.Ordinal) || callee.MethodName.StartsWith("PartitionerForEachWorker", StringComparison.Ordinal))
+                return "Parallel.ForEach";
+            if (callee.MethodName.StartsWith("ForWorker", StringComparison.Ordinal)) return "Parallel.For/ForEach";
+        }
+        return Names.ShortMethod(callee.TypeName, callee.MethodName);
+    }
+
+    /// The frame at the one line its IL leaves, or at none with the lines it can be at, so that no other frame's line is taken for it.
+    private static StackFrameInfo WithLines(StackFrameInfo frame, CallSites sites) =>
+        frame with { Source = sites.Line, CandidateLines = sites.Line is null ? sites.Lines : null };
+
+    /// Where a frame can be calling the frame above it, read from its IL; null when the IL can't be read.
+    private CallSites? FindCalls(StackFrameInfo frame, ClrMethod method, ClrModule module, StackFrameInfo callee, bool innermost)
+    {
+        if (_sources.ResolveCall(module.Name, method.MetadataToken, callee.TypeName, callee.MethodName, callee.ModuleName, () => module.Pdb?.Guid) is not { } sites) return null;
+        NoteUnknownLine(frame, sites, PublicCall(callee), innermost);
+        return sites;
+    }
+
+    /// What a frame above the app's code does, in the words of the call the app made: the runtime's own helpers
+    /// (Monitor.Enter_Slowpath, SemaphoreSlim.WaitCore) are what is left of that call once optimized code inlined it.
+    internal static string PublicCall(StackFrameInfo callee)
+    {
+        if (callee.TypeName is "System.Threading.Monitor" or "System.Threading.Lock"
+            && (callee.MethodName.StartsWith("Enter", StringComparison.Ordinal) || callee.MethodName.StartsWith("TryEnter", StringComparison.Ordinal) || callee.MethodName == "ReliableEnter"))
+            return "takes a lock";
+        if (callee.TypeName == "System.Threading.SemaphoreSlim" && callee.MethodName is "Wait" or "WaitCore") return "calls SemaphoreSlim.Wait()";
+        var name = callee.MethodName.StartsWith("get_", StringComparison.Ordinal) ? callee.MethodName[4..] : callee.MethodName;
+        return $"calls {Names.ShortMethod(callee.TypeName, name)}";
+    }
+
+    private readonly HashSet<string> _notes = [];
+
+    /// Says why a frame has no line, and where it can be: several calls, or (for the frame a thread waits in) none found.
+    private void NoteUnknownLine(StackFrameInfo frame, CallSites sites, string what, bool innermost)
+    {
+        if (!sites.HasSymbols || sites.Lines.Count == 1 || (sites.Lines.Count == 0 && !innermost)) return;
+        var method = Names.ShortMethod(frame.TypeName, frame.MethodName);
+        var note = sites.Lines.Count == 0
+            ? $"{method} runs optimized code that the dump has no line map for, and the place where it {what} can't be found in its IL, so its line is left out."
+            : $"{method} runs optimized code that the dump has no line map for, and it {what} in more than one place ({string.Join(", ", sites.Lines)}), so its line is left out.";
+        if (_notes.Add(note)) _warnings.Add(note);
+    }
+
+    /// Whether ClrMD's IL map covers an address. The map is that of the code the method was first compiled to; once the
+    /// JIT has compiled it again, its frames lie outside the map and GetILOffset silently answers the first statement.
+    internal static bool IsMapped(System.Collections.Immutable.ImmutableArray<ILToNativeMap> map, ulong address)
+    {
+        if (map.IsDefaultOrEmpty) return false;
+        foreach (var entry in map)
+        {
+            if (entry.StartAddress <= address && address <= entry.EndAddress) return true;
+        }
+        return false;
+    }
+
+    /// A framework frame that is the app's own blocking call on a task, or what is left of it once optimized code inlined the call.
+    private static bool IsTaskWaitFrame(StackFrameInfo f) =>
+        FrameClassifier.IsTaskWaitMethod(f.TypeName, f.MethodName)
+        || (f.TypeName.StartsWith("System.Threading.Tasks.ValueTask", StringComparison.Ordinal) && f.MethodName == "get_Result")
+        || (f.TypeName.StartsWith("System.Runtime.CompilerServices.", StringComparison.Ordinal) && f.MethodName is "GetResult" or "ValidateEnd" or "HandleNonSuccessAndDebuggerNotification");
+
+    /// The blocking call that a task-wait frame right above the app's frame belongs to; null when only the wait itself
+    /// is left (optimized code inlined .Result, .Wait() or GetResult() into the app's method).
+    private static string? WaitCall(StackFrameInfo f)
+    {
+        if (f.TypeName.StartsWith("System.Runtime.CompilerServices.", StringComparison.Ordinal)) return ".GetAwaiter().GetResult()";
+        if (f.MethodName is "get_Result" or "GetResultCore") return ".Result";
+        if (f.MethodName == "Wait") return ".Wait()";
+        if (f.MethodName.StartsWith("WaitAll", StringComparison.Ordinal)) return "Task.WaitAll(...)";
+        if (f.MethodName.StartsWith("WaitAny", StringComparison.Ordinal)) return "Task.WaitAny(...)";
+        return null;
+    }
+
+    /// "System.Int32" for a frame of Task&lt;System.Int32&gt; or TaskAwaiter&lt;System.Int32&gt;; null when the frame's type has no
+    /// type argument or is shared code for reference types (System.__Canon), which says nothing.
+    internal static string? ResultType(string typeName)
+    {
+        var open = typeName.IndexOf('<');
+        if (open <= 0 || !(char.IsLetterOrDigit(typeName[open - 1]) || typeName[open - 1] == '_')) return null;
+        var depth = 0;
+        for (var i = open; i < typeName.Length; i++)
+        {
+            if (typeName[i] == '<') depth++;
+            else if (typeName[i] == '>') depth--;
+            if (depth == 0 || (depth == 1 && typeName[i] == ','))
+            {
+                var argument = typeName[(open + 1)..i].Trim();
+                return argument.Length == 0 || argument.Contains("__Canon", StringComparison.Ordinal) ? null : argument;
+            }
+        }
+        return null;
+    }
+
+    /// The result type of the pending task that a task-wait frame holds ("" for a Task without one), or null when no
+    /// wait frame holds one. Only a wait frame's own task: another pending task on the stack may not be the one waited for.
+    private static string? WaitedResultType(List<ClrStackRoot> roots)
+    {
+        foreach (var root in roots)
+        {
+            var obj = root.Object;
+            var frameMethod = root.StackFrame?.Method;
+            if (obj.IsNull || frameMethod is null || !IsTask(obj.Type) || ReadTaskState(obj) != TaskState.Pending) continue;
+            if (!FrameClassifier.IsTaskWaitMethod(frameMethod.Type?.Name ?? "", frameMethod.Name ?? "")) continue;
+            for (var t = obj.Type; t is not null; t = t.BaseType)
+            {
+                if (t.Name is { } name && name.StartsWith("System.Threading.Tasks.Task<", StringComparison.Ordinal))
+                    return ResultType(name);
+            }
+            return "";
+        }
+        return null;
+    }
+
+    /// A compiled delegate (lambda_method: a minimal API handler or an MVC action invoker, always optimized code) often
+    /// has the app's small handler and service methods inlined into it, so a thread blocked on a task there has no app
+    /// frame to say where. The task says which of the app's async methods it waits for, and the app's IL says which
+    /// method calls that and blocks on it: when only one does, that method is put back on the stack, above the delegate.
+    private IReadOnlyList<StackFrameInfo> WithInlinedWaiter(IReadOnlyList<StackFrameInfo> frames, TaskInfo? task)
+    {
+        if (task is null || !Describe.IsAppAsyncMethod(task)) return frames;
+        var at = -1;
+        for (var i = 0; i < frames.Count && at < 0; i++)
+        {
+            if (FrameClassifier.IsUserFrame(frames[i])) return frames;
+            if (!frames[i].IsRuntimeFrame && frames[i].TypeName.Length == 0) at = i;
+        }
+        if (at < 1 || !IsTaskWaitFrame(frames[at - 1])) return frames;
         try
         {
-            var il = method.GetILOffset(code[index].IsLeaf ? code[index].Ip : code[index].Ip - 1);
-            if (_sources.ResolveBlockingCall(module.Name, method.MetadataToken, il, () => module.Pdb?.Guid) is not { } call) return;
-            frames[index] = frames[index] with { BlockingCall = call.Call, Source = call.Location ?? frames[index].Source };
+            if (!TryReadStateMachine(_heap.GetObject(task.Address), out var stateMachine)
+                || stateMachine.Type is not { Module: { } module } smType
+                || smType.Methods.FirstOrDefault(m => m.Name == "MoveNext") is not { } moveNext
+                || _sources.ResolveBlockingCallers(module.Name, moveNext.MetadataToken, AppModules(), () => module.Pdb?.Guid) is not { } callers)
+                return frames;
+            if (callers.Methods.Count > 1)
+            {
+                var note = $"Code inlined into {Names.ShortMethod("", frames[at].MethodName)} (a compiled delegate, such as a minimal API handler) is blocked on {task.Description}, " +
+                           $"which is waited for in more than one place ({string.Join(", ", callers.Methods.Select(m => Names.ShortMethod(m.TypeName, m.MethodName) + (m.Call.Location is { } l ? $" ({l})" : "")))}), so the stack doesn't say where.";
+                if (_notes.Add(note)) _warnings.Add(note);
+            }
+            if (!callers.Complete || callers.Methods.Count != 1) return frames;
+            var caller = callers.Methods[0];
+            var withCaller = frames.ToList();
+            withCaller.Insert(at, new StackFrameInfo
+            {
+                TypeName = caller.TypeName,
+                MethodName = caller.MethodName,
+                ModuleName = caller.ModulePath,
+                Source = caller.Call.Location,
+                BlockingCall = caller.Call.Call,
+                InlinedInto = frames[at].MethodName,
+            });
+            var inferred = $"{Names.ShortMethod(caller.TypeName, caller.MethodName)} is shown above {Names.ShortMethod("", frames[at].MethodName)} although the stack walk doesn't find it: " +
+                           $"the JIT inlined it into that compiled delegate (such as a minimal API handler), and it is the only method in the app's own code that blocks on {task.Description}.";
+            if (_notes.Add(inferred)) _warnings.Add(inferred);
+            return withCaller;
         }
         catch
         {
-            // Keep what the stack walk gave.
+            return frames;
         }
+    }
+
+    private List<(string Path, Func<Guid?>? DumpedBuild)>? _appModules;
+
+    /// The app's own modules (not the framework's), where the callers of its methods are.
+    private List<(string Path, Func<Guid?>? DumpedBuild)> AppModules()
+    {
+        if (_appModules is not null) return _appModules;
+        _appModules = [];
+        try
+        {
+            foreach (var module in _runtime.EnumerateModules())
+            {
+                if (module.IsDynamic || string.IsNullOrEmpty(module.Name) || FrameClassifier.IsFrameworkModule(module.Name)) continue;
+                if (_appModules.Any(m => string.Equals(m.Path, module.Name, StringComparison.OrdinalIgnoreCase))) continue;
+                _appModules.Add((module.Name, () => module.Pdb?.Guid));
+            }
+        }
+        catch
+        {
+            // The modules found so far will do.
+        }
+        return _appModules;
     }
 
     private SourceLocation? ResolveSource(ClrMethod method, ulong ip, bool isLeaf)

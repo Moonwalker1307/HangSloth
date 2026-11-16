@@ -95,6 +95,15 @@ public sealed record StackFrameInfo
     /// Null when the IL couldn't be read; the wait is then judged from the framework frames above.
     public string? BlockingCall { get; init; }
 
+    /// Set when the dump has no line map for this frame's optimized code and its IL leaves the line open: every line it
+    /// can be at (empty when none fits). <see cref="Source"/> is then null, and the place to name is this method, not
+    /// the line of another frame.
+    public IReadOnlyList<SourceLocation>? CandidateLines { get; init; }
+
+    /// For a frame the stack walk doesn't show because the JIT inlined its code into the frame below it (a compiled
+    /// delegate, lambda_method): that frame's method. The frame was put back from the app's IL.
+    public string? InlinedInto { get; init; }
+
     public string FullName => TypeName.Length == 0 ? MethodName : $"{TypeName}.{MethodName}";
 
     public override string ToString() => Source is null ? FullName : $"{FullName} ({Source})";

@@ -10,7 +10,7 @@
     <TieredPGO>false</TieredPGO>
   </PropertyGroup>
   <ItemGroup>
-    <!-- The generic host for the host-* modes, from the shared framework that comes with the SDK (no package). -->
+    <!-- The generic host for the host-* modes and the minimal API for the minimal-api mode, from the shared framework that comes with the SDK (no package). -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 </Project>
