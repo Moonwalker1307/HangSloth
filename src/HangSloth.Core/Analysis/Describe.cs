@@ -131,6 +131,34 @@ internal static class Describe
         return at >= 0 && !FrameClassifier.IsFrameworkType(task.TypeName[(at + marker.Length)..]);
     }
 
+    /// How one link of a task chain leads to the next: an async method awaits it, a ContinueWith task runs
+    /// after it, and a wrapper (Task.Run(async ...), WaitAsync) only waits for it.
+    public static string Link(TaskInfo from) => from.Kind switch
+    {
+        TaskKind.Continuation => "which runs after",
+        TaskKind.Wrapper => "which waits for",
+        _ => "which awaits",
+    };
+
+    /// A chain as a sentence should tell it: without the links that only repeat their neighbour.
+    public static List<TaskInfo> ReadableChain(TaskInfo task)
+    {
+        // Task.Run(async ...) whose lambda hasn't reached its first await yet: the lambda is still running as
+        // the Task.Run task behind the wrapper, so naming both would say "Task.Run" twice.
+        var chain = Chain(task)
+            .Where(t => !(t.Kind == TaskKind.Wrapper && t.Awaiting?.Kind == TaskKind.Delegate && t.Description.StartsWith("Task.Run(", StringComparison.Ordinal)))
+            .ToList();
+        // SemaphoreSlim.WaitAsync with a timeout or a token waits through an async method of its own and a
+        // WaitAsync(...) wrapper. The code that called WaitAsync is the link before those, as with a plain WaitAsync().
+        while (chain.Count >= 2 && chain[^1].Kind == TaskKind.SemaphoreWait && IsSemaphoreWaitPlumbing(chain[^2]))
+            chain.RemoveAt(chain.Count - 2);
+        return chain;
+    }
+
+    private static bool IsSemaphoreWaitPlumbing(TaskInfo task) =>
+        task.Kind is TaskKind.Wrapper or TaskKind.Continuation
+        || task.TypeName.Contains("System.Threading.SemaphoreSlim+<WaitUntilCountOrTimeoutAsync>", StringComparison.Ordinal);
+
     /// Walk an async chain from the waited task to the innermost thing it is waiting for.
     public static IEnumerable<TaskInfo> Chain(TaskInfo task)
     {

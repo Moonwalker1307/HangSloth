@@ -69,7 +69,8 @@ public sealed record ThreadSnapshot
     /// A Process this thread is waiting for (WaitForExit), if any.
     public ProcessWait? WaitingForProcess { get; init; }
 
-    /// The task whose delegate this thread is currently running (a Task.Run body), if any.
+    /// The task whose delegate this thread is currently running (a Task.Run body), or the async method
+    /// it is running the rest of after an await, if any.
     public ulong? RunningTask { get; init; }
 
     /// What this thread is doing with a database, if anything: a query it waits on, a pool it waits for,
@@ -123,6 +124,7 @@ public enum TaskKind
     Delegate,          // Task.Run / Task.Factory.StartNew
     Continuation,      // ContinueWith
     SemaphoreWait,     // SemaphoreSlim.WaitAsync
+    Wrapper,           // waits for the task in Awaiting: Task.Run(async ...), Unwrap(), WaitAsync, or a WhenAny stuck on all of its tasks
 }
 
 public sealed record TaskInfo
@@ -138,7 +140,8 @@ public sealed record TaskInfo
     /// For async methods: where the method is currently paused (the await it is stuck on).
     public SourceLocation? AwaitLocation { get; init; }
 
-    /// For async methods: the task the method is currently awaiting.
+    /// For async methods: the task the method is currently awaiting. For a ContinueWith task: the task it
+    /// runs after. For a wrapper: the task it waits for.
     public TaskInfo? Awaiting { get; init; }
 
     /// Where this task's continuation will run once its awaited task finishes.

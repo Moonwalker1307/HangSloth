@@ -15,17 +15,21 @@ public sealed partial class SnapshotBuilder
     private static readonly HashSet<string> TaskExecuteMethods =
         ["InnerInvoke", "ExecuteWithThreadLocal", "ExecuteEntry", "ExecuteEntryUnsafe", "ExecuteFromThreadPool", "ExecuteEntryCancellationRequestedOrCanceled"];
 
-    /// The task whose delegate this thread is running: the Task.Run body further down its stack.
-    private static ulong? FindRunningTask(List<ClrStackRoot> roots)
+    /// The task whose delegate this thread is running: the Task.Run body further down its stack, or else
+    /// the async method it is running the rest of after an await.
+    private ulong? FindRunningTask(List<ClrStackRoot> roots)
     {
+        ulong? resumed = null;
         foreach (var root in roots)
         {
             var method = root.StackFrame?.Method;
+            if (resumed is null && IsResumedAsyncMethod(root)) resumed = root.Object.Address;
             if (method?.Type?.Name?.StartsWith("System.Threading.Tasks.Task", StringComparison.Ordinal) != true
                 || !TaskExecuteMethods.Contains(method.Name ?? "")) continue;
             if (!root.Object.IsNull && IsTask(root.Object.Type)) return root.Object.Address;
         }
-        return null;
+        if (resumed is { } box) _resumedAsyncMethods.Add(box);
+        return resumed;
     }
 
     /// A SynchronizationContext.Send override on the stack, and the context it was called on. Send runs the

@@ -13,7 +13,7 @@ public sealed class BlockedOnTaskDetector : IDetector
             if (claimed.Contains(thread.ManagedId) || thread.BlockedOnTask is not { } waited || waited.State != TaskState.Pending)
                 continue;
 
-            var chain = Describe.Chain(waited).ToList();
+            var chain = Describe.ReadableChain(waited);
             // A test runner or host waiting for its own work (testhost's Main, host.RunAsync().GetAwaiter().GetResult()):
             // that's how a healthy process looks.
             if (FrameClassifier.Classify(thread.Frames) == BlockingKind.Idle || chain.Any(FrameClassifier.IsHostRunTask))
@@ -39,7 +39,7 @@ public sealed class BlockedOnTaskDetector : IDetector
 
             var path = chain.Count == 1
                 ? leafText
-                : $"{Describe.Task(chain[0])}" + string.Concat(chain.Skip(1).SkipLast(1).Select(t => $", which awaits {Describe.Task(t)}")) + $", which awaits {leafText}";
+                : $"{Describe.Task(chain[0])}" + string.Concat(chain.Skip(1).SkipLast(1).Select((t, i) => $", {Describe.Link(chain[i])} {Describe.Task(t)}")) + $", {Describe.Link(chain[^2])} {leafText}";
 
             yield return new Finding
             {
@@ -62,7 +62,7 @@ public sealed class BlockedOnTaskDetector : IDetector
     private static string Path(List<TaskInfo> chain, string leafText) =>
         chain.Count == 1
             ? leafText
-            : $"{Describe.Task(chain[0])}" + string.Concat(chain.Skip(1).SkipLast(1).Select(t => $", which awaits {Describe.Task(t)}")) + $", which {leafText}";
+            : $"{Describe.Task(chain[0])}" + string.Concat(chain.Skip(1).SkipLast(1).Select((t, i) => $", {Describe.Link(chain[i])} {Describe.Task(t)}")) + $", which {leafText}";
 
     /// An async chain parked in SemaphoreSlim.WaitAsync, often because something further up the same
     /// chain already holds that semaphore (SemaphoreSlim isn't reentrant).
