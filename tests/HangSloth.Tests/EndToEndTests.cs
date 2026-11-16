@@ -131,12 +131,14 @@ internal static class SampleApp
 {
     private static readonly ConcurrentDictionary<string, Lazy<string>> Builds = new();
     /// <param name="until">For timing-dependent scenarios: dump again (up to 3 times) until the report satisfies this.</param>
-    public static AnalysisReport Analyze(string mode, string configuration = "Release", string project = "HangApp", Func<AnalysisReport, bool>? until = null)
+    /// <param name="environment">Environment variables for the sample process (DOTNET_TieredCompilation=0 runs it fully optimized).</param>
+    public static AnalysisReport Analyze(string mode, string configuration = "Release", string project = "HangApp", Func<AnalysisReport, bool>? until = null,
+        IReadOnlyDictionary<string, string?>? environment = null)
     {
         var app = Build(project, configuration);
         var dump = TestRun.NewDumpPath(mode);
 
-        using var sample = Sample.Start(app, [mode]);
+        using var sample = Sample.Start(app, [mode], environment);
         try
         {
             sample.WaitUntilReady(TimeSpan.FromSeconds(30));

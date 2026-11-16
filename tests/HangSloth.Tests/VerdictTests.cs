@@ -53,6 +53,18 @@ public class VerdictTests
     }
 
     [Fact]
+    public void A_mismatch_shows_the_stacks_that_run_the_apps_code()
+    {
+        var waiting = SnapshotFactory.Thread(4, [SnapshotFactory.Fx("System.Threading.WaitHandle", "WaitOneNoCheck"), SnapshotFactory.App("Shop.Exporter", "Wait", "Exporter.cs", 12)], "export");
+        var idle = SnapshotFactory.Thread(5, [SnapshotFactory.Fx("System.Threading.Thread", "Sleep")]);
+        var report = new AnalysisReport(SnapshotFactory.Process(waiting, idle), []);
+        var ex = Assert.ThrowsAny<Exception>(() => Verdict.Expect(report, "warning process-pipe-deadlock"));
+        Assert.Contains("Stacks of the 1 threads in the app's code:", ex.Message);
+        Assert.Contains("Thread 4 (\"export\"): System.Threading.WaitHandle.WaitOneNoCheck < Shop.Exporter.Wait (Exporter.cs:12)", ex.Message);
+        Assert.DoesNotContain("Thread 5", ex.Message);
+    }
+
+    [Fact]
     public void A_misspelt_severity_is_an_error_in_the_test()
     {
         Assert.Throws<ArgumentException>(() => Verdict.Matches(Report(), "critcal lock-deadlock"));

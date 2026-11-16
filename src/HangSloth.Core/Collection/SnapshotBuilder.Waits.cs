@@ -32,28 +32,108 @@ public sealed partial class SnapshotBuilder
 
     /// A SynchronizationContext.Send override on the stack, and the context it was called on. Send runs the
     /// callback on the context's thread and waits for it, like Control.Invoke and Dispatcher.Invoke.
-    private static ObjectRef? FindSendTarget(List<ClrStackRoot> roots)
+    private ObjectRef? FindSendTarget(ClrThread thread, List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
     {
         foreach (var root in roots)
         {
-            if (root.StackFrame?.Method is not { Name: "Send" } m || m.Type?.Name == SyncContextType || !DerivesFrom(m.Type, SyncContextType)) continue;
+            if (!IsSendOverride(root.StackFrame?.Method)) continue;
             if (!root.Object.IsNull && DerivesFrom(root.Object.Type, SyncContextType))
                 return new ObjectRef(root.Object.Address, root.Object.Type?.Name ?? SyncContextType);
         }
-        return null;
+        // Optimized code doesn't keep the context alive in its Send frame, but the frame still names the context's
+        // type: the context sent to is of that type. Only when it is the one object of that type on the whole heap,
+        // and a thread has it installed, is it known which context that is; an uninstalled second one could be it.
+        if (!frames.Any(f => f.MethodName == "Send" && f.TypeName != SyncContextType) || SendFrameType(thread) is not { } sendType) return null;
+        return OnlyContextOfType(sendType) is { } only && _contextsInUse.TryGetValue(only, out var installed) ? installed : null;
+    }
+
+    /// The one SynchronizationContext on the heap whose type is or derives from <paramref name="typeName"/>; null
+    /// when there are none or several, or the heap couldn't be walked to the end.
+    private ulong? OnlyContextOfType(string typeName)
+    {
+        var lookups = HeapLookups;
+        if (!lookups.Complete) return null;
+        var matching = lookups.SyncContexts.Where(c => DerivesFrom(c.Type, typeName)).Take(2).ToList();
+        return matching.Count == 1 ? matching[0].Address : null;
     }
 
     private const string SyncContextType = "System.Threading.SynchronizationContext";
 
-    private static int? FindJoinTarget(List<ClrStackRoot> roots, int self)
+    private static bool IsSendOverride(ClrMethod? m) =>
+        m is { Name: "Send" } && m.Type?.Name != SyncContextType && DerivesFrom(m.Type, SyncContextType);
+
+    /// The type that declares the SynchronizationContext.Send override on the thread's stack, or null.
+    private static string? SendFrameType(ClrThread thread)
     {
+        try
+        {
+            foreach (var frame in thread.EnumerateStackTrace(includeContext: false, MaxFramesPerThread))
+                if (frame.Kind == ClrStackFrameKind.ManagedMethod && IsSendOverride(frame.Method)) return frame.Method!.Type!.Name;
+        }
+        catch
+        {
+            // No Send frame to go by: the target stays unknown.
+        }
+        return null;
+    }
+
+    private static int? FindJoinTarget(ClrThread thread, List<ClrStackRoot> roots)
+    {
+        var self = thread.ManagedThreadId;
         foreach (var root in roots)
         {
             if (root.Object.Type?.Name != "System.Threading.Thread") continue;
-            if (root.StackFrame?.Method is not { Type.Name: "System.Threading.Thread" } m || !(m.Name ?? "").StartsWith("Join", StringComparison.Ordinal)) continue;
+            if (root.StackFrame?.Method is not { } m || FrameClassifier.FrameworkWait(m.Type?.Name ?? "", m.Name ?? "") != BlockingKind.Join) continue;
             if (root.Object.TryReadField<int>("_managedThreadId", out var id) && id != self && id != 0) return id;
         }
-        return null;
+        // Thread.Join inlined into the caller: the thread joined is the one other Thread object the caller's frame holds.
+        var joined = WaitCallerObjects(thread, roots, BlockingKind.Join)
+            .Where(o => o.Type?.Name == "System.Threading.Thread")
+            .Select(o => o.TryReadField<int>("_managedThreadId", out var id) ? id : 0)
+            .Where(id => id != self && id != 0)
+            .Distinct()
+            .ToList();
+        return joined.Count == 1 ? joined[0] : null;
+    }
+
+    /// The objects rooted in a framework wait's own frames and in the managed frame that called it. Optimized code
+    /// inlines the wait's public method (Thread.Join, Monitor.Wait, Process.WaitForExit) into its caller and leaves
+    /// a P/Invoke stub or an internal method, so the object the wait was called on is kept alive by the caller only.
+    private static List<ClrObject> WaitCallerObjects(ClrThread thread, List<ClrStackRoot> roots, BlockingKind wait) =>
+        WaitCallerObjects(thread, roots, m => FrameClassifier.FrameworkWait(m.Type?.Name ?? "", m.Name ?? "") == wait);
+
+    private static List<ClrObject> WaitCallerObjects(ClrThread thread, List<ClrStackRoot> roots, Func<ClrMethod, bool> isWaitFrame)
+    {
+        var frames = new HashSet<ulong>();
+        try
+        {
+            var inWait = false;
+            foreach (var frame in thread.EnumerateStackTrace(includeContext: false, MaxFramesPerThread))
+            {
+                if (frame.Method is { } m && isWaitFrame(m))
+                {
+                    inWait = true;
+                    frames.Add(frame.StackPointer);
+                }
+                else if (inWait && frame.Method is { } stub && FrameClassifier.IsMarshallingStub(stub.Type?.Name ?? "", stub.Name ?? ""))
+                {
+                    frames.Add(frame.StackPointer);
+                }
+                else if (inWait && frame.Kind == ClrStackFrameKind.ManagedMethod)
+                {
+                    frames.Add(frame.StackPointer);
+                    break;
+                }
+            }
+        }
+        catch
+        {
+            return [];
+        }
+        return roots.Where(r => !r.Object.IsNull && r.StackFrame is { } f && frames.Contains(f.StackPointer))
+            .Select(r => r.Object)
+            .DistinctBy(o => o.Address)
+            .ToList();
     }
 
     // ---------------------------------------------------------------- ReaderWriterLockSlim and SemaphoreSlim
@@ -148,9 +228,10 @@ public sealed partial class SnapshotBuilder
     private PulseWait? FindPulseWait(ClrThread thread, List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
     {
         var prefix = FrameClassifier.FrameworkPrefix(frames);
-        if (prefix.Any(f => f.TypeName != "System.Threading.Monitor")) return null;
+        if (prefix.Any(f => f.TypeName != "System.Threading.Monitor" && !FrameClassifier.IsMarshallingStub(f.TypeName, f.MethodName))) return null;
 
-        var target = roots.FirstOrDefault(r => r.StackFrame?.Method is { Name: "Wait" or "ObjWait", Type.Name: "System.Threading.Monitor" } && !r.Object.IsNull)?.Object;
+        var target = roots.FirstOrDefault(r => r.StackFrame?.Method is { } m && FrameClassifier.FrameworkWait(m.Type?.Name ?? "", m.Name ?? "") == BlockingKind.MonitorWait && !r.Object.IsNull)?.Object
+                     ?? InlinedWaitObject(thread, roots);
         if (target is not { } obj) return null;
 
         var pending = new List<string>();
@@ -185,9 +266,31 @@ public sealed partial class SnapshotBuilder
         return new PulseWait { Object = new ObjectRef(obj.Address, obj.Type?.Name ?? "System.Object"), PendingWork = pending, PossibleWork = possible };
     }
 
+    /// Monitor.Wait inlined into the caller: the object waited on is the one object in the caller's frame whose
+    /// monitor is in use (it has a sync block, as every object waited on has) and that this thread doesn't hold.
+    /// A lock that was contended once keeps its sync block too, so an object with waiters on it comes first.
+    private static ClrObject? InlinedWaitObject(ClrThread thread, List<ClrStackRoot> roots)
+    {
+        try
+        {
+            var candidates = WaitCallerObjects(thread, roots, BlockingKind.MonitorWait)
+                .Where(o => o.SyncBlock is { } sb && !(sb.IsMonitorHeld && sb.HoldingThreadAddress == thread.Address))
+                .ToList();
+            var waitedOn = candidates.Where(o => o.SyncBlock!.WaitingThreadCount > 0).ToList();
+            if (waitedOn.Count == 1) return waitedOn[0];
+            return candidates.Count == 1 ? candidates[0] : null;
+        }
+        catch
+        {
+            // The sync blocks can't be read: the object waited on stays unknown.
+            return null;
+        }
+    }
+
     private WaitCondition? _waitCondition;
 
-    /// The app method that called Monitor.Wait, and where in it the call returns to.
+    /// The app method that called Monitor.Wait, and where in it the call returns to. Optimized code leaves only
+    /// Monitor's P/Invoke stub, a runtime frame (and at times the marshalling stub), above the app's method.
     private static (ClrMethod Method, ulong ReturnAddress)? WaitingFrame(ClrThread thread)
     {
         try
@@ -195,9 +298,9 @@ public sealed partial class SnapshotBuilder
             var inWait = false;
             foreach (var frame in thread.EnumerateStackTrace(includeContext: false, MaxFramesPerThread))
             {
-                if (frame.Kind != ClrStackFrameKind.ManagedMethod || frame.Method is not { } method) continue;
+                if (frame.Method is not { } method) continue;
                 if (method.Type?.Name == "System.Threading.Monitor") inWait = true;
-                else if (inWait) return frame.InstructionPointer == 0 ? null : (method, frame.InstructionPointer);
+                else if (inWait && frame.Kind == ClrStackFrameKind.ManagedMethod && !FrameClassifier.IsMarshallingStub(method.Type?.Name ?? "", method.Name ?? "")) return frame.InstructionPointer == 0 ? null : (method, frame.InstructionPointer);
             }
         }
         catch

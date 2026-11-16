@@ -86,6 +86,11 @@ public static partial class Names
         return type.Length == 0 ? method : $"{type}.{method}";
     }
 
+    /// The method a generated P/Invoke stub ("<Join>g____PInvoke|56_0") belongs to ("Join"), or null when the name
+    /// isn't one. The number after the bar differs between builds and operating systems.
+    public static string? PInvokeStubOf(string method) =>
+        LocalFunctionRegex().Match(method) is { Success: true } local && local.Groups["name"].Value == "__PInvoke" ? local.Groups["outer"].Value : null;
+
     [GeneratedRegex(@"^(?<owner>.+)\+<(?<method>[^>]+)>d__\d+(`\d+)?(<.*>)?$")]
     private static partial Regex StateMachineRegex();
 
