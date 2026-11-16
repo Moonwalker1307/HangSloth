@@ -23,6 +23,11 @@ public sealed record Finding
     /// The threads this finding is about, most important first.
     public IReadOnlyList<int> ThreadIds { get; init; } = [];
 
+    /// The threads this finding explains, when that is fewer than the ones it is about: later detectors still look at
+    /// the others. A lock contention names the owner, but when the owner is blocked on a task, the finding about that
+    /// task says what it waits for. Null: every thread in ThreadIds.
+    internal IReadOnlyList<int>? ExplainedThreadIds { get; init; }
+
     /// The line of the app's code to look at first.
     public SourceLocation? Location { get; init; }
 }

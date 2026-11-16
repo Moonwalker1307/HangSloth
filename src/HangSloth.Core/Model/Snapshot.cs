@@ -178,6 +178,10 @@ public sealed record TaskInfo
     /// For HttpConnectionPool's async methods: the pool the request is waiting in.
     public HttpPoolInfo? HttpPool { get; init; }
 
+    /// The first task of a Task.WhenAny or Task.WaitAny that was followed because every one of its tasks waits for a
+    /// TaskCompletionSource nobody completes: how many tasks it has. This task stands for all of them.
+    public int? FirstOf { get; init; }
+
     /// An app async method that keeps an HttpResponseMessage in a local: the response (and its connection,
     /// until the body is read or the response disposed) stays in use while the method waits.
     public bool HoldsHttpResponse { get; init; }

@@ -82,6 +82,10 @@ public sealed class SemaphoreDeadlockDetector : IDetector
                     .Select(h => $"{x.Thread.Label} took {semaphores[h.Address].DisplayName} earlier in {h.Method}{(h.Location is null ? "" : $" ({h.Location})")} and doesn't release it before this wait.")))
             .ToList();
         var names = taken.Select(x => x.Semaphore.DisplayName).ToList();
+        // Different semaphores that the dump can't tell apart: "a SemaphoreSlim and a SemaphoreSlim" would read as one.
+        var alike = names.Count > 1 && names.Distinct().Count() == 1;
+        var listed = alike ? $"{names.Count} different semaphores, each {names[0]}" : Describe.JoinAnd(names);
+        var these = alike ? "these semaphores" : Describe.JoinAnd(names);
         var site = FrameClassifier.BestUserFrame(threads[waiters[0]].Frames);
         var who = Describe.JoinAnd(waiters.Select(id => threads[id].Label));
         var start = site?.Source is null ? "" : $" Start at {site.Source}.";
@@ -102,7 +106,7 @@ public sealed class SemaphoreDeadlockDetector : IDetector
                 Id = "semaphore-deadlock",
                 Severity = Severity.Warning,
                 Title = "Possible deadlock: SemaphoreSlim locks taken in opposite order",
-                Summary = $"{who} are each waiting for a SemaphoreSlim(1, 1) that is already taken ({Describe.JoinAnd(names)}). If each of them holds the one another is waiting for, " +
+                Summary = $"{who} are each waiting for a SemaphoreSlim(1, 1) that is already taken ({listed}). If each of them holds the one another is waiting for, " +
                           $"they are deadlocked, but the dump can't confirm it: a SemaphoreSlim doesn't record who holds it, and {why}." + start,
                 Details = details,
                 Advice = "Check at the lines above whether the code holds one of these semaphores while it waits for another; if it does, take them in one consistent order everywhere, " +
@@ -121,10 +125,10 @@ public sealed class SemaphoreDeadlockDetector : IDetector
             Severity = anyoneElseRunning ? Severity.Warning : Severity.Critical,
             Title = "Deadlock: SemaphoreSlim locks taken in opposite order",
             Summary = $"{who} are each waiting for a SemaphoreSlim(1, 1) that is already taken " +
-                      $"({Describe.JoinAnd(names)}). A semaphore has no owner, so nothing reports this, but each of them most likely holds the one another is waiting for." +
+                      $"({listed}). A semaphore has no owner, so nothing reports this, but each of them most likely holds the one another is waiting for." +
                       start,
             Details = details,
-            Advice = $"Take {Describe.JoinAnd(names)} in one consistent order everywhere, or replace them with a single semaphore. " +
+            Advice = $"Take {these} in one consistent order everywhere, or replace them with a single semaphore. " +
                      "Unlike lock, SemaphoreSlim isn't tied to a thread, so neither the runtime nor a debugger will point at the holder.",
             ThreadIds = waiters,
             Location = site?.Source,
@@ -222,7 +226,7 @@ public sealed class SemaphoreWaitDetector : IDetector
                 Id = "semaphore-wait",
                 Severity = (asLock || notFollowed || once) && !running ? Severity.Warning : Severity.Info,
                 Title = SemaphoreFacts.NoFreeSlots,
-                Summary = $"{who} waiting in {Describe.Where(site)} for {s.DisplayName}, a SemaphoreSlim with {SemaphoreFacts.Slots(s)}." +
+                Summary = $"{who} waiting in {Describe.Where(site)} for {(s.FieldName is null ? "a SemaphoreSlim" : $"{s.DisplayName}, a SemaphoreSlim")} with {SemaphoreFacts.Slots(s)}." +
                           (running ? "" : " No other thread is running app code that could release it."),
                 Details = asLock ? [SemaphoreFacts.NoOwner(s)]
                     : notFollowed ? [SemaphoreFacts.NoOwner(s), SemaphoreFacts.NotFollowed(s.DisplayName)]

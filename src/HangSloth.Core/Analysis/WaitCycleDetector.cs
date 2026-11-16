@@ -250,11 +250,23 @@ public sealed class WaitCycleDetector : IDetector
         };
     }
 
-    /// The code that called Send, rather than the Send override itself.
+    /// The code that called Send, rather than the Send override itself. Null when the stack shows no other frame of the
+    /// app's (optimized code may have none left).
     private static StackFrameInfo? SendCaller(ThreadSnapshot t, WaitEdge edge)
     {
         var i = t.Frames.ToList().FindIndex(f => f.MethodName == "Send" && f.TypeName == edge.TypeName);
-        return i < 0 ? FrameClassifier.BestUserFrame(t.Frames) : FrameClassifier.BestUserFrame(t.Frames.Skip(i + 1).ToList()) ?? FrameClassifier.BestUserFrame(t.Frames);
+        var caller = i < 0 ? FrameClassifier.BestUserFrame(t.Frames) : FrameClassifier.BestUserFrame(t.Frames.Skip(i + 1).ToList()) ?? FrameClassifier.BestUserFrame(t.Frames);
+        return caller is not null && caller.MethodName == "Send" && caller.TypeName == edge.TypeName ? null : caller;
+    }
+
+    /// "UiDispatcherContext.Send, called from ExportWindow.Export (UiInvoke.cs:30)", or "UiDispatcherContext.Send (UiInvoke.cs:17)"
+    /// when the Send override is the only frame of the app's.
+    private static string SendCall(ThreadSnapshot t, WaitEdge edge)
+    {
+        var send = $"{Names.ShortType(edge.TypeName!)}.Send";
+        if (SendCaller(t, edge) is { } caller) return $"{send}, called from {Describe.Where(caller)}";
+        var own = t.Frames.FirstOrDefault(f => f.MethodName == "Send" && f.TypeName == edge.TypeName);
+        return own?.Source is { } at ? $"{send} ({at})" : send;
     }
 
     /// "CatalogService._catalog (Lazy<Catalog>)" -> "CatalogService._catalog".
@@ -282,7 +294,7 @@ public sealed class WaitCycleDetector : IDetector
             WaitKind.Join => $"{t.Label} {holds}is waiting in {where} for {other} to finish (Thread.Join).",
             WaitKind.Callback => $"{t.Label} {holds}is disposing a CancellationTokenRegistration in {where}, which waits for its callback to finish running on {other}.",
             WaitKind.Finalizer => $"{t.Label} {holds}is waiting in {where} for {other} to finish running finalizers (GC.WaitForPendingFinalizers).",
-            WaitKind.Send => $"{t.Label} {holds}is blocked in {Names.ShortType(edge.TypeName!)}.Send, called from {Describe.Where(SendCaller(t, edge))}, waiting for {other} to run the callback, since that SynchronizationContext belongs to {other}.",
+            WaitKind.Send => $"{t.Label} {holds}is blocked in {SendCall(t, edge)}, waiting for {other} to run the callback, since that SynchronizationContext belongs to {other}.",
             _ => $"{t.Label} {holds}needs {(edge.TypeName is { } type ? Names.ShortType(type) : "a type")} in {where}, so it waits for its static constructor, which {other} is running.",
         };
     }

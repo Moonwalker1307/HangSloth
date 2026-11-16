@@ -888,7 +888,7 @@ public sealed partial class SnapshotBuilder
                     if (!field.IsObjectReference) continue;
                     var value = obj.ReadObjectField(field);
                     if (value.IsNull || !search.Contains(value.Address) || names.ContainsKey(value.Address)) continue;
-                    names[value.Address] = new NamedObject($"{Names.ShortType(obj.Type.Name ?? "")}.{CleanFieldName(field.Name)}", obj.Address);
+                    names[value.Address] = new NamedObject(Names.Field(obj.Type.Name ?? "", field.Name), obj.Address);
                     containers[obj.Address] = obj;
                 }
             }
@@ -906,20 +906,54 @@ public sealed partial class SnapshotBuilder
                 : new NamedObject(lazyType, null);
         }
 
+        // Two ledgers that lock themselves (lock (this)) have no field to tell them apart; their own ids do.
+        try
+        {
+            var unnamed = targets.Where(t => !names.ContainsKey(t)).Select(_heap.GetObject).Where(o => o.IsValid && o.Type?.Name is not null);
+            foreach (var sameType in unnamed.GroupBy(o => o.Type!.Name!).Where(g => g.Count() > 1))
+                foreach (var obj in sameType)
+                    if (Identity(obj) is { } id) names[obj.Address] = new NamedObject($"{Names.ShortType(sameType.Key)} ({id})", null);
+        }
+        catch
+        {
+            // Names are a nicety.
+        }
+
         // Two Account.Sync locks in one finding read as one lock; say which account each belongs to.
         foreach (var group in names.Where(kv => targets.Contains(kv.Key)).GroupBy(kv => kv.Value.Name).Where(g => g.Count() > 1).ToList())
         {
             foreach (var (address, named) in group)
             {
-                if (named.Container is not { } c || !containers.TryGetValue(c, out var owner) || Identity(owner) is not { } id) continue;
+                if (named.Container is not { } c || !containers.TryGetValue(c, out var owner)) continue;
+                // An owner without an id is told apart by the field that holds it: "SharedGate.slot (in Billing.ledger)".
+                if ((Identity(owner) ?? HeldIn(owner, rootObjects)) is not { } id) continue;
                 names[address] = named with { Name = $"{named.Name} ({id})" };
             }
         }
         return names;
     }
 
-    private static string CleanFieldName(string? name) =>
-        name is not null && name.StartsWith('<') && name.EndsWith(">k__BackingField", StringComparison.Ordinal) ? name[1..name.IndexOf('>')] : name ?? "?";
+    /// "in Billing.ledger": the field of an object on an involved thread's stack that holds <paramref name="owner"/>.
+    private string? HeldIn(ClrObject owner, List<ClrObject> rootObjects)
+    {
+        try
+        {
+            foreach (var obj in rootObjects.Concat(_asyncThisObjects))
+            {
+                if (obj.Type is null || obj.Address == owner.Address || FrameClassifier.IsFrameworkType(obj.Type.Name ?? "")) continue;
+                foreach (var field in obj.Type.Fields)
+                    if (field.IsObjectReference && obj.ReadObjectField(field) is { IsNull: false } value && value.Address == owner.Address)
+                        return $"in {Names.Field(obj.Type.Name ?? "", field.Name)}";
+            }
+        }
+        catch
+        {
+            // Names are a nicety.
+        }
+        return null;
+    }
+
+    private static string CleanFieldName(string? name) => Names.FieldName(name);
 
     /// A short "Id = "alice"" for an object, from a field or auto-property that looks like its identity.
     private static string? Identity(ClrObject obj)

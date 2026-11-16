@@ -106,8 +106,12 @@ public sealed partial class SnapshotBuilder
         _unrecognised.Clear();
     }
 
+    /// SqlClient's pool is read only for a thread that waits for a connection, which is reported either way: what is
+    /// missing then is the proof that the pool is full.
     internal static string UnrecognisedWarning(string driver, IEnumerable<string> parts) =>
-        $"{driver}: {string.Join(" and ", parts)} not recognised, so pool exhaustion cannot be detected.";
+        driver.StartsWith("Microsoft.Data.SqlClient", StringComparison.Ordinal)
+            ? $"{driver}: {string.Join(" and ", parts)} not recognised, so the pool's size and use are unknown: threads waiting for a connection are still reported, but not whether the pool is full."
+            : $"{driver}: {string.Join(" and ", parts)} not recognised, so pool exhaustion cannot be detected.";
 
     /// "Npgsql 6.0.13", from the assembly's metadata in the dump: its informational version (without the
     /// commit hash), which is the package version, else its assembly version.

@@ -109,6 +109,36 @@ internal static class Describe
 
     public static string Plural(int n, string singular, string? plural = null) => n == 1 ? $"1 {singular}" : $"{n} {plural ?? singular + "s"}";
 
+    /// How many threads a sentence names before it says how many more there are.
+    public const int MaxListed = 5;
+
+    /// A list is cut only when that leaves out at least two: "and 1 more" would be longer than the one label.
+    private static bool Fits(int count) => count <= MaxListed + 1;
+
+    /// "Thread 4, Thread 5 and Thread 6", and for a long list the first few: "Thread 4, ..., Thread 8 and 25 more".
+    public static string Labels(IEnumerable<ThreadSnapshot> threads)
+    {
+        var list = threads.ToList();
+        return Fits(list.Count)
+            ? JoinAnd(list.Select(t => t.Label))
+            : string.Join(", ", list.Take(MaxListed).Select(t => t.Label)) + $" and {list.Count - MaxListed} more";
+    }
+
+    /// Threads in the same wait, as the subject of a sentence: the label of one thread, or
+    /// "30 "import-worker" threads (Thread 5, ..., Thread 9 and 25 more)".
+    public static string Many(IReadOnlyList<ThreadSnapshot> threads)
+    {
+        if (threads.Count == 1) return threads[0].Label;
+        var name = threads[0].Name;
+        if (name is { Length: > 0 } && threads.All(t => t.Name == name))
+        {
+            var ids = threads.Select(t => $"Thread {t.ManagedId}").ToList();
+            var list = Fits(ids.Count) ? JoinAnd(ids) : string.Join(", ", ids.Take(MaxListed)) + $" and {ids.Count - MaxListed} more";
+            return $"{threads.Count} \"{name}\" threads ({list})";
+        }
+        return $"{threads.Count} threads ({Labels(threads)})";
+    }
+
     public static string JoinAnd(IEnumerable<string> items)
     {
         var list = items.ToList();
@@ -153,7 +183,11 @@ internal static class Describe
         TaskKind.Continuation => "which runs after",
         TaskKind.Wrapper => "which waits for",
         _ => "which awaits",
-    };
+    } + (from.Awaiting is { } next ? FirstOf(next) : "");
+
+    /// " the first of its 3 tasks:" before the task that stands for a Task.WhenAny or Task.WaitAny, so that the
+    /// sentence doesn't read as if it waited for that one task only.
+    public static string FirstOf(TaskInfo task) => task.FirstOf is { } n ? $" the first of its {n} tasks:" : "";
 
     /// A chain as a sentence should tell it: without the links that only repeat their neighbour.
     public static List<TaskInfo> ReadableChain(TaskInfo task)

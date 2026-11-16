@@ -95,7 +95,7 @@ public sealed partial class SnapshotBuilder
             // Each task is a path of its own: two of them may well wait for the same thing.
             var described = DescribeTask(t, depth + 1, new HashSet<ulong>(visited));
             if (Describe.Chain(described).Last().Kind != TaskKind.Promise) return info;
-            first ??= described;
+            first ??= described with { FirstOf = count };
         }
         // The first task stands for all of them; for Task.WaitAny, it is what the thread waits for.
         return waitAny ? first! : info with { Kind = TaskKind.Wrapper, Awaiting = first };

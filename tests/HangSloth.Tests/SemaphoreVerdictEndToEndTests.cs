@@ -109,8 +109,12 @@ public class SemaphoreVerdictEndToEndTests
         var f = Assert.Single(report.Findings, f => f.Id == "semaphore-deadlock");
         Assert.Equal(Severity.Critical, f.Severity);
         Assert.Equal("Deadlock: SemaphoreSlim locks taken in opposite order", f.Title);
-        foreach (var name in new[] { "move north->south", "move south->north" })
-            Assert.Contains($"{Label(report, name)} took Warehouse.Lock earlier in Warehouse.MoveTo (StockTransfer.cs:15) and doesn't release it before this wait.", f.Details);
+        // Both semaphores are Warehouse.Lock: each warehouse's name tells them apart.
+        foreach (var (name, own, other) in new[] { ("move north->south", "north", "south"), ("move south->north", "south", "north") })
+        {
+            Assert.Contains($"{Label(report, name)} took Warehouse.Lock (Name = \"{own}\") earlier in Warehouse.MoveTo (StockTransfer.cs:15) and doesn't release it before this wait.", f.Details);
+            Assert.Contains($"{Label(report, name)} is waiting in Warehouse.MoveTo (StockTransfer.cs:19) for Warehouse.Lock (Name = \"{other}\") (0 of 1 free).", f.Details);
+        }
         Assert.DoesNotContain(report.Findings, x => x.Id == "semaphore-wait");
     }
 

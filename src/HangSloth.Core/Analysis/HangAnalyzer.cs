@@ -56,8 +56,11 @@ public sealed class HangAnalyzer
                 continue;
             }
             findings.AddRange(found);
-            foreach (var f in found.Where(f => f.Severity >= Severity.Warning))
-                claimed.UnionWith(f.ThreadIds);
+            // A thread is explained once: an Info finding claims the threads it explains too, so that a thread waiting for
+            // an HTTP response isn't also a second "blocked on a task" finding. A thread a finding only mentions stays open
+            // for the finding that explains it.
+            foreach (var f in found)
+                claimed.UnionWith(f.ExplainedThreadIds ?? f.ThreadIds);
         }
         if (warnings.Count > 0) snapshot = snapshot with { Warnings = [.. snapshot.Warnings, .. warnings] };
         return new AnalysisReport(snapshot, findings.OrderByDescending(f => f.Severity).ToList()) { FailedDetectors = failed };
