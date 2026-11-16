@@ -18,7 +18,7 @@ public class DeadlockLabTests
         "transfer", "dining-philosophers", "event-callback", "library-sync-over-async", "semaphore-order", "async-semaphore-reentry",
         "rwlock-vs-lock", "rwlock-upgrade-slow-reader", "rwlock-readers-block-writer", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose",
         "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse", "idle-monitor-consumer",
-        "http-connection-limit", "http-no-response", "http-connect-stall", "http-busy-connections", "db-connect-stall", "sqlclient-connect-stall", "timer-overlap", "cancellation-dispose", "finalizer-wait", "child-process-pipe", "healthy",
+        "http-connection-limit", "http-no-response", "http-connect-stall", "http-busy-connections", "db-connect-stall", "sqlclient-connect-stall", "timer-overlap", "cancellation-dispose", "finalizer-wait", "child-process-pipe", "test-blocks-on-async", "healthy",
     ];
 
     public static TheoryData<string> DatabaseScenarios =>

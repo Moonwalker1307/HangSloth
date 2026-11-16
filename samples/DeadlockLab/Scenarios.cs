@@ -155,6 +155,10 @@ public static class Scenarios
             "The app redirects a child process's output and waits for it to exit before reading it. The child fills the pipe and waits for the parent to read.",
             ["process-pipe-deadlock"], ChildProcessScenario.Run),
 
+        new("test-blocks-on-async", Area.Code, Difficulty.Obvious,
+            "Control: two tests block on a slow async call with .Result under xunit's AsyncTestSyncContext, one with ConfigureAwait(false) and one without. The context runs continuations on the thread pool, not on the blocked test thread, so the tests are slow, not deadlocked.",
+            [], TestRunScenario.Run, MustNotReport: ["sync-over-async-deadlock", "sync-over-async-risk"]),
+
         new("healthy", Area.Code, Difficulty.Obvious,
             "Control: background workers ticking along with short locks and a timer, and idle queue consumers waiting for work. Nothing is wrong.",
             [], HealthyScenario.Run),

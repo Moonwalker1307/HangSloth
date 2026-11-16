@@ -14,9 +14,11 @@ public sealed class SyncOverAsyncDetector : IDetector
                 continue;
 
             var chain = Describe.Chain(waited).ToList();
+            var elsewhere = RunsContinuationsElsewhere(ctx);
             // Every method in the chain that captured the context needs it to finish; the one already sitting
-            // in the context's queue is where it is literally stuck.
-            var capturing = chain.Where(t => t.Resume?.SynchronizationContext.Address == ctx.Address).ToList();
+            // in the context's queue is where it is literally stuck. A context that runs continuations on other
+            // threads is stuck only when one is already in its queue and none of its threads gets to it.
+            var capturing = chain.Where(t => t.Resume?.SynchronizationContext.Address == ctx.Address && (!elsewhere || t.Resume!.Status == ResumeStatus.Queued)).ToList();
             var stuck = capturing.LastOrDefault(t => t.Resume!.Status == ResumeStatus.Queued) ?? capturing.FirstOrDefault();
             var call = FrameClassifier.DescribeTaskWait(thread.Frames);
             var site = FrameClassifier.BestUserFrame(thread.Frames);
@@ -25,7 +27,7 @@ public sealed class SyncOverAsyncDetector : IDetector
             {
                 yield return Confirmed(thread, ctx, waited, stuck, capturing, call, site);
             }
-            else if (waited.State == TaskState.Pending && waited.Kind == TaskKind.AsyncMethod && ctx.TypeName != "System.Threading.SynchronizationContext")
+            else if (!elsewhere && waited.State == TaskState.Pending && waited.Kind == TaskKind.AsyncMethod && ctx.TypeName != "System.Threading.SynchronizationContext")
             {
                 yield return new Finding
                 {
@@ -42,6 +44,15 @@ public sealed class SyncOverAsyncDetector : IDetector
             }
         }
     }
+
+    /// Test runners' contexts that don't own a thread: xunit's AsyncTestSyncContext (v2 and v3) only counts a test's
+    /// async work and posts each continuation on to the thread pool or to the context it wraps, and
+    /// MaxConcurrencySyncContext runs continuations on a pool of threads of its own. A test blocking on async code
+    /// under them is waiting, not deadlocked, unlike under a UI context or one that pumps a single thread.
+    private static readonly string[] ContextsThatPostElsewhere = ["AsyncTestSyncContext", "MaxConcurrencySyncContext"];
+
+    internal static bool RunsContinuationsElsewhere(ObjectRef ctx) =>
+        ContextsThatPostElsewhere.Any(name => ctx.TypeName == name || ctx.TypeName.EndsWith("." + name, StringComparison.Ordinal));
 
     private static Finding Confirmed(ThreadSnapshot thread, ObjectRef ctx, TaskInfo waited, TaskInfo stuck, List<TaskInfo> capturing, string call, StackFrameInfo? site)
     {

@@ -125,6 +125,8 @@ public enum TaskKind
     Continuation,      // ContinueWith
     SemaphoreWait,     // SemaphoreSlim.WaitAsync
     Wrapper,           // waits for the task in Awaiting: Task.Run(async ...), Unwrap(), WaitAsync, or a WhenAny stuck on all of its tasks
+    NotStarted,        // new Task(...) that nothing has called Start() on
+    Queued,            // Task.Run / StartNew that is started but still waits in its scheduler's queue for a thread
 }
 
 public sealed record TaskInfo

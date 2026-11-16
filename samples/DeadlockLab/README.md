@@ -1,6 +1,6 @@
 # DeadlockLab
 
-A small, deliberately broken "shop" app with 50 ways to hang: textbook lock-ordering deadlocks, the
+A small, deliberately broken "shop" app with 51 ways to hang: textbook lock-ordering deadlocks, the
 hidden kind that hide in callbacks, libraries, initializers, semaphores, queues, UI dispatching, HTTP
 clients, finalizers and child processes, and deadlocks that involve a real database: PostgreSQL (with and
 without EF Core, including large selects that hold locks) and SQL Server. It's HangSloth's test bed: every scenario declares which finding HangSloth
@@ -64,6 +64,7 @@ Linux containers), and skip those scenarios otherwise.
 | `cancellation-dispose` | hidden | `CancellationTokenRegistration.Dispose` under a lock waits for the running callback, which waits for that lock. | `wait-cycle` (lock + cancellation callback) |
 | `finalizer-wait` | hidden | `GC.WaitForPendingFinalizers` under a lock that a finalizer takes. | `wait-cycle` (lock + finalizer thread) |
 | `child-process-pipe` | hidden | `WaitForExit` on a child with redirected, unread output; the child fills the pipe and blocks. | `process-pipe-deadlock`, with the child's command line and pid |
+| `test-blocks-on-async` | control | Two tests block on a slow async call with `.Result` under xunit's `AsyncTestSyncContext`, one with `ConfigureAwait(false)` and one without; the context runs continuations on the thread pool. Slow, not deadlocked. | nothing at warning level, and no `sync-over-async-deadlock` or `sync-over-async-risk` |
 | `healthy` | control | Short locks, a timer and idle `BlockingCollection` consumers waiting for work, nothing wrong. | nothing |
 | `db-forgotten-transaction` | obvious | One thread updates a row and waits for an approval without committing; another updates the same row. | `database-wait` naming the idle transaction and the blocked SQL |
 | `db-deadlock-retry` | obvious | Two transactions update two rows in opposite order; PostgreSQL aborts one, the app retries the same way. | `database-wait` (possible database deadlock) |
@@ -100,4 +101,4 @@ When the lab was written, HangSloth explained 7 of the first 19 scenarios, and a
 of fixes, 4 of the 10 added in the second round, and 2 of the 8 in the third. SQL Server connections weren't read at all before the last 5 were added. Most misses were reported as plain
 lock contention ("held by Thread 1, which is blocked on .Wait()"), which is true but doesn't say
 it's a deadlock, or not at all (semaphores, static constructors, everything involving the database).
-It now explains all 50. The changes are described in the pull requests that added the scenarios.
+It now explains all 51. The changes are described in the pull requests that added the scenarios.
