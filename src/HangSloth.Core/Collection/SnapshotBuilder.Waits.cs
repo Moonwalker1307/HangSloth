@@ -30,6 +30,127 @@ public sealed partial class SnapshotBuilder
         return resumed;
     }
 
+    private ClrThreadStaticField? _currentTaskField;
+    private bool _currentTaskFieldLooked;
+
+    /// The task this thread is executing, from the runtime's own record: Task.ExecuteWithThreadLocal keeps it in the
+    /// thread-static Task.t_currentTask for as long as it runs, also when optimized code left it on no frame of the stack.
+    /// A task run inline inside another replaces that one for the time, so the outer one is then not found. Only a task
+    /// whose delegate has started and that hasn't finished: once it has, the thread runs its continuations, not it.
+    private ulong? FindCurrentTask(ClrThread thread)
+    {
+        if (!_currentTaskFieldLooked)
+        {
+            _currentTaskFieldLooked = true;
+            _currentTaskField = _runtime.BaseClassLibrary?.GetTypeByName("System.Threading.Tasks.Task")?.ThreadStaticFields.FirstOrDefault(f => f.Name == "t_currentTask");
+        }
+        if (_currentTaskField is not { } field) return null;
+        var task = field.ReadObject(thread);
+        if (task.IsNull || !IsTask(task.Type) || ReadTaskState(task) != TaskState.Pending) return null;
+        return task.ReadInt("m_stateFlags") is { } flags && (flags & TaskStateDelegateInvoked) != 0 ? task.Address : null;
+    }
+
+    /// Task's methods that start running a task: ExecuteFromThreadPool calls ExecuteEntryUnsafe, which calls
+    /// ExecuteWithThreadLocal. One unbroken run of them on a stack is one task being executed.
+    private static readonly HashSet<string> TaskEntryMethods = ["ExecuteWithThreadLocal", "ExecuteEntry", "ExecuteEntryUnsafe", "ExecuteFromThreadPool"];
+
+    private static bool IsTaskEntryFrame(StackFrameInfo f) =>
+        f.TypeName.StartsWith("System.Threading.Tasks.", StringComparison.Ordinal) && TaskEntryMethods.Contains(f.MethodName);
+
+    /// The frames between a task's entry and its delegate: InnerInvoke, the lambda Task hands to ExecutionContext
+    /// (Task+&lt;&gt;c), and ExecutionContext's Run methods.
+    private static bool IsDelegateCallFrame(StackFrameInfo f) =>
+        (f.TypeName.StartsWith("System.Threading.Tasks.", StringComparison.Ordinal) && f.MethodName == "InnerInvoke")
+        || (f.TypeName == "System.Threading.Tasks.Task+<>c" && f.MethodName.StartsWith("<.cctor>", StringComparison.Ordinal))
+        || (f.TypeName == "System.Threading.ExecutionContext" && f.MethodName is "RunInternal" or "RunFromThreadPoolDispatchLoop");
+
+    /// Where the delegate of the innermost task a stack runs goes back when the JIT inlined it: right above the frames
+    /// that call it. -1 when the stack runs no task, or when the app's code is above that task's frames (the delegate is there).
+    internal static int InlinedDelegateIndex(IReadOnlyList<StackFrameInfo> frames)
+    {
+        for (var i = 0; i < frames.Count; i++)
+        {
+            if (FrameClassifier.IsUserFrame(frames[i])) return -1;
+            if (!IsTaskEntryFrame(frames[i])) continue;
+            while (i > 0 && IsDelegateCallFrame(frames[i - 1])) i--;
+            return i;
+        }
+        return -1;
+    }
+
+    /// How many tasks a stack runs one inside another, as Task.RunSynchronously or a Wait that runs the task inline do.
+    internal static int TaskRuns(IReadOnlyList<StackFrameInfo> frames) =>
+        frames.Where((f, i) => IsTaskEntryFrame(f) && (i == 0 || !IsTaskEntryFrame(frames[i - 1]))).Count();
+
+    /// The task whose delegate runs above the innermost task's frames. The runtime's record (t_currentTask) is that task,
+    /// once a frame that runs tasks keeps it alive. Without the record, the task the frames keep alive is only certain on a
+    /// stack that runs one task: an inner task's frames also keep the outer one alive, to restore it when the inner one ends.
+    internal static ulong? DelegateTask(IReadOnlyList<StackFrameInfo> frames, ulong? current, bool currentKept, ulong? running) =>
+        current is not null ? (currentKept ? current : null) : TaskRuns(frames) == 1 ? running : null;
+
+    /// A delegate put back on a stack, with what its line is read from once the frames above it are complete.
+    private sealed record RestoredDelegate(StackFrameInfo Frame, ClrMethod Method, ClrModule Module);
+
+    /// Guarded devirtualization turns the call of the pool's most frequent work item into a direct call and inlines it,
+    /// down to the app's lambda, into ExecutionContext.RunFromThreadPoolDispatchLoop or Task.ExecuteWithThreadLocal; a task
+    /// run inline inside another can get its lambda inlined into ExecutionContext.RunInternal the same way. The thread then
+    /// shows no frame of the app where it runs the app's code, and looks like an idle pool thread or one waiting for the
+    /// task it runs itself. A delegate whose last act is a call can lose its frame to a jump in optimized code as well.
+    /// The task names the delegate: that is put back where it runs.
+    private IReadOnlyList<StackFrameInfo> WithInlinedDelegate(IReadOnlyList<StackFrameInfo> frames, List<ClrStackRoot> roots, ulong? currentTask, ulong? runningTask,
+        out RestoredDelegate? restored)
+    {
+        restored = null;
+        if (InlinedDelegateIndex(frames) is not (>= 0 and var at)
+            || DelegateTask(frames, currentTask, currentTask is { } current && IsKeptByTaskFrame(roots, current), runningTask) is not { } address) return frames;
+        var task = _heap.GetObject(address);
+        if (!task.IsValid || ReadTaskState(task) != TaskState.Pending || !task.TryReadObjectField("m_action", out var action) || action.IsNull || !action.IsDelegate) return frames;
+        if (action.AsDelegate().GetDelegateTarget()?.Method is not { Type: { Module: { IsDynamic: false } module } type } method
+            || FrameClassifier.IsFrameworkModule(module.Name) || FrameClassifier.IsFrameworkType(type.Name ?? "")) return frames;
+        var frame = new StackFrameInfo
+        {
+            TypeName = type.Name ?? "",
+            MethodName = method.Name ?? "?",
+            ModuleName = module.Name,
+            InlinedInto = frames[at].MethodName,
+        };
+        var note = $"{Names.ShortMethod(frame.TypeName, frame.MethodName)} is shown above {Names.ShortMethod(frames[at].TypeName, frames[at].MethodName)} although the stack walk doesn't find it: " +
+                   "the JIT left it no frame of its own there, and it is the delegate of the task the thread is running.";
+        if (_notes.Add(note)) _warnings.Add(note);
+        restored = new RestoredDelegate(frame, method, module);
+        return [.. frames.Take(at), frame, .. frames.Skip(at)];
+    }
+
+    private static bool IsKeptByTaskFrame(List<ClrStackRoot> roots, ulong task) =>
+        roots.Any(r => r.Object.Address == task && r.StackFrame?.Method is { } m
+                       && m.Type?.Name?.StartsWith("System.Threading.Tasks.Task", StringComparison.Ordinal) == true && TaskExecuteMethods.Contains(m.Name ?? ""));
+
+    /// The line of a delegate put back on the stack, read as ResolveCalls reads it for an app frame of the stack walk, once
+    /// the frames above it are complete (a ManualResetEventSlim.Wait put back above it is the call it makes): its one call
+    /// that leads to the frame above, or for a task wait its one blocking call. The line is left out when that isn't one.
+    private IReadOnlyList<StackFrameInfo> WithDelegateLine(IReadOnlyList<StackFrameInfo> frames, RestoredDelegate restored, List<ClrStackRoot> roots)
+    {
+        var at = -1;
+        for (var i = 0; i < frames.Count && at < 0; i++)
+            if (ReferenceEquals(frames[i], restored.Frame)) at = i;
+        if (at < 0 || DelegateCallee(frames, at) is not { } callee) return frames;
+        var (frame, method, module) = restored;
+        frame = FrameClassifier.Classify(frames) == BlockingKind.TaskWait
+            ? WithBlockingCall(frames, frame, method, module, ilOffset: null, mapped: false, callee, roots)
+            : FindCalls(frame, method, module, callee, innermost: true) is { HasSymbols: true } sites ? WithLines(frame, sites) : frame;
+        return [.. frames.Take(at), frame, .. frames.Skip(at + 1)];
+    }
+
+    /// The call a frame put back at <paramref name="at"/> makes: the frame above it, past the marshalling stub that the
+    /// runtime puts between a P/Invoke stub (Thread.&lt;Join&gt;g____PInvoke|56_0) and the code that the JIT inlined the
+    /// call to it into. The stub, as for a frame of the stack walk, is what the app's call leads to.
+    internal static StackFrameInfo? DelegateCallee(IReadOnlyList<StackFrameInfo> frames, int at)
+    {
+        var above = at - 1;
+        while (above >= 0 && FrameClassifier.IsMarshallingStub(frames[above].TypeName, frames[above].MethodName)) above--;
+        return above >= 0 && frames[above].TypeName.Length > 0 ? frames[above] : null;
+    }
+
     /// A SynchronizationContext.Send override on the stack, and the context it was called on. Send runs the
     /// callback on the context's thread and waits for it, like Control.Invoke and Dispatcher.Invoke.
     private ObjectRef? FindSendTarget(ClrThread thread, List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
@@ -230,9 +351,7 @@ public sealed partial class SnapshotBuilder
         var prefix = FrameClassifier.FrameworkPrefix(frames);
         if (prefix.Any(f => f.TypeName != "System.Threading.Monitor" && !FrameClassifier.IsMarshallingStub(f.TypeName, f.MethodName))) return null;
 
-        var target = roots.FirstOrDefault(r => r.StackFrame?.Method is { } m && FrameClassifier.FrameworkWait(m.Type?.Name ?? "", m.Name ?? "") == BlockingKind.MonitorWait && !r.Object.IsNull)?.Object
-                     ?? InlinedWaitObject(thread, roots);
-        if (target is not { } obj) return null;
+        if (MonitorWaitObject(thread, roots) is not { } obj) return null;
 
         var pending = new List<string>();
         var possible = new List<string>();
@@ -265,6 +384,59 @@ public sealed partial class SnapshotBuilder
         }
         return new PulseWait { Object = new ObjectRef(obj.Address, obj.Type?.Name ?? "System.Object"), PendingWork = pending, PossibleWork = possible };
     }
+
+    private const string EventSlimType = "System.Threading.ManualResetEventSlim";
+
+    /// ManualResetEventSlim.Wait waits in Monitor.Wait on a lock object of the event's own (m_lock). Once optimized code
+    /// inlined Wait into its caller, the caller looks as if it waited in Monitor.Wait on that object itself. Nothing but the
+    /// event's own Wait waits on its private lock: when the object waited on is the lock of an event that the caller keeps
+    /// alive (itself, or in a field of an object it keeps alive, as CountdownEvent and Barrier do), Wait is put back there.
+    private IReadOnlyList<StackFrameInfo> WithInlinedEventWait(ClrThread thread, List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
+    {
+        var below = MonitorWaitDepth(frames);
+        if (below == 0 || below == frames.Count || frames[below].TypeName == EventSlimType || FrameClassifier.Classify(frames) != BlockingKind.MonitorWait) return frames;
+        if (MonitorWaitObject(thread, roots) is not { } waited) return frames;
+        return WaitCallerObjects(thread, roots, BlockingKind.MonitorWait).Select(o => EventOfLock(o, waited)).FirstOrDefault(e => e is not null) is { } ev
+            ? WithEventWaitFrame(frames, below, ev)
+            : frames;
+    }
+
+    private IReadOnlyList<StackFrameInfo> WithEventWaitFrame(IReadOnlyList<StackFrameInfo> frames, int below, ClrObject ev)
+    {
+        var frame = new StackFrameInfo { TypeName = EventSlimType, MethodName = "Wait", ModuleName = ev.Type?.Module?.Name, InlinedInto = frames[below].MethodName };
+        var note = $"ManualResetEventSlim.Wait is shown above {Names.ShortMethod(frames[below].TypeName, frames[below].MethodName)} although the stack walk doesn't find it: " +
+                   "the JIT inlined it there, and the object waited on in Monitor.Wait is that event's own lock.";
+        if (_notes.Add(note)) _warnings.Add(note);
+        return [.. frames.Take(below), frame, .. frames.Skip(below)];
+    }
+
+    /// The ManualResetEventSlim whose own lock <paramref name="waited"/> is: <paramref name="kept"/> itself, or an event in one of its fields.
+    private static ClrObject? EventOfLock(ClrObject kept, ClrObject waited)
+    {
+        if (IsLockOf(kept, waited)) return kept;
+        foreach (var field in kept.Type?.Fields ?? [])
+        {
+            if (field.IsObjectReference && kept.ReadObjectField(field) is var value && IsLockOf(value, waited)) return value;
+        }
+        return null;
+    }
+
+    private static bool IsLockOf(ClrObject ev, ClrObject waited) =>
+        !ev.IsNull && DerivesFrom(ev.Type, EventSlimType) && ev.TryReadObjectField("m_lock", out var l) && !l.IsNull && l.Address == waited.Address;
+
+    /// How many frames at the top of the stack are Monitor.Wait itself: its method, its P/Invoke stub and the marshalling stub.
+    internal static int MonitorWaitDepth(IReadOnlyList<StackFrameInfo> frames)
+    {
+        var depth = 0;
+        while (depth < frames.Count && (FrameClassifier.FrameworkWait(frames[depth]) == BlockingKind.MonitorWait
+                                        || FrameClassifier.IsMarshallingStub(frames[depth].TypeName, frames[depth].MethodName))) depth++;
+        return depth;
+    }
+
+    /// The object passed to Monitor.Wait: kept alive by Monitor.Wait's own frame, or found in its caller's.
+    private static ClrObject? MonitorWaitObject(ClrThread thread, List<ClrStackRoot> roots) =>
+        roots.FirstOrDefault(r => r.StackFrame?.Method is { } m && FrameClassifier.FrameworkWait(m.Type?.Name ?? "", m.Name ?? "") == BlockingKind.MonitorWait && !r.Object.IsNull)?.Object
+        ?? InlinedWaitObject(thread, roots);
 
     /// Monitor.Wait inlined into the caller: the object waited on is the one object in the caller's frame whose
     /// monitor is in use (it has a sync block, as every object waited on has) and that this thread doesn't hold.
