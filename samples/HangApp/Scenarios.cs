@@ -190,21 +190,38 @@ static class TieredStarvationScenario
         var check = new InvoiceCheck(directory);
         var ids = Enumerable.Range(1, 1).ToArray();
 
-        directory.Upstream = true;
-        for (var i = 0; i < 60; i++) _ = Task.Run(() => check.CheckAll(ids));
-        Thread.Sleep(300);
-
-        // Call it often enough, with time in between, for the JIT to recompile it at tier 1.
-        directory.Upstream = false;
-        for (var round = 0; round < 20; round++)
+        using (var jit = new OptimizedCodeListener())
         {
-            for (var i = 0; i < 2000; i++) check.CheckAll(ids);
-            Thread.Sleep(50);
+            directory.Upstream = true;
+            for (var i = 0; i < 60; i++) _ = Task.Run(() => check.CheckAll(ids));
+            Thread.Sleep(300);
+
+            // Keep calling it, with time in between, until the runtime says it has recompiled Validate at
+            // tier 1. How long that takes depends on the machine (about ten times longer on a single CPU than
+            // on four), so a fixed number of rounds isn't enough.
+            directory.Upstream = false;
+            var warmUp = System.Diagnostics.Stopwatch.StartNew();
+            while (!jit.ValidateIsOptimized)
+            {
+                if (warmUp.Elapsed > TimeSpan.FromSeconds(20))
+                {
+                    Console.Error.WriteLine("The runtime did not recompile InvoiceCheck.Validate with optimizations within 20 seconds, so this mode cannot show what it is meant to show.");
+                    Environment.Exit(3);
+                }
+                CallOften();
+            }
+            CallOften(); // The event is sent just before the new code is switched in.
         }
 
         directory.Upstream = true;
         for (var i = 0; i < 140; i++) _ = Task.Run(() => check.CheckAll(ids));
         Ready.SignalLater(1500);
         Thread.Sleep(Timeout.Infinite);
+
+        void CallOften()
+        {
+            for (var i = 0; i < 2000; i++) check.CheckAll(ids);
+            Thread.Sleep(50);
+        }
     }
 }
