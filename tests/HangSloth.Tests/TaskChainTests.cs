@@ -136,7 +136,7 @@ public class TaskChainTests
             TypeName = "System.Runtime.CompilerServices.AsyncTaskMethodBuilder<System.Boolean>+AsyncStateMachineBox<System.Threading.SemaphoreSlim+<WaitUntilCountOrTimeoutAsync>d__33>",
         };
         var print = AsyncMethod("LabelPrinter.PrintAsync", "Printer.cs", 24, plumbing) with { ThisAddress = printer };
-        var snapshot = Process(Thread(1, [.. WaitCall, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = print }) with
+        var snapshot = Process(Thread(1, [.. WaitCall, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = print, SemaphoreUse = new SemaphoreUse { ReleasesIt = true } }) with
         {
             Semaphores = [new SemaphoreInfo { Object = new ObjectRef(0x100, "System.Threading.SemaphoreSlim"), FieldName = "LabelPrinter._device", ContainerAddress = printer, CurrentCount = 0, MaxCount = 1, AsyncWaiters = 1 }],
         };
@@ -145,7 +145,7 @@ public class TaskChainTests
 
         Assert.Equal("semaphore-wait", f.Id);
         Assert.Equal(Severity.Warning, f.Severity);
-        Assert.Equal("Waiting for a SemaphoreSlim nobody releases", f.Title);
+        Assert.Equal("Waiting for a SemaphoreSlim with no free slots", f.Title);
         Assert.Equal("Thread 1 is blocked in .Wait() at Program.cs:5, waiting for LabelPrinter.PrintAsync (paused at Printer.cs:24), " +
                      "which is waiting to enter LabelPrinter._device (SemaphoreSlim.WaitAsync(), 0 of 1 slots free).", f.Summary);
     }
@@ -163,7 +163,7 @@ public class TaskChainTests
             Kind = TaskKind.Continuation, Description = "a ContinueWith(...) task", Awaiting = node,
         };
         var print = AsyncMethod("LabelPrinter.PrintAsync", "Printer.cs", 24, continuation) with { ThisAddress = printer };
-        var snapshot = Process(Thread(1, [.. WaitCall, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = print }) with
+        var snapshot = Process(Thread(1, [.. WaitCall, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = print, SemaphoreUse = new SemaphoreUse { ReleasesIt = true } }) with
         {
             Semaphores = [new SemaphoreInfo { Object = new ObjectRef(0x100, "System.Threading.SemaphoreSlim"), FieldName = "LabelPrinter._device", ContainerAddress = printer, CurrentCount = 0, MaxCount = 1, AsyncWaiters = 1 }],
         };
@@ -171,7 +171,7 @@ public class TaskChainTests
         var f = Assert.Single(new BlockedOnTaskDetector().Detect(snapshot, new HashSet<int>()));
 
         Assert.Equal(Severity.Warning, f.Severity);
-        Assert.Equal("Waiting for a SemaphoreSlim nobody releases", f.Title);
+        Assert.Equal("Waiting for a SemaphoreSlim with no free slots", f.Title);
         Assert.Equal("Thread 1 is blocked in .Wait() at Program.cs:5, waiting for LabelPrinter.PrintAsync (paused at Printer.cs:24), " +
                      "which is waiting to enter LabelPrinter._device (SemaphoreSlim.WaitAsync(), 0 of 1 slots free).", f.Summary);
     }

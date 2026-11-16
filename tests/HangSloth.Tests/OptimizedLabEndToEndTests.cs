@@ -21,11 +21,20 @@ public class OptimizedLabEndToEndTests
         ["ui-invoke"] = ["UiDispatcherContext.Send", "since that SynchronizationContext belongs to Thread"],
     };
 
+    /// The scenarios that optimized code reads differently, on purpose, with what they give there. A lock class's
+    /// Enter() is inlined into the code that takes two of its locks in opposite order, so the two waits "in Enter(),
+    /// which took nothing" of cold code are one possible deadlock here (SemaphoreOptimizedCodeEndToEndTests has the
+    /// sentences).
+    private static readonly Dictionary<string, string[]> ReadsDifferently = new()
+    {
+        ["semaphore-lock-class"] = ["semaphore-deadlock"],
+    };
+
     [Theory]
     [MemberData(nameof(DeadlockLabTests.CodeScenarios), MemberType = typeof(DeadlockLabTests))]
     public void Code_scenario_in_optimized_code(string scenario)
     {
-        var expected = Lab.Expected[scenario];
+        var expected = ReadsDifferently.GetValueOrDefault(scenario) ?? Lab.Expected[scenario];
         static List<string> Found(AnalysisReport r) => r.Findings.Where(f => f.Severity >= Severity.Warning).Select(f => f.Id).Distinct().ToList();
 
         var report = SampleApp.Analyze(scenario, project: "DeadlockLab", until: r => expected.All(Found(r).Contains), environment: Optimized);

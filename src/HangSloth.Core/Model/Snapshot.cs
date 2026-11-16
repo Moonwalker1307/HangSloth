@@ -50,6 +50,11 @@ public sealed record ThreadSnapshot
     /// Address of the SemaphoreSlim this thread is synchronously waiting on (SemaphoreSlim.Wait), if any.
     public ulong? WaitingForSemaphore { get; init; }
 
+    /// For a thread waiting on a SemaphoreSlim, directly or at the end of the task chain it is blocked on: what the
+    /// app's code that waits does with semaphores, read from its IL. Null when that couldn't be read, or when the wait in
+    /// progress isn't in it (the JIT inlined the helper that waits into the method the frame shows).
+    public SemaphoreUse? SemaphoreUse { get; init; }
+
     /// The object this thread is waiting on with a direct Monitor.Wait from app code, if any.
     public PulseWait? WaitingForPulse { get; init; }
 
@@ -292,7 +297,35 @@ public sealed record SemaphoreInfo
     public int MaxCount { get; init; }
     public IReadOnlyList<int> WaiterThreadIds { get; init; } = [];
     public int AsyncWaiters { get; init; }
+
+    /// The free slots it was created with, read from the `new SemaphoreSlim(...)` stored in its field. Null when
+    /// that wasn't found or isn't a constant. 0 means it was made as a signal: nothing passes until someone calls Release().
+    public int? InitialCount { get; init; }
+
+    /// True when it was made with `new SemaphoreSlim(n)` from a value that isn't a constant (a setting, a parameter,
+    /// Environment.ProcessorCount): a throttle sized when the app starts, so made with free slots, where a signal is made
+    /// with a constant 0. Null otherwise.
+    public bool? SizedAtRunTime { get; init; }
 }
+
+/// A SemaphoreSlim doesn't record who took its slots, but the code around a wait shows how it is used.
+public sealed record SemaphoreUse
+{
+    /// The code that waits also calls Release() on the same semaphore (the Wait, try, finally Release shape): there
+    /// the semaphore is used as a lock or throttle.
+    public bool ReleasesIt { get; init; }
+
+    /// The wait is inside a loop in the method that waits: it waits again after each pass, like a worker waiting for work.
+    public bool WaitsInLoop { get; init; }
+
+    /// Semaphores that code on this stack, or in this async chain, waited on before the point it is at and doesn't
+    /// release before it: as far as the code shows, they are held while this wait goes on.
+    public IReadOnlyList<HeldSemaphore> Holds { get; init; } = [];
+}
+
+/// <param name="Method">The method whose code took it, e.g. "ShippingService.PrintThenBook".</param>
+/// <param name="Location">The line of the Wait or WaitAsync that took it, when known.</param>
+public sealed record HeldSemaphore(ulong Address, string Method, SourceLocation? Location);
 
 public enum DatabaseWaitKind
 {

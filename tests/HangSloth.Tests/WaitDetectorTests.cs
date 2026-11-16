@@ -147,12 +147,15 @@ public class SemaphoreDetectorTests
     private static SemaphoreInfo Sem(ulong address, string name, params int[] waiters) =>
         new() { Object = new ObjectRef(address, "System.Threading.SemaphoreSlim"), FieldName = name, CurrentCount = 0, MaxCount = 1, WaiterThreadIds = waiters };
 
+    /// The waiting code took this semaphore earlier and hasn't released it: what SnapshotBuilder reads from the IL.
+    private static SemaphoreUse Holding(ulong semaphore) => new() { ReleasesIt = true, Holds = [new HeldSemaphore(semaphore, "M", null)] };
+
     [Fact]
     public void Two_taken_mutex_semaphores_with_crossed_waiters()
     {
         var snapshot = Process(
-            Thread(4, [.. SemaphoreWait, App("MyApp.Shipping", "PrintThenBook", "Shipping.cs", 17)]) with { WaitingForSemaphore = 0x200 },
-            Thread(5, [.. SemaphoreWait, App("MyApp.Shipping", "BookThenPrint", "Shipping.cs", 29)]) with { WaitingForSemaphore = 0x100 }) with
+            Thread(4, [.. SemaphoreWait, App("MyApp.Shipping", "PrintThenBook", "Shipping.cs", 17)]) with { WaitingForSemaphore = 0x200, SemaphoreUse = Holding(0x100) },
+            Thread(5, [.. SemaphoreWait, App("MyApp.Shipping", "BookThenPrint", "Shipping.cs", 29)]) with { WaitingForSemaphore = 0x100, SemaphoreUse = Holding(0x200) }) with
         {
             Semaphores = [Sem(0x100, "Shipping.Printer", 5), Sem(0x200, "Shipping.Carrier", 4)],
         };
@@ -167,8 +170,8 @@ public class SemaphoreDetectorTests
     public void Is_only_a_warning_while_other_app_code_is_still_running()
     {
         var snapshot = Process(
-            Thread(4, [.. SemaphoreWait, App("A", "M", "A.cs", 1)]) with { WaitingForSemaphore = 0x200 },
-            Thread(5, [.. SemaphoreWait, App("B", "M", "B.cs", 1)]) with { WaitingForSemaphore = 0x100 },
+            Thread(4, [.. SemaphoreWait, App("A", "M", "A.cs", 1)]) with { WaitingForSemaphore = 0x200, SemaphoreUse = Holding(0x100) },
+            Thread(5, [.. SemaphoreWait, App("B", "M", "B.cs", 1)]) with { WaitingForSemaphore = 0x100, SemaphoreUse = Holding(0x200) },
             Thread(6, [App("C", "Compute", "C.cs", 1)])) with
         {
             Semaphores = [Sem(0x100, "S.A", 5), Sem(0x200, "S.B", 4)],
@@ -183,7 +186,7 @@ public class SemaphoreDetectorTests
         var node = new TaskInfo { Address = 0x300, TypeName = "System.Threading.SemaphoreSlim+TaskNode", Kind = TaskKind.SemaphoreWait, Description = "SemaphoreSlim.WaitAsync()", Semaphore = 0x100 };
         var refresh = new TaskInfo { Address = 0x200, TypeName = "Box", Kind = TaskKind.AsyncMethod, Description = "PriceCache.RefreshAsync", ThisAddress = cache, Awaiting = node, AwaitLocation = new SourceLocation("/src/PriceCache.cs", 30) };
         var get = new TaskInfo { Address = 0x100, TypeName = "Box", Kind = TaskKind.AsyncMethod, Description = "PriceCache.GetAsync", ThisAddress = cache, Awaiting = refresh, AwaitLocation = new SourceLocation("/src/PriceCache.cs", 18) };
-        var snapshot = Process(Thread(1, [.. ResultWait, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = get }) with
+        var snapshot = Process(Thread(1, [.. ResultWait, App("MyApp.Program", "Main", "Program.cs", 5)]) with { BlockedOnTask = get, SemaphoreUse = Holding(0x100) }) with
         {
             Semaphores = [Sem(0x100, "PriceCache._gate") with { ContainerAddress = cache, AsyncWaiters = 1 }],
         };

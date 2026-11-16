@@ -103,6 +103,42 @@ public static class Scenarios
             "A SemaphoreSlim(3) throttle: each call holds a slot and makes a nested call through the same throttle. Three concurrent calls use every slot.",
             ["semaphore-wait"], ThrottleScenario.Run),
 
+        new("semaphore-leak", Area.Code, Difficulty.Obvious,
+            "Invoice exports take a SemaphoreSlim(1, 1) as their lock; an export with nothing to send returns early without releasing it, and every later export waits forever.",
+            ["semaphore-wait"], InvoiceExportScenario.Run, MustNotReport: ["semaphore-deadlock"]),
+
+        new("semaphore-slow-holder", Area.Code, Difficulty.Hidden,
+            "A tariff cache's LoadAsync holds its SemaphoreSlim while it awaits a carrier service that takes minutes; the next lookup blocks on .Result behind it. Slow, not deadlocked: nothing on the waiting path took the semaphore.",
+            ["semaphore-wait"], TariffCacheScenario.Run, MustNotReport: ["semaphore-deadlock"]),
+
+        new("semaphore-transfer", Area.Code, Difficulty.Obvious,
+            "Two warehouses move stock to each other at once; each move takes its own warehouse's SemaphoreSlim(1, 1), then the other one's.",
+            ["semaphore-deadlock"], StockTransferScenario.Run),
+
+        new("semaphore-fast-path", Area.Code, Difficulty.Hidden,
+            "Freight quotes try their gate with WaitAsync(0) and take a slow path that waits for it when it is busy; the first quote holds the gate for minutes. Slow, not deadlocked: the failed WaitAsync(0) took nothing.",
+            ["semaphore-wait"], FreightQuotesScenario.Run, MustNotReport: ["semaphore-deadlock"]),
+
+        new("semaphore-lock-class", Area.Code, Difficulty.Hidden,
+            "Picking and packing lock the dispatch desk's stock and label printer through a small lock class around a SemaphoreSlim(1, 1) (Enter(), Exit()), in opposite order. The waiting code is in Enter(), which took nothing; optimized code inlines it into the services.",
+            ["semaphore-wait"], LockClassScenario.Run),
+
+        new("semaphore-injected-lock", Area.Code, Difficulty.Hidden,
+            "Billing posts invoices and closes the month through two gates of a small lock class that is handed its SemaphoreSlim(1, 1), in opposite order. The waiting code is in Enter(), which took nothing, and the code that made the semaphores isn't in the class.",
+            ["semaphore-deadlock"], InjectedLockScenario.Run),
+
+        new("semaphore-optional-lock", Area.Code, Difficulty.Hidden,
+            "A rebuild holds an order store's row lock and waits for its table lock, which a truncate never released; a plain save waits for the row lock. Only an exclusive save takes the table lock, so the plain save holds nothing: a leak, not a deadlock.",
+            ["semaphore-wait"], OptionalLockScenario.Run, MustNotReport: ["semaphore-deadlock"]),
+
+        new("semaphore-queued-moves", Area.Code, Difficulty.Hidden,
+            "Loading bays move pallets into two dispatch bays that are closed for a stocktake. Each move keeps its own bay's SemaphoreSlim(1, 1) and waits for the dispatch bay's. Queued, not deadlocked: nobody waits for a gate a waiting move took. In optimized code the frame of the move keeps only the dispatch bay alive; two of the moves name it by its own class, which is derived from the loading bay's.",
+            ["semaphore-wait"], LoadingBaysScenario.Run, MustNotReport: ["semaphore-deadlock"]),
+
+        new("semaphore-release-helper", Area.Code, Difficulty.Hidden,
+            "Counting and packing each take one of a depot's two SemaphoreSlim(1, 1) locks and give it back through an extension method before they take the other one; the month-end closing then takes both and never finishes. A leak, not a deadlock: the two wait for each other's first lock but hold nothing.",
+            ["semaphore-wait"], DepotLocksScenario.Run, MustNotReport: ["semaphore-deadlock"]),
+
         new("bounded-queue", Area.Code, Difficulty.Hidden,
             "A publisher holds a lock while adding to a full BlockingCollection; the only consumer needs that lock before it takes the next item.",
             ["bounded-queue-deadlock"], BoundedQueueScenario.Run),
@@ -162,6 +198,10 @@ public static class Scenarios
         new("healthy", Area.Code, Difficulty.Obvious,
             "Control: background workers ticking along with short locks and a timer, and idle queue consumers waiting for work. Nothing is wrong.",
             [], HealthyScenario.Run),
+
+        new("healthy-signals", Area.Code, Difficulty.Obvious,
+            "Control: workers sleeping on SemaphoreSlim wake-up signals (created with no free slot, released when there is work), and a mail sender whose producer has nothing to send. Nothing is wrong.",
+            [], SignalWorkersScenario.Run, MustNotReport: ["semaphore-deadlock", "semaphore-wait"]),
 
         // ---------------------------------------------------------------- database
         new("db-forgotten-transaction", Area.Database, Difficulty.Obvious,

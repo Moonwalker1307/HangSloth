@@ -365,6 +365,8 @@ public sealed partial class SnapshotBuilder
             MaxCount = obj.ReadInt("m_maxCount") ?? int.MaxValue,
             WaiterThreadIds = threads.Where(t => t.WaitingForSemaphore == address).Select(t => t.ManagedId).ToList(),
             AsyncWaiters = AsyncWaiterNodes(obj).Count(),
+            InitialCount = _initialCounts.GetValueOrDefault(address) is { } created and not FromVariable ? created : null,
+            SizedAtRunTime = _initialCounts.GetValueOrDefault(address) == FromVariable ? true : null,
         };
     }
 

@@ -171,14 +171,14 @@ public class CollectionWaitTests
     [Fact]
     public void A_plain_SemaphoreSlim_waiter_is_reported_as_before()
     {
-        var snapshot = Process(HostMain(), Thread(4, [.. SemaphoreCore, Fx("System.Threading.SemaphoreSlim", "Wait"), App("MyApp.Exporter", "Export", "Exporter.cs", 17)], "exporter") with { WaitingForSemaphore = 0x500 }) with
+        var snapshot = Process(HostMain(), Thread(4, [.. SemaphoreCore, Fx("System.Threading.SemaphoreSlim", "Wait"), App("MyApp.Exporter", "Export", "Exporter.cs", 17)], "exporter") with { WaitingForSemaphore = 0x500, SemaphoreUse = new() { ReleasesIt = true } }) with
         {
             Semaphores = [new SemaphoreInfo { Object = new ObjectRef(0x500, "System.Threading.SemaphoreSlim"), FieldName = "Exporter._gate", CurrentCount = 0, MaxCount = 2, WaiterThreadIds = [4] }],
         };
         var f = Assert.Single(new HangAnalyzer().Analyze(snapshot).Findings);
         Assert.Equal("semaphore-wait", f.Id);
         Assert.Equal(Severity.Warning, f.Severity);
-        Assert.Equal("Waiting for a SemaphoreSlim nobody releases", f.Title);
+        Assert.Equal("Waiting for a SemaphoreSlim with no free slots", f.Title);
         Assert.Equal("Thread 4 (\"exporter\") is waiting in Exporter.Export (Exporter.cs:17) for Exporter._gate, a SemaphoreSlim with 0 of 2 slots free. No other thread is running app code that could release it.", f.Summary);
         Assert.Equal(["A SemaphoreSlim has no owner: whoever took the slot of Exporter._gate has to call Release(). If that code is itself waiting, directly or through this thread, nothing ever will."], f.Details);
         Assert.Equal("Find the code that takes Exporter._gate and make sure it calls Release() on every path (try/finally), and never waits for this thread while holding it.", f.Advice);
