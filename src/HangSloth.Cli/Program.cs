@@ -36,15 +36,17 @@ public static class Program
 
     /// <param name="loadDump">Replaces reading a dump file; lets tests drive the CLI with a synthetic snapshot.</param>
     /// <param name="analyzer">Replaces the default detector list; lets tests inject a failing detector.</param>
+    /// <param name="capture">Replaces capturing a dump of a live process (pid, --keep-dump, progress line sink).</param>
     /// <param name="stdout">Replaces the console as the report's destination; lets tests give it a legacy encoding.</param>
-    internal static int Run(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump = null, Func<HangAnalyzer>? analyzer = null, Stdout? stdout = null)
+    internal static int Run(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump = null, Func<HangAnalyzer>? analyzer = null,
+        Func<int, string?, Action<string>, CapturedDump>? capture = null, Stdout? stdout = null)
     {
         // Numbers in sentences read the same on every machine: "12,345 rows", "1.5 minutes".
         var (culture, uiCulture) = (CultureInfo.CurrentCulture, CultureInfo.CurrentUICulture);
         CultureInfo.CurrentCulture = CultureInfo.CurrentUICulture = CultureInfo.InvariantCulture;
         try
         {
-            return RunInvariant(args, loadDump, analyzer, stdout ?? new Stdout());
+            return RunInvariant(args, loadDump, analyzer, capture, stdout ?? new Stdout());
         }
         finally
         {
@@ -53,7 +55,8 @@ public static class Program
         }
     }
 
-    private static int RunInvariant(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump, Func<HangAnalyzer>? analyzer, Stdout stdout)
+    private static int RunInvariant(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump, Func<HangAnalyzer>? analyzer,
+        Func<int, string?, Action<string>, CapturedDump>? capture, Stdout stdout)
     {
         Options options;
         try
@@ -74,10 +77,18 @@ public static class Program
             return 0;
         }
 
-        if (options.ShowHelp || options.Target is null)
+        if (options.ShowHelp)
         {
             Console.WriteLine(Usage);
-            return options.ShowHelp ? 0 : 1;
+            return 0;
+        }
+
+        if (options.Target is null)
+        {
+            Console.Error.WriteLine("Missing <dump-file> or <pid>.");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine(Usage);
+            return 1;
         }
 
         var isPid = int.TryParse(options.Target, out var pid) && !File.Exists(options.Target);
@@ -89,15 +100,30 @@ public static class Program
             return 1;
         }
 
+        if (options.AllThreads && options.Json)
+            Console.Error.WriteLine("hangsloth: --all-threads has no effect with --json, which always has every thread's stack.");
+
+        CapturedDump? captured = null;
         try
         {
+            // Checked before a live capture, which pauses the app and writes a dump that can be several GB.
             if (options.SymbolDirectories.FirstOrDefault(d => !Directory.Exists(d)) is { } missing)
                 throw new HangSlothException($"Symbols folder not found: {missing}");
+            if (options.DacPath is { } dac && !File.Exists(dac))
+                throw new HangSlothException($"DAC not found: {dac}");
 
             var load = new LoadOptions { SymbolDirectories = options.SymbolDirectories, DacPath = options.DacPath };
-            var snapshot = isPid
-                ? DumpLoader.LoadProcess(pid, load, options.KeepDump)
-                : (loadDump ?? DumpLoader.LoadDump)(options.Target, load);
+            ProcessSnapshot snapshot;
+            if (isPid)
+            {
+                captured = (capture ?? ((p, keep, progress) => DumpLoader.CaptureProcess(p, keep, progress)))(pid, options.KeepDump, Console.Error.WriteLine);
+                // Live process: the app's binaries are where the process loaded them from, so PDBs are found next to them.
+                snapshot = (loadDump ?? DumpLoader.LoadDump)(captured.Path, load) with { Source = DumpLoader.LiveSource(pid, options.KeepDump) };
+            }
+            else
+            {
+                snapshot = (loadDump ?? DumpLoader.LoadDump)(options.Target, load);
+            }
 
             var report = (analyzer?.Invoke() ?? new HangAnalyzer()).Analyze(snapshot);
             WriteReport(report, options, stdout);
@@ -126,15 +152,20 @@ public static class Program
         }
         catch (HangSlothException e)
         {
-            Console.Error.WriteLine($"hangsloth: {e.Message}");
+            // A capture that worked is not thrown away because the analysis failed: the hang may not come back.
+            Console.Error.WriteLine($"hangsloth: {e.Message}{captured?.KeepAndDescribe()}");
             if (e.InnerException is not null && Environment.GetEnvironmentVariable("HANGSLOTH_DEBUG") == "1") Console.Error.WriteLine(e.InnerException);
             return 1;
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"hangsloth: unexpected error ({e.GetType().Name}): {e.Message.ReplaceLineEndings(" ")}");
+            Console.Error.WriteLine($"hangsloth: unexpected error ({e.GetType().Name}): {e.Message.ReplaceLineEndings(" ")}{captured?.KeepAndDescribe()}");
             if (Environment.GetEnvironmentVariable("HANGSLOTH_DEBUG") == "1") Console.Error.WriteLine(e);
             return 1;
+        }
+        finally
+        {
+            captured?.Dispose();
         }
     }
 
@@ -249,7 +280,27 @@ public static class Program
             for (var i = 0; i < args.Length; i++)
             {
                 var a = args[i];
-                string Value() => i + 1 < args.Length ? args[++i] : throw new ArgumentException($"{a} needs a value.");
+                // --name=value also takes a value that starts with '-'.
+                string? inline = null;
+                if (a.StartsWith("--") && a.IndexOf('=') is > 2 and var eq)
+                {
+                    inline = a[(eq + 1)..];
+                    a = a[..eq];
+                }
+                // An option never takes the next option as its value: "--symbols --json" is a missing folder.
+                string Value(string what)
+                {
+                    if (inline is not null) return inline.Length > 0 ? inline : throw new ArgumentException($"{a} needs a {what}.");
+                    if (i + 1 >= args.Length) throw new ArgumentException($"{a} needs a {what}.");
+                    if (args[i + 1].StartsWith('-'))
+                        throw new ArgumentException($"{a} needs a {what}, got '{args[i + 1]}'. Write {a}=<{what}> for one that starts with '-'.");
+                    return args[++i];
+                }
+                string Once(string? current, string what) =>
+                    Value(what) is var v && current is not null && current != v ? throw new ArgumentException($"{a} is given twice.") : v;
+                if (inline is not null && a is not ("--dac" or "--keep-dump" or "--symbols"))
+                    throw new ArgumentException(a is "--json" or "--all-threads" or "--no-color" or "--version" or "--help"
+                        ? $"{a} does not take a value." : $"Unknown option: {args[i]}");
                 o = a switch
                 {
                     "--json" => o with { Json = true },
@@ -257,9 +308,9 @@ public static class Program
                     "--no-color" => o with { NoColor = true },
                     "--version" => o with { ShowVersion = true },
                     "-h" or "--help" or "-?" => o with { ShowHelp = true },
-                    "--dac" => o with { DacPath = Value() },
-                    "--keep-dump" => o with { KeepDump = Value() },
-                    "--symbols" => AddSymbols(o, Value()),
+                    "--dac" => o with { DacPath = Once(o.DacPath, "file") },
+                    "--keep-dump" => o with { KeepDump = Once(o.KeepDump, "file") },
+                    "--symbols" => AddSymbols(o, Value("folder")),
                     _ when a.StartsWith('-') => throw new ArgumentException($"Unknown option: {a}"),
                     _ when o.Target is null => o with { Target = a },
                     _ => throw new ArgumentException($"Unexpected argument: {a}"),

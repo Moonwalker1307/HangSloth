@@ -79,7 +79,7 @@ public class CliEndToEndTests : IClassFixture<CliEndToEndTests.DumpFixture>, IDi
         Assert.StartsWith("hangsloth: ", err);
         Assert.Single(err.Split('\n', StringSplitOptions.RemoveEmptyEntries));
         if (!OperatingSystem.IsWindows())
-            Assert.Contains("the dump looks truncated or damaged", err);
+            Assert.Contains("looks cut off", err);
     }
 
     [Fact]
