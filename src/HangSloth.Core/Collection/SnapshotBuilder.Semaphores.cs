@@ -1580,21 +1580,16 @@ public sealed partial class SnapshotBuilder
             }
         }
 
+        /// The module's image, for methods the JIT hasn't compiled on their own. Read from the dump; when the dump doesn't
+        /// hold all of it, or it doesn't read in the layout ClrMD names, from the module's file, but only when that file is
+        /// the build that was dumped (the same module version id as the dump's metadata).
         private PEReader? Image(ClrModule module)
         {
             if (_images.TryGetValue(module.Address, out var cached)) return cached;
             PEReader? pe = null;
             try
             {
-                if (module.ImageBase != 0 && module.Size is > 0 and < MaxImageBytes)
-                {
-                    var bytes = new byte[(int)module.Size];
-                    if (runtime.DataTarget.DataReader.Read(module.ImageBase, bytes) == bytes.Length)
-                    {
-                        pe = new PEReader(new MemoryStream(bytes), module.Layout == ModuleLayout.Flat ? PEStreamOptions.Default : PEStreamOptions.IsLoadedImage);
-                        if (!pe.HasMetadata) { pe.Dispose(); pe = null; }
-                    }
-                }
+                pe = ImageFromDump(module) ?? ImageFromFile(module);
             }
             catch
             {
@@ -1603,6 +1598,61 @@ public sealed partial class SnapshotBuilder
             }
             _images[module.Address] = pe;
             return pe;
+        }
+
+        private const int PageBytes = 4096;
+
+        private PEReader? ImageFromDump(ClrModule module)
+        {
+            if (module.ImageBase == 0 || module.Size is <= 0 or >= MaxImageBytes) return null;
+            var bytes = new byte[(int)module.Size];
+            // Page by page: a read across the end of one memory range of the dump stops there, even when the next range
+            // holds the rest. A page that is missing leaves the image unused: zeros in a method body would read as code.
+            for (var offset = 0; offset < bytes.Length; offset += PageBytes)
+            {
+                var page = bytes.AsSpan(offset, Math.Min(PageBytes, bytes.Length - offset));
+                if (runtime.DataTarget.DataReader.Read(module.ImageBase + (ulong)offset, page) != page.Length) return null;
+            }
+            PEStreamOptions[] layouts = module.Layout == ModuleLayout.Flat
+                ? [PEStreamOptions.Default, PEStreamOptions.IsLoadedImage]
+                : [PEStreamOptions.IsLoadedImage, PEStreamOptions.Default];
+            foreach (var layout in layouts)
+            {
+                var pe = new PEReader(new MemoryStream(bytes, writable: false), layout | PEStreamOptions.PrefetchEntireImage);
+                if (IsDumpedBuild(pe, module)) return pe;
+                pe.Dispose();
+            }
+            return null;
+        }
+
+        private PEReader? ImageFromFile(ClrModule module)
+        {
+            if (string.IsNullOrEmpty(module.Name) || !File.Exists(module.Name)) return null;
+            var pe = new PEReader(new MemoryStream(File.ReadAllBytes(module.Name), writable: false), PEStreamOptions.PrefetchEntireImage);
+            if (IsDumpedBuild(pe, module)) return pe;
+            pe.Dispose();
+            return null;
+        }
+
+        /// The image reads (its metadata and its method bodies are where its headers say) and is the dumped build.
+        private bool IsDumpedBuild(PEReader pe, ClrModule module)
+        {
+            try
+            {
+                if (!pe.HasMetadata || Metadata(module) is not { } dumped) return false;
+                var image = pe.GetMetadataReader();
+                if (image.GetGuid(image.GetModuleDefinition().Mvid) != dumped.GetGuid(dumped.GetModuleDefinition().Mvid)) return false;
+                foreach (var handle in image.MethodDefinitions.Take(16))
+                {
+                    var rva = image.GetMethodDefinition(handle).RelativeVirtualAddress;
+                    if (rva != 0) _ = pe.GetMethodBody(rva).GetILBytes();
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private MetadataReader? Metadata(ClrModule module)
