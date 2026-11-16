@@ -199,9 +199,10 @@ public static class FrameClassifier
 
     public static StackFrameInfo? FirstUserFrame(IReadOnlyList<StackFrameInfo> frames) => frames.FirstOrDefault(IsUserFrame);
 
-    /// The innermost user frame that has a source location, falling back to the innermost user frame.
+    /// The innermost user frame that has a source location, falling back to the innermost user frame. A frame whose
+    /// line the dump leaves open (CandidateLines) is the place itself: a caller's line would be stated as the wait's.
     public static StackFrameInfo? BestUserFrame(IReadOnlyList<StackFrameInfo> frames) =>
-        FirstUserFrame(frames) is { } first && first.Source is null
+        FirstUserFrame(frames) is { } first && first.Source is null && first.CandidateLines is null
             ? frames.Where(IsUserFrame).FirstOrDefault(f => f.Source is not null) ?? first
             : FirstUserFrame(frames);
 
