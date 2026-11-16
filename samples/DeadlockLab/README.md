@@ -7,8 +7,10 @@ without EF Core, including large selects that hold locks) and SQL Server. It's H
 should report, and the end-to-end tests (`tests/HangSloth.Tests/DeadlockLabTests.cs`) run them all.
 
 ```sh
-dotnet run --project samples/DeadlockLab -c Release -- transfer &   # prints READY once it's stuck
-hangsloth $!
+dotnet build -c Release                                                # once, from the repository root
+dotnet samples/DeadlockLab/bin/Release/net10.0/DeadlockLab.dll transfer &   # prints READY once it's stuck
+sleep 2; hangsloth $!
+kill $!
 
 dotnet run --project samples/DeadlockLab -- --list                  # every scenario, tab-separated
 scripts/try-deadlock-lab.sh                                         # run them all, print a scoreboard

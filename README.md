@@ -70,15 +70,35 @@ Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found,
             1 = error, or nothing found but the dump has no managed heap or a check failed.
 ```
 
-Exit code 1 also covers a check that failed when no other check found anything: the report is still printed, but stderr says which check failed, so do not read "No hang patterns found" as a clean result. The same goes for a dump without the managed heap (see below). An unexpected error is one line on stderr; set `HANGSLOTH_DEBUG=1` to see the full exception. Dumps from .NET Framework are not supported, and a Windows dump has to be analyzed on Windows.
+The exact meaning of the exit codes:
+
+| Exit code | Meaning |
+|---|---|
+| `0` | No finding above informational. Informational findings (`●`) are still printed. |
+| `2` | At least one warning (`▲`) or critical (`✖`) finding. |
+| `1` | An error: bad arguments, a dump that can't be read, or a process that can't be reached. Also a check that failed when no other check found anything, and a dump without the managed heap in which nothing was found (see below): the report is still printed, but stderr says what was missing, so do not read it as a clean result. |
+
+An unexpected error is one line on stderr; set `HANGSLOTH_DEBUG=1` to see the full exception. Dumps from .NET Framework are not supported, and a Windows dump has to be analyzed on Windows.
 
 HangSloth needs a dump with the managed heap: `dotnet-dump collect` (its default `--type Full`, or `--type Heap`), `createdump` (its default `--withheap`, or `--full`), `procdump -ma` on Windows, or Task Manager's "Create dump file". Mini and triage dumps (`createdump --normal` or `--triage`, `dotnet-dump collect --type Mini` or `--type Triage`, and `procdump` on Windows without `-ma`) contain only the stacks, so locks, tasks, semaphores, queues, connection pools and the thread pool can't be seen. For such a dump HangSloth still reports what it can find from the stacks, but instead of "No hang patterns found" it says at the top that it can't tell, lists the threads in your code, and exits with 1 (2 if it did find something). `--json` has `"heapAvailable": false` for it. The same happens, rarely, for a full dump taken while a garbage collection was running, whose heap can't be read; then HangSloth asks for another dump.
 
 When nothing is found, the report lists what the threads in your code are doing (for example `Thread 1 is waiting on a WaitHandle in SingleInstance.Run (SingleInstance.cs:13).` or `Thread 6 is running Parser.Loop (Parser.cs:88).`) with their stacks, so a wait HangSloth doesn't explain or a loop that never ends is visible without `--all-threads`. Idle thread pool workers, the finalizer and the runtime's own threads aren't listed.
 
-For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written.
+For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written. It writes a full dump to the temp folder while it analyzes (hundreds of megabytes for a busy app) and deletes it afterwards, unless you pass `--keep-dump`. The target has to run as the same user and see the same `TMPDIR` (the diagnostics socket lives there; if the connection fails with a message about the socket path length, set `TMPDIR` to a shorter folder for both processes).
 
-If the dump comes from another machine, pass `--symbols` with a folder containing the app's `.dll` and `.pdb` files to get file and line numbers. HangSloth checks that the `.dll` and `.pdb` files it finds are the build that was dumped, and uses that build wherever it is: at the app's original path or in any `--symbols` folder. If it only finds another build (for example because the app was rebuilt after the dump was taken), it still shows file and line numbers, with a note that they may be off for that module.
+Reports can contain SQL text, URLs and the command lines of child processes, taken from the dump. Check a report before you paste it into a public issue.
+
+### Analyzing a dump from another machine
+
+The usual case is a dump from a server or container that you open on your workstation. Bring:
+
+- **A full dump**, as above, and analyze it on the same operating system family and the same CPU architecture it came from (a Linux dump on Linux, a Windows dump on Windows).
+- **The runtime's debugging library (the DAC)** for the exact runtime version the app ran on. If that version is installed on the analyzing machine, nothing more is needed. If it is not, pass `--dac`. On Linux and macOS HangSloth never downloads the DAC, so without it the analysis stops with "Could not load the debugging library (DAC)". The easiest fix is to install the runtime version named in that message. Otherwise take `libmscordaccore.so` (`mscordaccore.dll` on Windows) from the `shared/Microsoft.NETCore.App/<version>/` folder of that runtime, or from the `Microsoft.NETCore.App.Runtime.<rid>` NuGet package of that version. It has to be built for the analyzing machine's OS, architecture and C library: the file from an Alpine (musl) container does not load on a glibc workstation.
+- **The app's binaries**, the build that was dumped, to get file and line numbers: pass `--symbols` with a folder containing the app's `.dll` and `.pdb` files (the publish folder). Without them you still get method names. HangSloth checks that the `.dll` and `.pdb` files it finds are the build that was dumped, and uses that build wherever it is: at the app's original path or in any `--symbols` folder. If it only finds another build (for example because the app was rebuilt after the dump was taken), it still shows file and line numbers, with a note that they may be off for that module.
+
+```sh
+hangsloth prod.dmp --dac ~/dac/10.0.15/libmscordaccore.so --symbols ./publish
+```
 
 ## Build and run from source
 
@@ -96,9 +116,12 @@ dotnet tool install -g HangSloth --add-source ./artifacts
 Try it on the included broken app:
 
 ```sh
-dotnet run --project samples/HangApp -c Release -- sync-over-async &
-hangsloth $!
+dotnet samples/HangApp/bin/Release/net10.0/HangApp.dll sync-over-async &   # prints READY once it is stuck
+sleep 2; hangsloth $!
+kill $!
 ```
+
+The `dotnet build -c Release` above builds the samples too. Start the built app itself, not `dotnet run ... &`: with `dotnet run`, `$!` is the .NET SDK's launcher process and the app is its child, so HangSloth would analyze the launcher.
 
 Modes: `sync-over-async`, `deadlock`, `contention`, `starvation`, `tiered-starvation`, `never-completes`, `healthy`, `lock-type-deadlock`, `sync-io-starvation`.
 

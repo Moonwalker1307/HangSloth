@@ -64,9 +64,9 @@ public sealed class ThreadPoolStarvationDetector : IDetector
             .GroupBy(x => FrameClassifier.TimerCallback(x.Thread.Frames) is { } f ? Names.ShortMethod(f.TypeName, f.MethodName) : "")
             .OrderByDescending(g => g.Count())
             .FirstOrDefault();
-        var timer = timerCallbacks is not null && timerCallbacks.Count() >= MinimumBlockedThreads - 1;
-        if (timer)
-            details.Add($"{timerCallbacks!.Count()} of the blocked threads are running the same timer callback ({timerCallbacks.Key}). A System.Threading.Timer doesn't wait for the previous callback: " +
+        var timerGroup = timerCallbacks is not null && timerCallbacks.Count() >= MinimumBlockedThreads - 1 ? timerCallbacks : null;
+        if (timerGroup is not null)
+            details.Add($"{timerGroup.Count()} of the blocked threads are running the same timer callback ({timerGroup.Key}). A System.Threading.Timer doesn't wait for the previous callback: " +
                         "when the callback takes longer than the period, every tick takes another thread pool thread.");
         if (blocked.Any(x => x.Kind == BlockingKind.TaskWait))
             details.Add("Threads blocked on .Result/.Wait() are usually waiting for a task whose continuation needs a free thread pool thread to finish, which is exactly what's missing.");
@@ -82,8 +82,8 @@ public sealed class ThreadPoolStarvationDetector : IDetector
             Title = "Thread pool starvation",
             Summary = summary,
             Details = details,
-            Advice = timer
-                ? $"Make the timer callback ({timerCallbacks!.Key}) non-overlapping: use a one-shot timer re-armed at the end of the callback (timer.Change(period, Timeout.Infinite)), " +
+            Advice = timerGroup is not null
+                ? $"Make the timer callback ({timerGroup.Key}) non-overlapping: use a one-shot timer re-armed at the end of the callback (timer.Change(period, Timeout.Infinite)), " +
                   "a PeriodicTimer loop, or skip the tick when the previous one is still running (Monitor.TryEnter / Interlocked). And keep slow work out of the lock."
                 : top.Kind == BlockingKind.TaskWait && (top.Call.StartsWith('.') || top.Call.StartsWith("Task.", StringComparison.Ordinal))
                 ? $"Stop blocking on async code in thread pool work: await instead of {top.Call} in {top.Spot}. Raising ThreadPool.SetMinThreads only hides the problem."
