@@ -1,4 +1,5 @@
 using HangSloth.Analysis;
+using HangSloth.Collection;
 using HangSloth.Model;
 
 namespace HangSloth.Reporting;
@@ -22,12 +23,22 @@ public static class TextReporter
         output.WriteLine(c.Bold("HangSloth") + c.Dim($" · {s.Source} · .NET {s.RuntimeVersion ?? "?"} · {Describe.Plural(s.Threads.Count, "managed thread")}"));
         output.WriteLine();
 
-        if (report.Findings.Count == 0)
+        var alarming = report.Findings.Any(f => f.Severity >= Severity.Warning);
+        if (!s.HeapAvailable)
+            WriteNoHeap(output, alarming, s.Warnings.Contains(SnapshotBuilder.HeapNotWalkableWarning), c);
+        else if (report.Findings.Count == 0)
         {
             output.WriteLine(c.Green("No hang patterns found."));
             var blocked = s.Threads.Count(t => FrameClassifier.IsBlocked(FrameClassifier.Classify(t.Frames)));
-            output.WriteLine($"{Describe.Plural(blocked, "thread is", "threads are")} waiting on something, but nothing looks like a deadlock, starvation or a stuck task.");
-            output.WriteLine("If the app still seems hung, take a second dump a few seconds later and compare, or rerun with --all-threads.");
+            var running = s.Threads.Count(t => IsInAppCode(t) && !FrameClassifier.IsBlocked(FrameClassifier.Classify(t.Frames)));
+            if (blocked > 0)
+                output.WriteLine($"{Describe.Plural(blocked, "thread is", "threads are")} waiting on something, but nothing looks like a deadlock, starvation or a stuck task.");
+            else if (running > 0)
+                output.WriteLine($"No thread is waiting on something, but {Describe.Plural(running, "thread is", "threads are")} in your code: if the process is using CPU, look there first.");
+            else
+                output.WriteLine("No thread is waiting on something or running your code: the app looks idle.");
+            output.WriteLine("If the app still seems hung, take a second dump a few seconds later and compare" + (options.AllThreads ? "." : ", or rerun with --all-threads."));
+            output.WriteLine();
         }
 
         var n = 0;
@@ -49,12 +60,16 @@ public static class TextReporter
             output.WriteLine();
         }
 
+        // Nothing alarming found: say what the app's own threads are doing, so an unexplained wait or a
+        // loop that never ends is visible without a second capture.
+        List<int> inCode = alarming ? [] : WriteThreadsInCode(output, report, options, c);
+
         var threadIds = options.AllThreads
             ? s.Threads.Select(t => t.ManagedId).ToList()
-            : report.Findings.SelectMany(f => f.ThreadIds).Distinct().ToList();
+            : report.Findings.SelectMany(f => f.ThreadIds).Concat(inCode).Distinct().ToList();
         if (threadIds.Count > 0)
         {
-            output.WriteLine(c.Bold(options.AllThreads ? "Threads" : "Stacks of the threads involved"));
+            output.WriteLine(c.Bold(options.AllThreads ? "Threads" : report.Findings.Count == 0 ? "Stacks of the threads in your code" : "Stacks of the threads involved"));
             // Threads stopped in the same way at the same lines of app code (typical for starvation
             // and contention) are shown once, even if the framework frames below them differ.
             var groups = threadIds
@@ -72,6 +87,84 @@ public static class TextReporter
 
         foreach (var w in s.Warnings)
             output.WriteLine(c.Dim("note: " + w));
+    }
+
+    /// The warning for a dump without the managed heap. It replaces the all-clear, because without the heap
+    /// most hangs cannot be seen at all. A full dump taken mid-GC has a heap that cannot be walked: it needs
+    /// another dump, not a different kind of dump.
+    private static void WriteNoHeap(TextWriter output, bool alarming, bool midGc, Palette c)
+    {
+        var title = midGc ? "the managed heap in this dump could not be read" : "this dump has no managed heap";
+        output.WriteLine(c.Bold(c.Yellow(alarming ? "▲ " + char.ToUpperInvariant(title[0]) + title[1..] : "▲ Can't tell: " + title)));
+        WriteWrapped(output, "HangSloth could not read the managed heap from this dump, so it only sees the threads' stacks. "
+                             + "Without the heap it cannot see who holds a lock, what a task or async method is waiting for, "
+                             + "semaphores, queues, connection pools, the thread pool or thread names, so most hangs go unnoticed."
+                             + (alarming ? " The findings below come from the stacks alone, and there may be more." : ""), "   ");
+        if (midGc)
+        {
+            WriteWrapped(output, "The dump was probably taken while a garbage collection was running.", "   ");
+            WriteWrapped(output, c.Green("Fix: ") + "Take another dump a moment later.", "   ");
+            output.WriteLine();
+            return;
+        }
+        WriteWrapped(output, "Mini and triage dumps leave the heap out: createdump --normal or --triage, "
+                             + "dotnet-dump collect --type Mini or Triage, and procdump on Windows without -ma.", "   ");
+        WriteWrapped(output, c.Green("Fix: ") + "Take a full dump instead: run hangsloth <pid> on the running app, or use "
+                             + "dotnet-dump collect --type Full, createdump --full (or --withheap) or procdump -ma.", "   ");
+        output.WriteLine();
+    }
+
+    /// One line per group of app threads that no finding shows yet, at most MaxSummaryGroups of them.
+    /// Returns the ids of the threads listed, whose stacks are printed below.
+    private static List<int> WriteThreadsInCode(TextWriter output, AnalysisReport report, TextReportOptions options, Palette c)
+    {
+        var shown = report.Findings.SelectMany(f => f.ThreadIds).ToHashSet();
+        var groups = report.Snapshot.Threads
+            .Where(t => !shown.Contains(t.ManagedId) && IsInAppCode(t))
+            .GroupBy(GroupKey)
+            .Select(g => g.OrderBy(t => t.ManagedId).ToList())
+            .OrderByDescending(g => g.Count)
+            .ThenBy(g => g[0].ManagedId)
+            .ToList();
+        if (groups.Count == 0) return [];
+
+        output.WriteLine(c.Bold("Threads in your code"));
+        var listed = groups.Take(MaxSummaryGroups).ToList();
+        foreach (var g in listed)
+        {
+            var who = g.Count == 1 ? $"{g[0].Label} is"
+                : g.Count > MaxIdsListed ? $"{g.Count} threads ({string.Join(", ", g.Take(MaxIdsListed).Select(t => t.ManagedId))} and more) are"
+                : $"Threads {Describe.JoinAnd(g.Select(t => t.ManagedId.ToString()))} are";
+            WriteWrapped(output, $"{who} {InCodeActivity(g[0])}.", "   ", "     ");
+        }
+        var more = groups.Skip(listed.Count).Sum(g => g.Count);
+        if (more > 0)
+            output.WriteLine(c.Dim($"   (+{Describe.Plural(more, "more thread")} in your code" + (options.AllThreads ? ")" : "; use --all-threads to see every stack)")));
+        output.WriteLine();
+        return listed.SelectMany(g => g).Select(t => t.ManagedId).ToList();
+    }
+
+    /// A thread that is in the app's own code, and not parked in app.Run() or a test runner's wait. Idle pool
+    /// workers, the finalizer and the runtime's own threads have no app frames.
+    private static bool IsInAppCode(ThreadSnapshot t) =>
+        !t.IsFinalizer && t.Frames.Any(FrameClassifier.IsUserFrame) && FrameClassifier.Classify(t.Frames) != BlockingKind.Idle;
+
+    /// What the thread is doing. A thread that is in a framework call HangSloth does not know (a regex match,
+    /// a sort) is not called "running": the call it is in is named instead. Lock waits are worded
+    /// here because the detectors' wording ("itself waiting for another lock") follows a lock it already holds.
+    private static string InCodeActivity(ThreadSnapshot t)
+    {
+        var kind = FrameClassifier.Classify(t.Frames);
+        var at = Describe.Where(FrameClassifier.BestUserFrame(t.Frames));
+        if (kind == BlockingKind.None
+            && FrameClassifier.FrameworkPrefix(t.Frames).LastOrDefault(f => !f.IsRuntimeFrame) is { } call)
+            return $"in {Names.ShortMethod(call.TypeName, call.MethodName)}, called from {at}";
+        if (t.Database is not { Waiting: DatabaseWaitKind.ReadingRows } && t.WaitingOnCollection is null)
+        {
+            if (kind == BlockingKind.MonitorEnter) return $"waiting to enter a lock in {at}";
+            if (kind == BlockingKind.ReaderWriterLock) return $"waiting for a ReaderWriterLockSlim in {at}";
+        }
+        return Describe.Activity(t, withMethod: true);
     }
 
     private static void WriteThread(TextWriter output, IReadOnlyList<ThreadSnapshot> same, TextReportOptions options, Palette c)
@@ -119,6 +212,7 @@ public static class TextReporter
     }
 
     private const int MaxGroups = 12;
+    private const int MaxSummaryGroups = 8;
     private const int LongPrefix = 8;
     private const int MaxIdsListed = 10;
 

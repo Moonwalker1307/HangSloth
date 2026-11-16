@@ -16,6 +16,9 @@ public sealed record ProcessSnapshot
     /// block a thread, so they don't show up in any stack.
     public IReadOnlyList<AsyncPoolWait> AsyncPoolWaits { get; init; } = [];
     public IReadOnlyList<string> Warnings { get; init; } = [];
+    /// False when the dump's managed heap could not be read (a mini or triage dump, or a heap that cannot be
+    /// walked). Locks, tasks, semaphores and pools all come from the heap, so then only the stacks are known.
+    public bool HeapAvailable { get; init; } = true;
 
     public ThreadSnapshot? FindThread(int managedId) => Threads.FirstOrDefault(t => t.ManagedId == managedId);
     public MonitorLock? FindLock(ulong address) => Locks.FirstOrDefault(l => l.Object.Address == address);

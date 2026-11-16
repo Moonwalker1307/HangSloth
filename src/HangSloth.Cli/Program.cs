@@ -26,7 +26,8 @@ public static class Program
           --version            Show the version
           -h, --help           Show this help
 
-        Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found, 1 = error.
+        Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found,
+                    1 = error, or nothing found but the dump has no managed heap or a check failed.
         """;
 
     public static int Main(string[] args) => Run(args);
@@ -90,14 +91,27 @@ public static class Program
                 TextReporter.Write(report, Console.Out, new TextReportOptions { UseColor = color, AllThreads = options.AllThreads });
             }
             if (report.Findings.Any(f => f.Severity >= Severity.Warning)) return 2;
+            var incomplete = false;
+            if (!report.Snapshot.HeapAvailable)
+            {
+                // Without the heap most hangs cannot be seen, so finding nothing is not a clean result either.
+                Console.Error.WriteLine(report.Snapshot.Warnings.Contains(SnapshotBuilder.HeapNotWalkableWarning)
+                    ? "hangsloth: the managed heap in this dump could not be read, so HangSloth cannot tell whether the app is hung. Take another dump a moment later."
+                    : "hangsloth: this dump has no managed heap, so HangSloth cannot tell whether the app is hung. Take a full dump (hangsloth <pid>, dotnet-dump collect --type Full or createdump --full).");
+                incomplete = true;
+            }
             if (report.FailedDetectors.Count > 0)
             {
-                // A failed check must not look like a healthy app.
+                // A failed check must not look like a healthy app. Without the heap the report has no
+                // "No hang patterns found" to distrust, so the line only adds the failed check.
                 var many = report.FailedDetectors.Count > 1;
-                Console.Error.WriteLine($"hangsloth: the {string.Join(", ", report.FailedDetectors)} {(many ? "checks" : "check")} failed, so \"No hang patterns found\" cannot be trusted.");
-                return 1;
+                var checks = $"the {string.Join(", ", report.FailedDetectors)} {(many ? "checks" : "check")} failed";
+                Console.Error.WriteLine(report.Snapshot.HeapAvailable
+                    ? $"hangsloth: {checks}, so \"No hang patterns found\" cannot be trusted."
+                    : $"hangsloth: {checks} too.");
+                incomplete = true;
             }
-            return 0;
+            return incomplete ? 1 : 0;
         }
         catch (HangSlothException e)
         {

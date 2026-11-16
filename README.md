@@ -66,12 +66,17 @@ hangsloth <pid>         [options]   Capture a dump of a running .NET process and
   --no-color           Disable colored output
   --version            Show the version
 
-Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found, 1 = error.
+Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found,
+            1 = error, or nothing found but the dump has no managed heap or a check failed.
 ```
 
-Exit code 1 also covers a check that failed when no other check found anything: the report is still printed, but stderr says which check failed, so do not read "No hang patterns found" as a clean result. An unexpected error is one line on stderr; set `HANGSLOTH_DEBUG=1` to see the full exception. Dumps from .NET Framework are not supported, and a Windows dump has to be analyzed on Windows.
+Exit code 1 also covers a check that failed when no other check found anything: the report is still printed, but stderr says which check failed, so do not read "No hang patterns found" as a clean result. The same goes for a dump without the managed heap (see below). An unexpected error is one line on stderr; set `HANGSLOTH_DEBUG=1` to see the full exception. Dumps from .NET Framework are not supported, and a Windows dump has to be analyzed on Windows.
 
-Dumps from `dotnet-dump collect`, `createdump`, `procdump` or Task Manager all work. For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written.
+HangSloth needs a dump with the managed heap: `dotnet-dump collect` (its default `--type Full`, or `--type Heap`), `createdump` (its default `--withheap`, or `--full`), `procdump -ma` on Windows, or Task Manager's "Create dump file". Mini and triage dumps (`createdump --normal` or `--triage`, `dotnet-dump collect --type Mini` or `--type Triage`, and `procdump` on Windows without `-ma`) contain only the stacks, so locks, tasks, semaphores, queues, connection pools and the thread pool can't be seen. For such a dump HangSloth still reports what it can find from the stacks, but instead of "No hang patterns found" it says at the top that it can't tell, lists the threads in your code, and exits with 1 (2 if it did find something). `--json` has `"heapAvailable": false` for it. The same happens, rarely, for a full dump taken while a garbage collection was running, whose heap can't be read; then HangSloth asks for another dump.
+
+When nothing is found, the report lists what the threads in your code are doing (for example `Thread 1 is waiting on a WaitHandle in SingleInstance.Run (SingleInstance.cs:13).` or `Thread 6 is running Parser.Loop (Parser.cs:88).`) with their stacks, so a wait HangSloth doesn't explain or a loop that never ends is visible without `--all-threads`. Idle thread pool workers, the finalizer and the runtime's own threads aren't listed.
+
+For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written.
 
 If the dump comes from another machine, pass `--symbols` with a folder containing the app's `.dll` and `.pdb` files to get file and line numbers. HangSloth checks that the `.dll` and `.pdb` files it finds are the build that was dumped, and uses that build wherever it is: at the app's original path or in any `--symbols` folder. If it only finds another build (for example because the app was rebuilt after the dump was taken), it still shows file and line numbers, with a note that they may be off for that module.
 
