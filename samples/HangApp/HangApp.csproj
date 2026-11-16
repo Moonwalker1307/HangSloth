@@ -4,5 +4,9 @@
     <TargetFramework>net10.0</TargetFramework>
     <DebugType>portable</DebugType>
     <IsPackable>false</IsPackable>
+    <!-- With dynamic PGO the JIT decides from run to run whether to inline Task<T>.Result completely, depending on
+         how much profile it has collected by then. The tiered-starvation mode needs the same optimized code every
+         time, so this sample runs without it. -->
+    <TieredPGO>false</TieredPGO>
   </PropertyGroup>
 </Project>
