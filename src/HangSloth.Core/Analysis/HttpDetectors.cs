@@ -134,7 +134,7 @@ public sealed class HttpDetector : IDetector
     }
 
     private static string Format(TimeSpan t) =>
-        t.TotalMinutes >= 1 ? $"{t.TotalMinutes:0.#} minutes" : $"{t.TotalSeconds:0.#} seconds";
+        t.TotalMinutes >= 1 ? $"{Describe.Number(t.TotalMinutes)} minutes" : $"{Describe.Number(t.TotalSeconds)} seconds";
 }
 
 /// A parent waiting for a child process to exit while the child's redirected output is unread: the

@@ -2,7 +2,9 @@ using HangSloth.Analysis;
 using HangSloth.Collection;
 using HangSloth.Model;
 using HangSloth.Reporting;
+using System.Globalization;
 using System.Reflection;
+using System.Text;
 
 namespace HangSloth.Cli;
 
@@ -34,7 +36,24 @@ public static class Program
 
     /// <param name="loadDump">Replaces reading a dump file; lets tests drive the CLI with a synthetic snapshot.</param>
     /// <param name="analyzer">Replaces the default detector list; lets tests inject a failing detector.</param>
-    internal static int Run(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump = null, Func<HangAnalyzer>? analyzer = null)
+    /// <param name="stdout">Replaces the console as the report's destination; lets tests give it a legacy encoding.</param>
+    internal static int Run(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump = null, Func<HangAnalyzer>? analyzer = null, Stdout? stdout = null)
+    {
+        // Numbers in sentences read the same on every machine: "12,345 rows", "1.5 minutes".
+        var (culture, uiCulture) = (CultureInfo.CurrentCulture, CultureInfo.CurrentUICulture);
+        CultureInfo.CurrentCulture = CultureInfo.CurrentUICulture = CultureInfo.InvariantCulture;
+        try
+        {
+            return RunInvariant(args, loadDump, analyzer, stdout ?? new Stdout());
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = culture;
+            CultureInfo.CurrentUICulture = uiCulture;
+        }
+    }
+
+    private static int RunInvariant(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump, Func<HangAnalyzer>? analyzer, Stdout stdout)
     {
         Options options;
         try
@@ -81,15 +100,7 @@ public static class Program
                 : (loadDump ?? DumpLoader.LoadDump)(options.Target, load);
 
             var report = (analyzer?.Invoke() ?? new HangAnalyzer()).Analyze(snapshot);
-            if (options.Json)
-            {
-                Console.WriteLine(JsonReporter.Serialize(report));
-            }
-            else
-            {
-                var color = !options.NoColor && !Console.IsOutputRedirected && Environment.GetEnvironmentVariable("NO_COLOR") is null;
-                TextReporter.Write(report, Console.Out, new TextReportOptions { UseColor = color, AllThreads = options.AllThreads });
-            }
+            WriteReport(report, options, stdout);
             if (report.Findings.Any(f => f.Severity >= Severity.Warning)) return 2;
             var incomplete = false;
             if (!report.Snapshot.HeapAvailable)
@@ -124,6 +135,90 @@ public static class Program
             Console.Error.WriteLine($"hangsloth: unexpected error ({e.GetType().Name}): {e.Message.ReplaceLineEndings(" ")}");
             if (Environment.GetEnvironmentVariable("HANGSLOTH_DEBUG") == "1") Console.Error.WriteLine(e);
             return 1;
+        }
+    }
+
+    private static void WriteReport(AnalysisReport report, Options options, Stdout stdout)
+    {
+        void Emit(TextWriter writer, bool ascii)
+        {
+            if (options.Json)
+            {
+                writer.WriteLine(JsonReporter.Serialize(report, Version()));
+                return;
+            }
+            var color = !options.NoColor && !stdout.Redirected && Environment.GetEnvironmentVariable("NO_COLOR") is null;
+            TextReporter.Write(report, writer, new TextReportOptions { UseColor = color, AllThreads = options.AllThreads, Ascii = ascii });
+        }
+
+        switch (PlanOutput(stdout.Writer.Encoding, stdout.Redirected, options.Json))
+        {
+            case OutputPlan.Utf8Stream:
+                // The console's code page does not matter for a file or a pipe: write UTF-8, without a byte order mark.
+                using (var writer = new StreamWriter(stdout.OpenBytes(), new UTF8Encoding(false), 4096, leaveOpen: true))
+                    Emit(writer, ascii: false);
+                break;
+            case OutputPlan.SwitchConsole:
+                if (stdout.SwitchToUtf8() is { } utf8)
+                {
+                    try { Emit(utf8.Writer, ascii: false); }
+                    finally { utf8.Restore(); }
+                }
+                else
+                    Emit(stdout.Writer, ascii: true);
+                break;
+            default:
+                Emit(stdout.Writer, ascii: false);
+                break;
+        }
+    }
+
+    internal enum OutputPlan
+    {
+        /// Write to the console's writer as it is: it is UTF-8, or not a byte encoding at all.
+        Console,
+        /// Write UTF-8 bytes straight to the standard output stream.
+        Utf8Stream,
+        /// A person's console with a legacy code page: switch it to UTF-8 for the report, or use ASCII markers.
+        SwitchConsole,
+    }
+
+    /// <param name="redirected">Output goes to a file or a pipe, not to a console window.</param>
+    internal static OutputPlan PlanOutput(Encoding console, bool redirected, bool json)
+    {
+        // 65001 is UTF-8; 1200, 1201, 12000 and 12001 are UTF-16 and UTF-32, which no real console uses
+        // (a StringWriter has one), so there is no code page to work around.
+        if (console.CodePage is 65001 or 1200 or 1201 or 12000 or 12001) return OutputPlan.Console;
+        return json || redirected ? OutputPlan.Utf8Stream : OutputPlan.SwitchConsole;
+    }
+
+    /// Where the report is written. The defaults are the real console.
+    internal sealed class Stdout
+    {
+        public TextWriter Writer { get; init; } = Console.Out;
+        public bool Redirected { get; init; } = Console.IsOutputRedirected;
+        public Func<Stream> OpenBytes { get; init; } = Console.OpenStandardOutput;
+        /// Makes the console itself write UTF-8; null when it cannot (no console attached, or not allowed).
+        public Func<(TextWriter Writer, Action Restore)?> SwitchToUtf8 { get; init; } = () => SwitchConsoleToUtf8(OperatingSystem.IsWindows());
+
+        /// Only Windows has a console code page to change. On Linux and macOS the terminal's own charset (from the
+        /// locale) decides how bytes look and no call here can change it, so UTF-8 bytes would reach a Latin-1
+        /// terminal as mojibake with raw C1 control bytes in it: the caller falls back to ASCII instead.
+        internal static (TextWriter Writer, Action Restore)? SwitchConsoleToUtf8(bool isWindows)
+        {
+            if (!isWindows) return null;
+            Encoding previous;
+            try
+            {
+                previous = Console.OutputEncoding;
+                Console.OutputEncoding = new UTF8Encoding(false);
+            }
+            catch (Exception e) when (e is IOException or ArgumentException or NotSupportedException or UnauthorizedAccessException)
+            {
+                return null;
+            }
+            // On Windows the code page belongs to the console window and outlives this process: put it back.
+            return (Console.Out, () => { try { Console.OutputEncoding = previous; } catch (Exception) { /* best effort */ } });
         }
     }
 
