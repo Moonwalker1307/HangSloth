@@ -8,93 +8,142 @@ public sealed class BlockedOnTaskDetector : IDetector
 {
     public IEnumerable<Finding> Detect(ProcessSnapshot snapshot, IReadOnlySet<int> claimed)
     {
-        foreach (var thread in snapshot.Threads)
+        var waits = snapshot.Threads
+            .Where(t => !claimed.Contains(t.ManagedId))
+            .Select(t => Explain(snapshot, t))
+            .OfType<Wait>();
+        // Threads blocked at the same line on the same chain read as one finding that says how many they are.
+        return SameWait.Group(waits, w => w.Thread, w => w.Key, (w, who) => w.Make(who));
+    }
+
+    /// One thread's wait: the finding, worded for whoever it is about, and what its words don't show (the semaphore).
+    private sealed record Wait(ThreadSnapshot Thread, string Key, Func<Subject, Finding> Make);
+
+    private static Wait? Explain(ProcessSnapshot snapshot, ThreadSnapshot thread)
+    {
+        if (thread.BlockedOnTask is not { } waited || waited.State != TaskState.Pending)
+            return null;
+
+        var chain = Describe.ReadableChain(waited);
+        // The generic host waiting for a hosted service's StartAsync: the app never gets to run, however
+        // healthy the host's own wait looks.
+        var hostStarting = chain.Any(IsHostStarting);
+        // A test runner or host waiting for its own work (testhost's Main, host.RunAsync().GetAwaiter().GetResult()):
+        // that's how a healthy process looks.
+        if (!hostStarting && (FrameClassifier.Classify(thread.Frames) == BlockingKind.Idle || chain.Any(FrameClassifier.IsHostRunTask)))
+            return null;
+
+        var leaf = chain[^1];
+        var asyncMain = Describe.IsAsyncMainWait(thread.Frames);
+        if (asyncMain && !IsShownBehindAsyncMain(chain, hostStarting))
+            return null;
+        // An app whose async Main runs until it is told to stop may wait for its stop signal further down its own
+        // code too. The dump can't tell that from a hang, so the finding keeps its severity and says so.
+        var mayBeStopSignal = asyncMain && !hostStarting;
+
+        var call = HostRunCall(thread.Frames) ?? FrameClassifier.DescribeTaskWait(thread.Frames);
+        var site = FrameClassifier.BestUserFrame(thread.Frames) ?? FrameClassifier.WaitingFrame(thread.Frames);
+        // For async Main, the story starts where Main is paused, not at the compiler's wait for it.
+        var path = asyncMain ? chain.Skip(1).ToList() : chain;
+        string Opening(Subject who) => asyncMain
+            ? $"{who.Who} {who.Is} waiting for the app's async Main, which " + (chain[0].AwaitLocation is { } paused ? $"is paused at {paused}, awaiting " : "awaits ")
+            // Task.WaitAny names the first of its tasks: say that there are more.
+            : $"{who.Who} {who.Is} blocked in {call} at {Describe.Spot(site)}, waiting for" + (Describe.FirstOf(chain[0]) is { Length: > 0 } firstOf ? firstOf : "") + " ";
+        var location = asyncMain ? chain[0].AwaitLocation : site?.Source;
+
+        if (leaf.Kind == TaskKind.SemaphoreWait)
         {
-            if (claimed.Contains(thread.ManagedId) || thread.BlockedOnTask is not { } waited || waited.State != TaskState.Pending)
-                continue;
-
-            var chain = Describe.ReadableChain(waited);
-            // The generic host waiting for a hosted service's StartAsync: the app never gets to run, however
-            // healthy the host's own wait looks.
-            var hostStarting = chain.Any(IsHostStarting);
-            // A test runner or host waiting for its own work (testhost's Main, host.RunAsync().GetAwaiter().GetResult()):
-            // that's how a healthy process looks.
-            if (!hostStarting && (FrameClassifier.Classify(thread.Frames) == BlockingKind.Idle || chain.Any(FrameClassifier.IsHostRunTask)))
-                continue;
-
-            var leaf = chain[^1];
-            var asyncMain = Describe.IsAsyncMainWait(thread.Frames);
-            if (asyncMain && !IsShownBehindAsyncMain(chain, hostStarting))
-                continue;
-            // An app whose async Main runs until it is told to stop may wait for its stop signal further down its own
-            // code too. The dump can't tell that from a hang, so the finding keeps its severity and says so.
-            var mayBeStopSignal = asyncMain && !hostStarting;
-
-            var call = HostRunCall(thread.Frames) ?? FrameClassifier.DescribeTaskWait(thread.Frames);
-            var site = FrameClassifier.BestUserFrame(thread.Frames) ?? FrameClassifier.WaitingFrame(thread.Frames);
-            // For async Main, the story starts where Main is paused, not at the compiler's wait for it.
-            var path = asyncMain ? chain.Skip(1).ToList() : chain;
-            var opening = asyncMain
-                ? $"{thread.Label} is waiting for the app's async Main, which " + (chain[0].AwaitLocation is { } paused ? $"is paused at {paused}, awaiting " : "awaits ")
-                : $"{thread.Label} is blocked in {call} at {Describe.Spot(site)}, waiting for ";
-            var location = asyncMain ? chain[0].AwaitLocation : site?.Source;
-
-            if (leaf.Kind == TaskKind.SemaphoreWait)
+            // Null for a loop waiting on a signal: an idle pump, not a hang.
+            if (SemaphoreWait(snapshot, thread, chain, Opening(new(thread.Label, false)), path, location) is null) return null;
+            return new Wait(thread, $"semaphore {leaf.Semaphore}", who =>
             {
-                // Null for a loop waiting on a signal: an idle pump, not a hang.
-                if (SemaphoreWait(snapshot, thread, chain, opening, path, location) is { } semaphoreWait)
-                    yield return mayBeStopSignal && semaphoreWait.Severity == Severity.Warning
-                        ? semaphoreWait with { Details = [.. semaphoreWait.Details, StopSignalDetail] }
-                        : semaphoreWait;
-                continue;
-            }
-
-            var leafText = leaf.Kind switch
-            {
-                TaskKind.Promise => $"{leaf.Description} that nothing has completed yet",
-                TaskKind.Delay => "a Task.Delay that hasn't elapsed yet",
-                TaskKind.Delegate => $"{leaf.Description}, which is still running",
-                TaskKind.NotStarted => $"{leaf.Description}, which was never started",
-                TaskKind.Queued => $"{leaf.Description}, which is queued and hasn't started running: no thread has picked it up yet",
-                _ => leaf.Description,
-            };
-
-            List<string> details = leaf.Kind switch
-            {
-                TaskKind.Promise => ["A TaskCompletionSource task only finishes when some code calls SetResult/SetException/SetCanceled on it. Check the code that should do that: it may have failed, been skipped, or be waiting itself."],
-                TaskKind.NotStarted => ["A task created with new Task(...) runs only once something calls Start() on it. Until then, every wait for it waits forever."],
-                _ => [],
-            };
-            if (hostStarting)
-                details.Add(HostStartingDetail);
-            if (mayBeStopSignal && leaf.Kind == TaskKind.Promise)
-                details.Add(StopSignalDetail);
-
-            yield return new Finding
-            {
-                Id = "blocked-on-task",
-                // A host that hasn't finished starting isn't serving, whatever StartAsync waits for.
-                Severity = leaf.Kind is TaskKind.NotStarted or TaskKind.Promise || hostStarting ? Severity.Warning : Severity.Info,
-                Title = leaf.Kind switch
-                {
-                    TaskKind.Promise => "Waiting for a task nobody completes",
-                    TaskKind.NotStarted => "Waiting for a task that was never started",
-                    _ when hostStarting => "The host hasn't finished starting",
-                    _ => "Thread blocked on a task",
-                },
-                Summary = $"{opening}{PathText(path, leafText)}.",
-                Details = details,
-                Advice = leaf.Kind switch
-                {
-                    TaskKind.Promise => "Make sure every path completes the TaskCompletionSource (including errors and cancellation), and consider a timeout.",
-                    TaskKind.NotStarted => "Call Start() on the task, or create it with Task.Run, which starts it right away.",
-                    _ when hostStarting => HostStartingAdvice,
-                    _ => $"Prefer await over {call} so the thread isn't held while waiting.",
-                },
-                ThreadIds = [thread.ManagedId],
-                Location = location,
-            };
+                var semaphoreWait = SemaphoreWait(snapshot, thread, chain, Opening(who), path, location)!;
+                return mayBeStopSignal && semaphoreWait.Severity == Severity.Warning
+                    ? semaphoreWait with { Details = [.. semaphoreWait.Details, StopSignalDetail] }
+                    : semaphoreWait;
+            });
         }
+
+        if (OutputEnd(thread, call, chain) is { } outputEnd)
+            return new Wait(thread, "", who => outputEnd(who, Describe.Spot(site), location));
+
+        var leafText = leaf.Kind switch
+        {
+            TaskKind.Promise => $"{leaf.Description} that nothing has completed yet",
+            TaskKind.Delay => "a Task.Delay that hasn't elapsed yet",
+            TaskKind.Delegate => $"{leaf.Description}, which is still running",
+            TaskKind.NotStarted => $"{leaf.Description}, which was never started",
+            TaskKind.Queued => $"{leaf.Description}, which is queued and hasn't started running: no thread has picked it up yet",
+            _ => leaf.Description,
+        };
+
+        List<string> details = leaf.Kind switch
+        {
+            TaskKind.Promise => ["A TaskCompletionSource task only finishes when some code calls SetResult/SetException/SetCanceled on it. Check the code that should do that: it may have failed, been skipped, or be waiting itself."],
+            TaskKind.NotStarted => ["A task created with new Task(...) runs only once something calls Start() on it. Until then, every wait for it waits forever."],
+            _ => [],
+        };
+        if (hostStarting)
+            details.Add(HostStartingDetail);
+        if (mayBeStopSignal && leaf.Kind == TaskKind.Promise)
+            details.Add(StopSignalDetail);
+
+        return new Wait(thread, "", who => new Finding
+        {
+            Id = "blocked-on-task",
+            // A host that hasn't finished starting isn't serving, whatever StartAsync waits for.
+            Severity = leaf.Kind is TaskKind.NotStarted or TaskKind.Promise || hostStarting ? Severity.Warning : Severity.Info,
+            Title = leaf.Kind switch
+            {
+                TaskKind.Promise => "Waiting for a task nobody completes",
+                TaskKind.NotStarted => "Waiting for a task that was never started",
+                _ when hostStarting => "The host hasn't finished starting",
+                _ => "Thread blocked on a task",
+            },
+            Summary = $"{Opening(who)}{PathText(path, leafText)}.",
+            Details = details,
+            Advice = leaf.Kind switch
+            {
+                TaskKind.Promise => "Make sure every path completes the TaskCompletionSource (including errors and cancellation), and consider a timeout.",
+                TaskKind.NotStarted => "Call Start() on the task, or create it with Task.Run, which starts it right away.",
+                _ when hostStarting => HostStartingAdvice,
+                _ when call.StartsWith("Parallel.", StringComparison.Ordinal) => ParallelAdvice,
+                _ => $"Prefer await over {call} so the thread isn't held while waiting.",
+            },
+            ThreadIds = [thread.ManagedId],
+            Location = location,
+        });
+    }
+
+    /// Parallel.For/ForEach has nothing to await: it blocks its caller until the last iteration is done.
+    private const string ParallelAdvice =
+        "Parallel.For/ForEach holds the thread that calls it until every iteration has finished, so there is nothing to await here: look at what the loop body waits for. " +
+        "If the body waits for I/O or other work, use Parallel.ForEachAsync with an async body, which doesn't block a thread while it waits; otherwise don't block inside the body.";
+
+    /// Process.WaitForExit() without a timeout waits, once the child has exited, for the end of the output that
+    /// BeginOutputReadLine/BeginErrorReadLine read in the background: the task it waits for is that read.
+    private static Func<Subject, string, SourceLocation?, Finding>? OutputEnd(ThreadSnapshot thread, string call, List<TaskInfo> chain)
+    {
+        if (!call.StartsWith("Process.WaitForExit", StringComparison.Ordinal) || !chain.Any(t => t.TypeName.Contains("System.Diagnostics.AsyncStreamReader", StringComparison.Ordinal)))
+            return null;
+        var child = thread.WaitingForProcess is { } p ? $" for `{p.CommandLine}` (pid {p.ProcessId})" : "";
+        return (who, spot, location) => new Finding
+        {
+            Id = "blocked-on-task",
+            Severity = Severity.Info,
+            Title = "Waiting for the end of a child process's output",
+            Summary = $"{who.Who} {who.Is} blocked in Process.WaitForExit() at {spot}{child}. The child process has exited, and WaitForExit() now waits for the end of its " +
+                      "redirected output, which BeginOutputReadLine or BeginErrorReadLine reads in the background. That output is still open.",
+            Details =
+            [
+                "Another process that inherited the child's output keeps it open, typically one the child started in the background (`command &` in a shell script, a daemon, a helper that outlives it). " +
+                "WaitForExit() without a timeout waits for the end of the output, so it waits for that process too.",
+            ],
+            Advice = "Wait with a timeout, WaitForExit(milliseconds), which doesn't wait for the end of the output, or keep the processes the child starts in the background from " +
+                     "inheriting its output and error streams (in a shell script: `command > /dev/null 2>&1 &`).",
+            ThreadIds = [thread.ManagedId],
+            Location = location,
+        };
     }
 
     /// async Main (and top-level await) keeps the main thread waiting for Main's task for as long as the app runs,

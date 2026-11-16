@@ -41,11 +41,17 @@ public sealed class LockContentionDetector : IDetector
 
             var ownerSite = owner is null ? null : FrameClassifier.BestUserFrame(owner.Frames);
             var details = new List<string> { $"Waiting at: {Describe.JoinAnd(waitSpots)}." };
-            var timerCallbacks = waiters.Select(snapshot.FindThread).OfType<ThreadSnapshot>().Where(IsTimerCallback).ToList();
+            var onTimer = waiters.Select(snapshot.FindThread).OfType<ThreadSnapshot>().Where(IsTimerCallback).ToList();
+            // An await of Task.Delay continues on the timer's thread too: that is the rest of an async method, not a callback the app gave a Timer.
+            var afterDelay = onTimer.Where(IsDelayContinuation).ToList();
+            var timerCallbacks = onTimer.Except(afterDelay).ToList();
+            if (owner is not null && afterDelay.Count > 0)
+                details.Add($"{Describe.Labels(afterDelay)} {(afterDelay.Count == 1 ? "is" : "are")} running the continuation of a Task.Delay ({Describe.Where(FrameClassifier.BestUserFrame(afterDelay[0].Frames))}): " +
+                            "the rest of an async method after await Task.Delay(...) runs on the thread that fires the delay's timer.");
             if (owner is not null && timerCallbacks.Count > 0)
             {
                 var callback = Describe.Where(FrameClassifier.BestUserFrame(timerCallbacks[0].Frames));
-                details.Add($"{Describe.JoinAnd(timerCallbacks.Select(t => t.Label))} {(timerCallbacks.Count == 1 ? "is" : "are")} running a timer callback ({callback}).");
+                details.Add($"{Describe.Labels(timerCallbacks)} {(timerCallbacks.Count == 1 ? "is" : "are")} running a timer callback ({callback}).");
                 if (ownerKind is BlockingKind.WaitHandle or BlockingKind.TaskWait)
                     details.Add($"If {owner.Label} is waiting for the timer's callbacks to finish (Timer.Dispose(WaitHandle) or DisposeAsync), this is a deadlock: the callback it waits for is the one stuck on this lock.");
             }
@@ -65,6 +71,8 @@ public sealed class LockContentionDetector : IDetector
                     ? "Don't do slow or blocking work while holding a lock: copy what you need, release the lock, then do the slow part."
                     : "Keep the work inside this lock short, or use a finer-grained or reader/writer lock.",
                 ThreadIds = owner is null ? waiters : [owner.ManagedId, .. waiters],
+                // An owner blocked on a task is named here; what that task waits for is the finding about the task.
+                ExplainedThreadIds = owner?.BlockedOnTask is { State: TaskState.Pending } ? waiters : null,
                 Location = ownerSite?.Source,
             };
         }
@@ -147,6 +155,10 @@ public sealed class LockContentionDetector : IDetector
             Location = readerSite?.Source,
         };
     }
+
+    /// Task.Delay completes its task from a timer callback of its own, and an await of it continues right there.
+    private static bool IsDelayContinuation(ThreadSnapshot t) =>
+        t.Frames.Any(f => f.TypeName.StartsWith("System.Threading.Tasks.Task+DelayPromise", StringComparison.Ordinal));
 
     private static bool IsTimerCallback(ThreadSnapshot t) =>
         t.Frames.Any(f => f.TypeName.StartsWith("System.Threading.TimerQueueTimer", StringComparison.Ordinal) && f.MethodName is "Fire" or "CallCallback");

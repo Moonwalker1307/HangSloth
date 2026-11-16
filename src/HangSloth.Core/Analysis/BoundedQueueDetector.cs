@@ -22,7 +22,8 @@ public sealed class BoundedQueueDeadlockDetector : IDetector
             var other = partner ?? waiters[0];
             var lockNames = Describe.JoinAnd(held.Select(Describe.Held));
             var state = wait.Adding
-                ? $"which is full ({wait.Count} of {wait.Capacity})"
+                // Add only blocks on a full collection; its count may not be readable.
+                ? wait.Count is null ? $"which is full (capacity {wait.Capacity})" : $"which is full ({wait.Count} of {wait.Capacity})"
                 : "which is empty";
             var role = wait.Adding ? "takes items out of" : "adds items to";
             var site = FrameClassifier.BestUserFrame(t.Frames);

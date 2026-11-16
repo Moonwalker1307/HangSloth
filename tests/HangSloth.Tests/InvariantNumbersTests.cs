@@ -43,8 +43,9 @@ public class InvariantNumbersTests
     }
 
     [Theory]
-    [InlineData(90, "1.5 minutes")]
-    [InlineData(100, "1.7 minutes")]
+    [InlineData(90, "90 seconds")]
+    [InlineData(100, "100 seconds")]
+    [InlineData(150, "2.5 minutes")]
     [InlineData(30, "30 seconds")]
     [InlineData(2.5, "2.5 seconds")]
     public void Http_timeouts_read_the_same_in_every_culture(double seconds, string expected)

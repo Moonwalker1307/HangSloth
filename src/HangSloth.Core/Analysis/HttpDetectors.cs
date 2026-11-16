@@ -36,8 +36,8 @@ public sealed class HttpDetector : IDetector
             var nested = full && holders.Count > 0;
             var first = group.First();
             var site = FrameClassifier.BestUserFrame(first.Thread.Frames);
-            var details = group.Select(w => $"{w.Thread.Label} is blocked in {FrameClassifier.DescribeTaskWait(w.Thread.Frames)} at {Describe.Where(FrameClassifier.BestUserFrame(w.Thread.Frames))}, " +
-                                            $"waiting for {AppPath(w.Chain)}, which is queued for a connection to {pool.Server}.").ToList();
+            var details = SameWait.Lines(group, w => w.Thread, (w, who) => $"{who.Who} {who.Is} blocked in {FrameClassifier.DescribeTaskWait(w.Thread.Frames)} at {Describe.Where(FrameClassifier.BestUserFrame(w.Thread.Frames))}, " +
+                                                                           $"waiting for {AppPath(w.Chain)}, which is queued for a connection to {pool.Server}.");
             details.Add($"The pool for {pool.Server} " +
                         (pool.MaxConnections == int.MaxValue ? "has no connection limit (MaxConnectionsPerServer isn't set)" : $"allows {Describe.Plural(pool.MaxConnections, "connection")} (MaxConnectionsPerServer)") +
                         $" and {pool.OpenConnections} {(pool.OpenConnections == 1 ? "is" : "are")} open.");
@@ -52,8 +52,8 @@ public sealed class HttpDetector : IDetector
                 Id = "http-connection-limit",
                 Severity = nested ? Severity.Critical : Severity.Warning,
                 Title = nested ? "Deadlock: HTTP calls holding a connection while waiting for another" : "HTTP calls waiting for a connection",
-                Summary = $"{Describe.JoinAnd(group.Select(w => w.Thread.Label))} {(group.Count() == 1 ? "is" : "are")} waiting for a free HTTP connection to {pool.Server}" +
-                          (full ? $", and all {pool.MaxConnections} allowed connections are in use." : ".") +
+                Summary = $"{Describe.Labels(group.Select(w => w.Thread))} {(group.Count() == 1 ? "is" : "are")} waiting for a free HTTP connection to {pool.Server}" +
+                          (full ? pool.MaxConnections == 1 ? ", and the only allowed connection is in use." : $", and all {pool.MaxConnections} allowed connections are in use." : ".") +
                           (nested ? " The connections are held by responses that the waiting calls themselves haven't read or disposed, so none is ever returned." : "") +
                           (site?.Source is null ? "" : $" Start at {site.Source}."),
                 Details = details,
@@ -66,26 +66,43 @@ public sealed class HttpDetector : IDetector
             };
         }
 
-        foreach (var (thread, chain, call) in responseWaits)
+        // Threads blocked at the same line on requests to the same server read as one finding that says how many they are.
+        foreach (var group in responseWaits.GroupBy(ResponseWaitKey))
         {
+            var waits = group.ToList();
+            var (thread, chain, call) = waits[0];
             var site = FrameClassifier.BestUserFrame(thread.Frames);
             var timeout = call.InfiniteTimeout ? "The HttpClient has no timeout (Timeout = Infinite), so it will wait forever."
                 : call.Timeout is { } t ? $"The HttpClient's timeout is {Format(t)}." : null;
+            var uris = waits.Select(w => w.Call.Uri).Distinct().ToList();
+            var request = uris.Count == 1 ? $"`{call.Method} {call.Uri}`" : $"`{call.Method}` requests to {Authority(call.Uri)} (for example `{call.Method} {call.Uri}`)";
+            var one = waits.Count == 1;
             yield return new Finding
             {
                 Id = "http-wait",
                 Severity = call.InfiniteTimeout || call.Timeout > TimeSpan.FromMinutes(5) ? Severity.Warning : Severity.Info,
                 Title = "Waiting for an HTTP response",
-                Summary = $"{thread.Label} is blocked in {FrameClassifier.DescribeTaskWait(thread.Frames)} at {Describe.Spot(site)}, waiting for `{call.Method} {call.Uri}`: " +
-                          "the request was sent and the server hasn't answered." + (timeout is null ? "" : $" {timeout}"),
+                Summary = $"{Describe.Many(waits.Select(w => w.Thread).ToList())} {(one ? "is" : "are")} blocked in {FrameClassifier.DescribeTaskWait(thread.Frames)} at {Describe.Spot(site)}, waiting for {request}: " +
+                          (uris.Count == 1 && one ? "the request was sent and the server hasn't answered." : "the requests were sent and the server hasn't answered.") + (timeout is null ? "" : $" {timeout}"),
                 Details = chain.Any(Describe.IsAppAsyncMethod) ? [$"Async path: {AppPath(chain)}, which is reading the response from the server."] : [],
                 Advice = (call.InfiniteTimeout ? "Give the HttpClient a timeout (or pass a CancellationToken with one) so a server that never answers fails the call instead of hanging it. " : "") +
                          $"Await the call instead of {FrameClassifier.DescribeTaskWait(thread.Frames)} so a slow server doesn't hold a thread.",
-                ThreadIds = [thread.ManagedId],
+                ThreadIds = waits.Select(w => w.Thread.ManagedId).ToList(),
                 Location = site?.Source,
             };
         }
     }
+
+    /// The same wait: the same call at the same line, through the same async path, for the same kind of request
+    /// to the same server with the same timeout.
+    private static string ResponseWaitKey((ThreadSnapshot Thread, List<TaskInfo> Chain, HttpCall Call) w) =>
+        string.Join("\u0002", FrameClassifier.DescribeTaskWait(w.Thread.Frames), Describe.Spot(FrameClassifier.BestUserFrame(w.Thread.Frames)),
+            FrameClassifier.BestUserFrame(w.Thread.Frames)?.FullName ?? "", string.Join(", ", w.Chain.Where(Describe.IsAppAsyncMethod).Select(Describe.Task)),
+            w.Call.Method, Authority(w.Call.Uri), w.Call.Timeout?.ToString() ?? "", w.Call.InfiniteTimeout.ToString());
+
+    /// "http://127.0.0.1:23117" for "http://127.0.0.1:23117/quote/9".
+    private static string Authority(string uri) =>
+        Uri.TryCreate(uri, UriKind.Absolute, out var u) ? u.GetLeftPart(UriPartial.Authority) : uri;
 
     /// Requests queued in a pool that isn't at its limit: each waits for a connection that is still being
     /// established (TCP connect, TLS handshake, proxy), not for one to be returned.
@@ -94,9 +111,9 @@ public sealed class HttpDetector : IDetector
         var first = group[0];
         var site = FrameClassifier.BestUserFrame(first.Thread.Frames);
         var one = group.Count == 1;
-        var details = group.Select(w => $"{w.Thread.Label} is blocked in {FrameClassifier.DescribeTaskWait(w.Thread.Frames)} at {Describe.Where(FrameClassifier.BestUserFrame(w.Thread.Frames))}, " +
-                                        $"waiting for {AppPath(w.Chain)}, which is waiting for a connection to {pool.Server} to be established.").ToList();
-        var limit = pool.MaxConnections == int.MaxValue ? "has no connection limit (MaxConnectionsPerServer isn't set)" : $"allows {pool.MaxConnections} connections (MaxConnectionsPerServer)";
+        var details = SameWait.Lines(group, w => w.Thread, (w, who) => $"{who.Who} {who.Is} blocked in {FrameClassifier.DescribeTaskWait(w.Thread.Frames)} at {Describe.Where(FrameClassifier.BestUserFrame(w.Thread.Frames))}, " +
+                                                                       $"waiting for {AppPath(w.Chain)}, which is waiting for a connection to {pool.Server} to be established.");
+        var limit = pool.MaxConnections == int.MaxValue ? "has no connection limit (MaxConnectionsPerServer isn't set)" : $"allows {Describe.Plural(pool.MaxConnections, "connection")} (MaxConnectionsPerServer)";
         var connections = pool.PendingConnections is not { } p ? $"it has {Describe.Plural(pool.OpenConnections, "connection")} open"
             : p == pool.OpenConnections ? (p == 1 ? "its only connection is still being established" : $"all {p} of its connections are still being established")
             : $"it has {Describe.Plural(pool.OpenConnections, "connection")}, {p} of them still being established";
@@ -108,7 +125,7 @@ public sealed class HttpDetector : IDetector
             Id = "http-connect",
             Severity = Severity.Warning,
             Title = one ? "HTTP call waiting for a connection to be established" : "HTTP calls waiting for a connection to be established",
-            Summary = $"{Describe.JoinAnd(group.Select(w => w.Thread.Label))} {(one ? "is" : "are")} waiting for a new connection to {pool.Server} to be established. " +
+            Summary = $"{Describe.Labels(group.Select(w => w.Thread))} {(one ? "is" : "are")} waiting for a new connection to {pool.Server} to be established. " +
                       (full ? "Every connection the pool has is still connecting" : "The pool isn't at its limit") +
                       ", so this isn't a wait for a free connection: the connect itself (TCP connect, TLS handshake or proxy) hasn't finished." +
                       (site?.Source is null ? "" : $" Start at {site.Source}."),
@@ -133,8 +150,9 @@ public sealed class HttpDetector : IDetector
         return app.Count == 0 ? request : $"{string.Join(", which awaits ", app)}, which awaits {request}";
     }
 
+    /// "100 seconds" for HttpClient's default, minutes from two minutes on.
     private static string Format(TimeSpan t) =>
-        t.TotalMinutes >= 1 ? $"{Describe.Number(t.TotalMinutes)} minutes" : $"{Describe.Number(t.TotalSeconds)} seconds";
+        t.TotalSeconds >= 120 ? $"{Describe.Number(t.TotalMinutes)} minutes" : $"{Describe.Number(t.TotalSeconds)} seconds";
 }
 
 /// A parent waiting for a child process to exit while the child's redirected output is unread: the

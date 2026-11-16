@@ -132,7 +132,7 @@ public class TaskDescriptionEndToEndTests
 
         Assert.Equal("Waiting for a task nobody completes", f.Title);
         Assert.Equal(Severity.Warning, f.Severity);
-        Assert.Equal("Thread N is blocked in .Wait() at TaskShapeScenarios.cs:62, waiting for Task.WhenAny(...), which waits for a TaskCompletionSource task that nothing has completed yet.", Stable(f.Summary));
+        Assert.Equal("Thread N is blocked in .Wait() at TaskShapeScenarios.cs:62, waiting for Task.WhenAny(...), which waits for the first of its 2 tasks: a TaskCompletionSource task that nothing has completed yet.", Stable(f.Summary));
     }
 
     [Fact]

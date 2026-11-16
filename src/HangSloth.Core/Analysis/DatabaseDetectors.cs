@@ -13,17 +13,19 @@ internal static partial class Db
     public static string Session(int? id) => id is null ? "" : $" (session {id})";
 
     /// "is waiting in Refund (X.cs:22) for PostgreSQL to answer `UPDATE ...`", including the async case.
-    public static string WaitPhrase(ThreadSnapshot t)
+    /// <param name="several">For a sentence about several threads in the same wait: "are", and no session, since each has its own.</param>
+    public static string WaitPhrase(ThreadSnapshot t, bool several = false)
     {
+        var be = several ? "are" : "is";
         var db = t.Database!;
-        var answer = $"for {db.Provider} to answer {Describe.Sql(db.CommandText)}{Session(db.SessionId)}";
+        var answer = $"for {db.Provider} to answer {Describe.Sql(db.CommandText)}{(several ? "" : Session(db.SessionId))}";
         if (t.BlockedOnTask is { } task)
         {
             var mine = Describe.Chain(task).LastOrDefault(Describe.IsAppAsyncMethod);
             var via = mine is null ? "" : $" on {Describe.Task(mine)}";
-            return $"is blocked in {FrameClassifier.DescribeTaskWait(t.Frames)} at {Describe.Spot(FrameClassifier.BestUserFrame(t.Frames))}{via}, waiting {answer}";
+            return $"{be} blocked in {FrameClassifier.DescribeTaskWait(t.Frames)} at {Describe.Spot(FrameClassifier.BestUserFrame(t.Frames))}{via}, waiting {answer}";
         }
-        return $"is waiting in {Describe.Where(FrameClassifier.BestUserFrame(t.Frames))} {answer}";
+        return $"{be} waiting in {Describe.Where(FrameClassifier.BestUserFrame(t.Frames))} {answer}";
     }
 
     /// The table a DDL statement needs an exclusive lock on: ALTER TABLE, DROP TABLE, TRUNCATE, CREATE INDEX ... ON, LOCK TABLE, VACUUM FULL.
@@ -250,7 +252,7 @@ public sealed class ConnectionPoolDetector : IDetector
             .Select(g => $"Waiting for a connection in {g.Key}" + (g.Count() > 1 ? $" ({g.Count()} threads)." : $" ({g.First().Label})."))
             .ToList();
         if (holdAndWait.Count > 0)
-            details.Add($"{Describe.JoinAnd(holdAndWait.Select(t => t.Label))} {(holdAndWait.Count == 1 ? "already holds" : "each already hold")} an open connection while waiting for another one.");
+            details.Add($"{Describe.Labels(holdAndWait)} {(holdAndWait.Count == 1 ? "already holds" : "each already hold")} an open connection while waiting for another one.");
         if (holdAndWait.Count > 0 && full && !accountedFor)
             details.Add($"Only {heldByWaiters} of the {pool!.OpenConnections} connections in use {(heldByWaiters == 1 ? "is" : "are")} held on a thread's stack. " +
                         "The others are held by code that isn't on any stack: async methods, objects that keep a connection, or connections that were never disposed.");
@@ -277,6 +279,9 @@ public sealed class ConnectionPoolDetector : IDetector
                       : "")
                 : "Find what the connection holders are waiting for and keep connections open only for the database work itself.",
             ThreadIds = waiters.Concat(holding).Distinct().Select(t => t.ManagedId).ToList(),
+            // The holders are named for what they do with their connection; what blocks them (an idle transaction) is the
+            // database wait's finding.
+            ExplainedThreadIds = waiters.Select(t => t.ManagedId).ToList(),
             Location = site?.Source,
         };
     }
@@ -406,7 +411,10 @@ public sealed class DatabaseWaitDetector : IDetector
         var idleTx = snapshot.Threads.Where(t => !Db.WaitingForQuery(t) && Db.InTransaction(t) && t.Database!.Provider == provider).ToList();
         var inTx = waiting.Where(Db.InTransaction).ToList();
         var site = FrameClassifier.BestUserFrame(waiting[0].Frames);
-        var details = waiting.Select(t => $"{t.Label} {Db.WaitPhrase(t)}" + (Db.InTransaction(t) ? ", inside an open transaction." : ".")).ToList();
+        // One line for each statement and call site (one request per pool thread in a web app), not one per thread.
+        var details = SameWait.Lines(waiting, t => t,
+            t => $"{Db.WaitPhrase(t, several: true)}\u0002{Db.InTransaction(t)}",
+            (t, who) => $"{who.Who} {Db.WaitPhrase(t, several: who.Plural)}" + (Db.InTransaction(t) ? (who.Plural ? ", each inside an open transaction." : ", inside an open transaction.") : "."));
         var sessions = waiting.Select(t => t.Database!.SessionId).Concat(idleTx.Select(Db.TransactionSession)).Concat(inTx.Select(Db.TransactionSession));
 
         // DDL waiting for a table lock: everything that arrives after it on that table queues behind it.
@@ -427,7 +435,7 @@ public sealed class DatabaseWaitDetector : IDetector
             var lockDetails = new List<string> { $"{ddl.Label} {Db.WaitPhrase(ddl)}. It needs an exclusive lock on {table}, so it waits for every statement that is already using the table." };
             lockDetails.AddRange(holderDetails);
             if (queued.Count > 0)
-                lockDetails.Add($"{Describe.JoinAnd(queued.Select(t => t.Label))} {(queued.Count == 1 ? "is" : "are")} waiting to run {Describe.Sql(queued[0].Database!.CommandText)}{(queued.Select(t => t.Database!.CommandText).Distinct().Count() > 1 ? " and other queries" : "")} on {table}: " +
+                lockDetails.Add($"{Describe.Labels(queued)} {(queued.Count == 1 ? "is" : "are")} waiting to run {Describe.Sql(queued[0].Database!.CommandText)}{(queued.Select(t => t.Database!.CommandText).Distinct().Count() > 1 ? " and other queries" : "")} on {table}: " +
                                 $"even a plain SELECT queues behind a waiting {Db.Verb(ddl.Database!.CommandText)}, so the table is frozen for everyone.");
             if (Db.ConfirmOnServer(provider, sessions.Concat(holders.SelectMany(h => h.Database!.Connections.Select(c => c.SessionId)))) is { } confirmQueue) lockDetails.Add(confirmQueue);
             var holder = holders.FirstOrDefault();
@@ -528,7 +536,7 @@ public sealed class DatabaseWaitDetector : IDetector
                 Id = "database-wait",
                 Severity = Severity.Warning,
                 Title = "Possible database deadlock",
-                Summary = $"{Describe.JoinAnd(inTx.Select(t => t.Label))} are {(inTx.Count == 2 ? "both" : "all")} waiting for {provider}, each inside its own open transaction. " +
+                Summary = $"{Describe.Labels(inTx)} are {(inTx.Count == 2 ? "both" : "all")} waiting for {provider}, each inside its own open transaction. " +
                           $"If each has locked rows {(inTx.Count == 2 ? "the other" : "another one")} needs, for example by updating the same rows in a different order, this is a database deadlock.",
                 Details = details,
                 Advice = "Touch rows in one consistent order in every transaction (for example, update accounts sorted by id), keep transactions short, " +

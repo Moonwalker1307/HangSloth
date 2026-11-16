@@ -109,7 +109,7 @@ public class TaskChainEndToEndTests
         var f = BlockedOnTask("when-any");
         Assert.Equal(NobodyCompletes, f.Title);
         Assert.Matches(@"^Thread \d+ is blocked in \.Wait\(\) at TaskChainScenarios\.cs:147, waiting for Task\.WhenAny\(\.\.\.\), " +
-                       @"which waits for a TaskCompletionSource task that nothing has completed yet\.$", f.Summary);
+                       @"which waits for the first of its 3 tasks: a TaskCompletionSource task that nothing has completed yet\.$", f.Summary);
     }
 
     [Fact]
