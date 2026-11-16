@@ -11,5 +11,7 @@
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.1.2" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
+    <!-- xunit's own AsyncTestSyncContext, for the test-blocks-on-async control (the version the tests use). -->
+    <PackageReference Include="xunit.extensibility.execution" Version="2.9.3" />
   </ItemGroup>
 </Project>

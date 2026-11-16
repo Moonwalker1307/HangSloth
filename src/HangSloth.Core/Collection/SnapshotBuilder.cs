@@ -18,6 +18,8 @@ public sealed partial class SnapshotBuilder
     private const int MaxContextSearchDepth = 8;
 
     // Task.m_stateFlags bits (see System.Threading.Tasks.Task).
+    private const int TaskStateStarted = 0x10000;
+    private const int TaskStateDelegateInvoked = 0x20000;
     private const int TaskStateFaulted = 0x200000;
     private const int TaskStateCanceled = 0x400000;
     private const int TaskStateRanToCompletion = 0x1000000;
@@ -89,6 +91,8 @@ public sealed partial class SnapshotBuilder
             switch (kind)
             {
                 case BlockingKind.TaskWait:
+                // host.Run() waits for the host's RunAsync task too: a host that never finishes starting looks idle otherwise.
+                case BlockingKind.Idle when FrameClassifier.FrameworkPrefix(snapshot.Frames).Any(FrameClassifier.IsHostRunFrame):
                     var task = FindBlockedOnTask(roots);
                     result = result with { BlockedOnTask = task };
                     if (task is not null && DatabaseCommandInChain(task) is { } command)
@@ -409,6 +413,8 @@ public sealed partial class SnapshotBuilder
             return info with { Kind = TaskKind.Delay, Description = "Task.Delay(...)" };
         if (typeName.Contains("WhenAllPromise", StringComparison.Ordinal))
             return info with { Kind = TaskKind.WhenAll, Description = "Task.WhenAll(...)" };
+        if (typeName.StartsWith("System.Threading.Tasks.Task+TwoTaskWhenAnyPromise<", StringComparison.Ordinal))
+            return DescribeWhenAny(task, info, depth, visited);
         if (typeName.Contains("WhenAnyPromise", StringComparison.Ordinal))
             return info with { Kind = TaskKind.WhenAny, Description = "Task.WhenAny(...)" };
         if (typeName.StartsWith("System.Threading.Tasks.Continuation", StringComparison.Ordinal))
@@ -421,7 +427,8 @@ public sealed partial class SnapshotBuilder
             var description = target?.Type?.Name?.StartsWith("System.Threading.Tasks.TaskReplicator", StringComparison.Ordinal) == true
                 ? "a Parallel.For/ForEach worker"
                 : $"Task.Run({name})";
-            return info with { Kind = TaskKind.Delegate, Description = description };
+            var kind = DelegateTaskKind(task.ReadInt("m_stateFlags"));
+            return info with { Kind = kind, Description = kind == TaskKind.NotStarted ? $"new Task({name})" : description };
         }
 
         if (!IsPlainTask(typeName))

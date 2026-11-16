@@ -31,9 +31,19 @@ switch (mode)
     case "parked-pool": ParkedPoolScenario.Run(); break;
     case "pool-lock-convoy": PoolLockConvoyScenario.Run(); break;
     case "pool-backlog": PoolBacklogScenario.Run(); break;
+    case "never-started": NeverStartedTaskScenario.Run(); break;
+    case "queued-task": QueuedTaskScenario.Run(); break;
+    case "when-any-two": TwoTaskWhenAnyScenario.Run(); break;
+    case "when-any-two-timeout": TwoTaskWhenAnyTimeoutScenario.Run(); break;
+    case "host-start-stuck": GenericHostScenario.Run(stuckStart: true); break;
+    case "host-running": GenericHostScenario.Run(stuckStart: false); break;
+    // These await, which makes this file the app's async Main.
+    case "async-main-shutdown": await AsyncMainShutdownScenario.WaitForShutdown(); break;
+    case "async-main-import": await AsyncMainImportScenario.RunAsync(); break;
+    case "host-start-stuck-async": await GenericHostScenario.RunAsync(stuckStart: true); break;
 
     default:
-        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|tiered-starvation|never-completes|healthy|lock-type-deadlock|sync-io-starvation|task-run-async|task-run-async-result|wait-async|unwrap|continue-with|lock-task-run-async|lock-task-run-async-start|semaphore-token|when-any|when-any-timeout|wait-any-timeout|task-run-returns-task|resumed-monitor-wait|parked-pool|pool-lock-convoy|pool-backlog>");
+        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|tiered-starvation|never-completes|healthy|lock-type-deadlock|sync-io-starvation|task-run-async|task-run-async-result|wait-async|unwrap|continue-with|lock-task-run-async|lock-task-run-async-start|semaphore-token|when-any|when-any-timeout|wait-any-timeout|task-run-returns-task|resumed-monitor-wait|parked-pool|pool-lock-convoy|pool-backlog|never-started|queued-task|when-any-two|when-any-two-timeout|async-main-shutdown|async-main-import|host-start-stuck|host-start-stuck-async|host-running>");
         Environment.Exit(2);
         break;
 }

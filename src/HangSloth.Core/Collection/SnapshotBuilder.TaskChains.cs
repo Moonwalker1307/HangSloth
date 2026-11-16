@@ -27,6 +27,14 @@ public sealed partial class SnapshotBuilder
         return false;
     }
 
+    /// A delegate task from its m_stateFlags: created with new Task(...) and never started, started but still waiting
+    /// in its scheduler's queue for a thread, or running. Unreadable flags say nothing, so the task counts as running.
+    internal static TaskKind DelegateTaskKind(int? stateFlags) =>
+        stateFlags is not { } flags ? TaskKind.Delegate
+        : (flags & TaskStateStarted) == 0 ? TaskKind.NotStarted
+        : (flags & TaskStateDelegateInvoked) == 0 ? TaskKind.Queued
+        : TaskKind.Delegate;
+
     /// A ContinueWith task starts when its antecedent finishes, and points at it until then.
     private TaskInfo DescribeContinuation(ClrObject task, TaskInfo info, int depth, HashSet<ulong> visited)
     {
@@ -70,12 +78,12 @@ public sealed partial class SnapshotBuilder
 
     private const int MaxWhenAnyTasks = 64;
 
-    /// Task.WhenAny of more than two tasks, and Task.WaitAny. It finishes as soon as one of its tasks does, so it is
-    /// stuck only when every one of them ends in a TaskCompletionSource nobody completes; only then is it followed.
+    /// Task.WhenAny and Task.WaitAny. It finishes as soon as one of its tasks does, so it is stuck only when every
+    /// one of them ends in a TaskCompletionSource nobody completes; only then is it followed.
     private TaskInfo DescribeWhenAny(ClrObject task, TaskInfo info, int depth, HashSet<ulong> visited)
     {
         var count = 0;
-        var tasks = task.TryReadObjectField("_tasks", out var list) && !list.IsNull ? ReadTaskList(list, out count) : [];
+        var tasks = task.TryReadObjectField("_tasks", out var list) && !list.IsNull ? ReadTaskList(list, out count) : ReadTwoTasks(task, out count);
         // Task.WaitAny blocks on the same promise, marked as a synchronous wait; the thread's own call already names it.
         var waitAny = ((task.ReadInt("_stateFlags") ?? 0) & 2) != 0;
         info = info with { Kind = TaskKind.WhenAny, Description = waitAny && count > 0 ? $"one of its {count} tasks" : "Task.WhenAny(...)" };
@@ -92,6 +100,18 @@ public sealed partial class SnapshotBuilder
         }
         // The first task stands for all of them; for Task.WaitAny, it is what the thread waits for.
         return waitAny ? first! : info with { Kind = TaskKind.Wrapper, Awaiting = first };
+    }
+
+    /// Task.WhenAny of exactly two tasks keeps them in two fields of its own instead of a list.
+    private static List<ClrObject> ReadTwoTasks(ClrObject promise, out int count)
+    {
+        var result = new List<ClrObject>();
+        foreach (var field in new[] { "_task1", "_task2" })
+            if (promise.TryReadObjectField(field, out var t) && !t.IsNull) result.Add(t);
+        // It clears both when the first of them finishes, so a promise with only one left is not waiting any more.
+        if (result.Count != 2) result.Clear();
+        count = result.Count;
+        return result;
     }
 
     /// The tasks of a Task[] or a List&lt;Task&gt;: the first few, and how many there are.

@@ -33,6 +33,9 @@ internal static class Describe
         return kind switch
         {
             BlockingKind.Sleep => $"sleeping (Thread.Sleep) in {at}",
+            BlockingKind.TaskWait when IsAsyncMainWait(thread.Frames) => thread.BlockedOnTask?.AwaitLocation is { } paused
+                ? $"waiting for the app's async Main, which is paused at {paused}"
+                : "waiting for the app's async Main to finish",
             BlockingKind.TaskWait => $"blocked on {FrameClassifier.DescribeTaskWait(thread.Frames)} in {at}",
             BlockingKind.MonitorEnter => $"itself waiting for another lock in {at}",
             BlockingKind.MonitorWait when FrameClassifier.FrameworkPrefix(thread.Frames).Any(f => f.TypeName == "System.Threading.ManualResetEventSlim")
@@ -138,6 +141,11 @@ internal static class Describe
         return at >= 0 && !FrameClassifier.IsFrameworkType(task.TypeName[(at + marker.Length)..]);
     }
 
+    /// The entry point the compiler writes for async Main and top-level await: "&lt;Main&gt;" calls the app's Main and
+    /// blocks on its task with GetAwaiter().GetResult() for as long as the app runs. The app didn't write that wait.
+    public static bool IsAsyncMainWait(IReadOnlyList<StackFrameInfo> frames) =>
+        FrameClassifier.FirstUserFrame(frames) is { MethodName: "<Main>" };
+
     /// How one link of a task chain leads to the next: an async method awaits it, a ContinueWith task runs
     /// after it, and a wrapper (Task.Run(async ...), WaitAsync) only waits for it.
     public static string Link(TaskInfo from) => from.Kind switch
@@ -153,7 +161,7 @@ internal static class Describe
         // Task.Run(async ...) whose lambda hasn't reached its first await yet: the lambda is still running as
         // the Task.Run task behind the wrapper, so naming both would say "Task.Run" twice.
         var chain = Chain(task)
-            .Where(t => !(t.Kind == TaskKind.Wrapper && t.Awaiting?.Kind == TaskKind.Delegate && t.Description.StartsWith("Task.Run(", StringComparison.Ordinal)))
+            .Where(t => !(t.Kind == TaskKind.Wrapper && t.Awaiting?.Kind is TaskKind.Delegate or TaskKind.Queued && t.Description.StartsWith("Task.Run(", StringComparison.Ordinal)))
             .ToList();
         // SemaphoreSlim.WaitAsync with a timeout or a token waits through an async method of its own and a
         // WaitAsync(...) wrapper. The code that called WaitAsync is the link before those, as with a plain WaitAsync().
