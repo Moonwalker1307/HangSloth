@@ -47,7 +47,60 @@ internal static partial class Db
         _ => level ?? "an unknown isolation level",
     };
 
-    public static string Verb(string? sql) => sql?.TrimStart().Split(' ', 2)[0].ToUpperInvariant() ?? "statement";
+    /// The statement's first keyword, whatever whitespace follows it ("ALTER\nTABLE ..." is an ALTER).
+    public static string Verb(string? sql) =>
+        sql?.Split((char[]?)null, 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.ToUpperInvariant() ?? "statement";
+
+    /// Inside the pool's Get, the driver is opening a new physical connection (network connect, TLS, login)
+    /// rather than waiting in the pool's queue for a free one.
+    public static bool IsConnecting(ThreadSnapshot t) => FrameClassifier.FrameworkPrefix(t.Frames).Any(IsConnectFrame);
+
+    /// Npgsql: PoolingDataSource.OpenNewConnector (then NpgsqlConnector.Open, SetupEncryption, Authenticate).
+    /// SqlClient: the pool creating a connection (UserCreateRequest, CreateObject), the internal connection's
+    /// login (SqlConnectionInternal, SqlInternalConnectionTds before 7.0) and TdsParser.Connect.
+    /// MySqlConnector: ConnectionPool.ConnectSessionAsync and ServerSession.ConnectAsync.
+    public static bool IsConnectFrame(StackFrameInfo f)
+    {
+        var type = f.TypeName;
+        if (type.StartsWith("Npgsql.", StringComparison.Ordinal)) return Named(f, "OpenNewConnector");
+        if (type.StartsWith("Microsoft.Data.SqlClient.", StringComparison.Ordinal) || type.StartsWith("System.Data.SqlClient.", StringComparison.Ordinal)
+            || type.StartsWith("Microsoft.Data.ProviderBase.", StringComparison.Ordinal))
+        {
+            var outer = type.IndexOf('+') is var plus and >= 0 ? type[..plus] : type;
+            return (outer.Contains("ConnectionPool", StringComparison.Ordinal) && (Named(f, "UserCreateRequest") || Named(f, "CreateObject")))
+                   || outer.EndsWith(".SqlConnectionInternal", StringComparison.Ordinal) || outer.EndsWith(".SqlInternalConnectionTds", StringComparison.Ordinal)
+                   || (outer.EndsWith(".TdsParser", StringComparison.Ordinal) && Named(f, "Connect"));
+        }
+        if (type.StartsWith("MySqlConnector.", StringComparison.Ordinal))
+            return Named(f, "ConnectSessionAsync") || (type.StartsWith("MySqlConnector.Core.ServerSession", StringComparison.Ordinal) && Named(f, "ConnectAsync"));
+        return false;
+    }
+
+    /// The method itself, or the state machine of an async method of that name ("X+&lt;ConnectAsync&gt;d__12.MoveNext").
+    private static bool Named(StackFrameInfo f, string method) =>
+        f.MethodName.Contains(method, StringComparison.Ordinal) || f.TypeName.Contains($"<{method}>", StringComparison.Ordinal);
+
+    /// The connection string keyword for the connect timeout, when the provider is known.
+    public static string? ConnectTimeoutKeyword(string provider) => provider switch
+    {
+        "PostgreSQL" => "Timeout",
+        "SQL Server" => "Connect Timeout",
+        "MySQL" => "Connection Timeout",
+        _ => null,
+    };
+
+    /// A short lock timeout for a schema change, in the server's own syntax.
+    public static string DdlLockTimeout(string provider) => provider switch
+    {
+        "PostgreSQL" => "a short lock_timeout (SET lock_timeout = '2s')",
+        "SQL Server" => "a short lock_timeout (SET LOCK_TIMEOUT 2000)",
+        "MySQL" => "a short lock wait timeout (SET SESSION lock_wait_timeout = 2)",
+        _ => "a short lock timeout",
+    };
+
+    /// A thread in a transaction that is blocked on something else, not running code or reading rows.
+    public static bool IsIdle(ThreadSnapshot t) =>
+        t.Database?.Waiting != DatabaseWaitKind.ReadingRows && FrameClassifier.IsBlocked(FrameClassifier.Classify(t.Frames));
 
     /// Does the SQL name this table (as a whole word)?
     public static bool Mentions(string? sql, string table) =>
@@ -158,18 +211,38 @@ public sealed class ConnectionPoolDetector : IDetector
             yield break;
         }
 
-        var provider = waiters[0].Database!.Provider;
+        // Each driver has its own pools: explain each provider's waiters with that provider's pool and holders.
+        foreach (var group in waiters.GroupBy(t => t.Database!.Provider))
+            foreach (var f in Detect(snapshot, group.Key, group.ToList()))
+                yield return f;
+    }
+
+    private static IEnumerable<Finding> Detect(ProcessSnapshot snapshot, string provider, List<ThreadSnapshot> waiters)
+    {
+        var holding = snapshot.Threads.Where(t => t.Database is { Connections.Count: > 0 } d && d.Provider == provider).ToList();
+        var connecting = waiters.Where(Db.IsConnecting).ToList();
+        if (connecting.Count > 0)
+        {
+            // With no connection held by anyone, threads queued in the pool are waiting for the ones being opened.
+            var behind = holding.Count == 0 ? waiters.Except(connecting).ToList() : [];
+            yield return Connecting(provider, connecting, behind);
+            waiters = waiters.Except(connecting).Except(behind).ToList();
+            if (waiters.Count == 0) yield break;
+        }
+
         var pool = waiters.Select(t => t.Database!.Pool).FirstOrDefault(p => p is not null);
-        var holding = snapshot.Threads.Where(t => t.Database?.Connections.Count > 0).ToList();
         var holdAndWait = holding.Where(waiters.Contains).ToList();
-        var full = pool is null || pool.OpenConnections >= pool.MaxSize;
-        var deadlock = holdAndWait.Count > 0 && full && holding.All(waiters.Contains);
+        var full = pool is not null && pool.OpenConnections >= pool.MaxSize;
+        // Only the connections on some thread's stack are visible: "every connection" needs them to add up to the pool.
+        var heldByWaiters = holdAndWait.Sum(t => t.Database!.Connections.Count);
+        var accountedFor = pool is not null && heldByWaiters >= pool.OpenConnections;
+        var deadlock = holdAndWait.Count > 0 && full && holding.All(waiters.Contains) && accountedFor;
 
         var poolText = pool is null ? "" : $" ({pool.OpenConnections} of {pool.MaxSize} connections in use, {pool.IdleConnections} idle)";
         var who = waiters.Count == 1 ? $"{waiters[0].Label} is" : $"{waiters.Count} threads are";
         var summary = deadlock
             ? $"Connection pool deadlock: {who} waiting for a free {provider} connection and the pool is full{poolText}. " +
-              $"Every connection is held by {(holdAndWait.Count == 1 ? "a thread that is" : "threads that are")} themselves waiting for another connection, so none is ever returned."
+              $"Every connection is held by {(holdAndWait.Count == 1 ? "a thread that is itself" : "threads that are themselves")} waiting for another connection, so none is ever returned."
             : $"{who} waiting for a free {provider} connection{(full ? $" and the pool is full{poolText}" : poolText)}.";
 
         var details = waiters
@@ -178,6 +251,12 @@ public sealed class ConnectionPoolDetector : IDetector
             .ToList();
         if (holdAndWait.Count > 0)
             details.Add($"{Describe.JoinAnd(holdAndWait.Select(t => t.Label))} {(holdAndWait.Count == 1 ? "already holds" : "each already hold")} an open connection while waiting for another one.");
+        if (holdAndWait.Count > 0 && full && !accountedFor)
+            details.Add($"Only {heldByWaiters} of the {pool!.OpenConnections} connections in use {(heldByWaiters == 1 ? "is" : "are")} held on a thread's stack. " +
+                        "The others are held by code that isn't on any stack: async methods, objects that keep a connection, or connections that were never disposed.");
+        if (holdAndWait.Count > 0 && pool is null)
+            details.Add($"The dump doesn't show how many connections the {provider} pool allows or has in use, so it can't tell whether every connection is held this way. " +
+                        "If Max Pool Size is no bigger than the number of threads doing this, none of them can ever continue.");
         foreach (var h in holding.Except(waiters).Take(5))
             details.Add($"{h.Label} holds a connection and is {Describe.Activity(h, withMethod: true)}.");
 
@@ -198,6 +277,55 @@ public sealed class ConnectionPoolDetector : IDetector
                       : "")
                 : "Find what the connection holders are waiting for and keep connections open only for the database work itself.",
             ThreadIds = waiters.Concat(holding).Distinct().Select(t => t.ManagedId).ToList(),
+            Location = site?.Source,
+        };
+    }
+
+    /// Threads inside the pool's Get that are opening a new connection: the server (or the network) hasn't
+    /// finished the connect, TLS handshake or login. The pool isn't what they wait for.
+    private static Finding Connecting(string provider, List<ThreadSnapshot> connecting, List<ThreadSnapshot> behind)
+    {
+        var databases = connecting.Concat(behind).Select(t => t.Database!).ToList();
+        var pool = databases.Select(d => d.Pool).FirstOrDefault(p => p is not null);
+        var dataSource = databases.Select(d => d.DataSource).FirstOrDefault(s => s is not null);
+        var timeout = databases.Select(d => d.ConnectTimeout).FirstOrDefault(t => t is not null);
+        var keyword = Db.ConnectTimeoutKeyword(provider) ?? "Timeout";
+        var one = connecting.Count == 1;
+        var who = one ? $"{connecting[0].Label} is" : $"{connecting.Count} threads are";
+
+        var summary = $"{who} still connecting to {provider}{(dataSource is null ? "" : $" at {dataSource}")}: the network connect, TLS handshake or login hasn't finished. " +
+                      $"{(one ? "It isn't" : "They aren't")} waiting for a free connection from the pool" +
+                      (pool is null ? "" : $" ({pool.OpenConnections} of {pool.MaxSize} connections in use, counting {(one ? "the one" : "the ones")} being opened)") + ".";
+        if (behind.Count > 0)
+            summary += $" {(behind.Count == 1 ? $"{behind[0].Label} is" : $"{behind.Count} other threads are")} queued in the pool behind {(one ? "it" : "them")}" +
+                       (pool is not null && pool.OpenConnections >= pool.MaxSize ? ": the pool is full, but only with connections that are still being opened." : ".");
+
+        var details = connecting
+            .GroupBy(t => Describe.WhereWithCaller(t.Frames))
+            .Select(g => $"Opening a new connection in {g.Key}" + (g.Count() > 1 ? $" ({g.Count()} threads)." : $" ({g.First().Label})."))
+            .ToList();
+        details.AddRange(behind
+            .GroupBy(t => Describe.WhereWithCaller(t.Frames))
+            .Select(g => $"Waiting for a free connection in {g.Key}" + (g.Count() > 1 ? $" ({g.Count()} threads)." : $" ({g.First().Label}).")));
+        if (timeout == 0)
+            details.Add($"The connection string turns the connect timeout off ({keyword}=0), so this wait never ends on its own.");
+        else if (timeout is { } seconds)
+            details.Add($"The connect timeout is {Describe.Plural(seconds, "second")} ({keyword}={seconds}), so the attempt fails with a timeout error after that.");
+
+        var site = FrameClassifier.BestUserFrame(connecting[0].Frames);
+        return new Finding
+        {
+            Id = "database-connect",
+            Severity = Severity.Warning,
+            Title = $"Waiting to connect to {provider}",
+            Summary = summary,
+            Details = details,
+            Advice = $"Check that the {provider} server{(dataSource is null ? "" : $" at {dataSource}")} is up and reachable from this machine: a server that is down or still starting, " +
+                     "a firewall or proxy that swallows the traffic, a wrong host or port, DNS. " +
+                     (timeout == 0
+                         ? $"Don't turn the connect timeout off: with {keyword} set to a few seconds, an unreachable server fails fast with an error instead of hanging."
+                         : $"Keep the connect timeout ({keyword} in the connection string) short, so an unreachable server fails fast with an error instead of hanging."),
+            ThreadIds = connecting.Concat(behind).Select(t => t.ManagedId).ToList(),
             Location = site?.Source,
         };
     }
@@ -267,10 +395,15 @@ public sealed class DatabaseWaitDetector : IDetector
     public IEnumerable<Finding> Detect(ProcessSnapshot snapshot, IReadOnlySet<int> claimed)
     {
         var waiting = snapshot.Threads.Where(t => Db.WaitingForQuery(t) && !claimed.Contains(t.ManagedId)).ToList();
-        if (waiting.Count == 0) yield break;
+        // Two servers in one process: a transaction on one can't block a query on the other, and each has its own sessions.
+        foreach (var group in waiting.GroupBy(t => t.Database!.Provider))
+            foreach (var f in Detect(snapshot, group.Key, group.ToList()))
+                yield return f;
+    }
 
-        var provider = waiting[0].Database!.Provider;
-        var idleTx = snapshot.Threads.Where(t => !Db.WaitingForQuery(t) && Db.InTransaction(t)).ToList();
+    private static IEnumerable<Finding> Detect(ProcessSnapshot snapshot, string provider, List<ThreadSnapshot> waiting)
+    {
+        var idleTx = snapshot.Threads.Where(t => !Db.WaitingForQuery(t) && Db.InTransaction(t) && t.Database!.Provider == provider).ToList();
         var inTx = waiting.Where(Db.InTransaction).ToList();
         var site = FrameClassifier.BestUserFrame(waiting[0].Frames);
         var details = waiting.Select(t => $"{t.Label} {Db.WaitPhrase(t)}" + (Db.InTransaction(t) ? ", inside an open transaction." : ".")).ToList();
@@ -282,7 +415,7 @@ public sealed class DatabaseWaitDetector : IDetector
             var table = Db.DdlTable(ddl.Database!.CommandText)!;
             var queued = waiting.Where(t => t != ddl && Db.Mentions(t.Database!.CommandText, table)).ToList();
             var holders = snapshot.Threads
-                .Where(t => t != ddl && !queued.Contains(t) && t.Database is { } d
+                .Where(t => t != ddl && !queued.Contains(t) && t.Database is { } d && d.Provider == provider
                             && (Db.Mentions(d.OpenQuery, table) || (d.Waiting == DatabaseWaitKind.ReadingRows && Db.Mentions(d.CommandText, table))
                                 || (Db.InTransaction(t) && d.StackCommands.Any(c => Db.Mentions(c, table)))))
                 .ToList();
@@ -295,19 +428,21 @@ public sealed class DatabaseWaitDetector : IDetector
             lockDetails.AddRange(holderDetails);
             if (queued.Count > 0)
                 lockDetails.Add($"{Describe.JoinAnd(queued.Select(t => t.Label))} {(queued.Count == 1 ? "is" : "are")} waiting to run {Describe.Sql(queued[0].Database!.CommandText)}{(queued.Select(t => t.Database!.CommandText).Distinct().Count() > 1 ? " and other queries" : "")} on {table}: " +
-                                "even a plain SELECT queues behind a waiting ALTER, so the table is frozen for everyone.");
+                                $"even a plain SELECT queues behind a waiting {Db.Verb(ddl.Database!.CommandText)}, so the table is frozen for everyone.");
             if (Db.ConfirmOnServer(provider, sessions.Concat(holders.SelectMany(h => h.Database!.Connections.Select(c => c.SessionId)))) is { } confirmQueue) lockDetails.Add(confirmQueue);
             var holder = holders.FirstOrDefault();
             yield return new Finding
             {
                 Id = "database-wait",
                 Severity = Severity.Warning,
-                Title = $"Lock queue on {table}: schema change waiting behind a running query",
+                Title = holder is not null ? $"Lock queue on {table}: schema change waiting behind a running query"
+                    : queued.Count > 0 ? $"Lock queue on {table}: schema change waiting for a table lock"
+                    : $"Schema change waiting for a lock on {table}",
                 Summary = $"{ddl.Label} is waiting to change {table} ({Describe.Sql(ddl.Database!.CommandText)}), which needs the whole table to itself" +
                           (holder is null ? "" : $", and {holder.Label} is still {(holder.Database!.Waiting == DatabaseWaitKind.ReadingRows ? "reading" : "using")} it") + "." +
                           (queued.Count > 0 ? $" {Describe.Plural(queued.Count, "query", "queries")} that came later {(queued.Count == 1 ? "is" : "are")} queued behind the {Db.Verb(ddl.Database.CommandText)}, so nothing can use {table} until the first statement finishes." : ""),
                 Details = lockDetails,
-                Advice = "Run schema changes with a short lock_timeout (SET lock_timeout = '2s') and retry, so a long-running query makes the migration fail fast instead of freezing the table. " +
+                Advice = $"Run schema changes with {Db.DdlLockTimeout(provider)} and retry, so a long-running query makes the migration fail fast instead of freezing the table. " +
                          "Don't keep a reader open while doing slow work per row: page through big results (keyset pagination), or copy what you need and close the reader first.",
                 ThreadIds = [ddl.ManagedId, .. queued.Select(t => t.ManagedId), .. holders.Select(t => t.ManagedId)],
                 Location = FrameClassifier.BestUserFrame((holder ?? ddl).Frames)?.Source ?? site?.Source,
@@ -319,14 +454,18 @@ public sealed class DatabaseWaitDetector : IDetector
         {
             foreach (var t in idleTx)
             {
-                details.Add($"{t.Label} has an open transaction{Db.Session(Db.TransactionSession(t))} but isn't talking to the database: it is {Describe.Activity(t, withMethod: true)}. " +
+                details.Add($"{t.Label} has an open transaction{Db.Session(Db.TransactionSession(t))}" +
+                            (Db.IsIdle(t) ? " but isn't talking to the database: it is " : " and is ") + $"{Describe.Activity(t, withMethod: true)}. " +
                             "Every row that transaction has changed stays locked until it commits or rolls back.");
                 if (t.Database!.StackCommands.Count > 0)
                     details.Add($"Commands still on {t.Label}'s stack: {Describe.JoinAnd(t.Database.StackCommands.Take(3).Select(Describe.Sql))}.");
             }
             var forUpdate = idleTx.SelectMany(t => t.Database!.StackCommands).FirstOrDefault(Db.LocksRows);
             if (Db.ConfirmOnServer(provider, sessions) is { } confirm) details.Add(confirm);
-            var blocker = idleTx[0];
+            // The likely blocker is a transaction that waits for something else; one that is busy will soon move on.
+            var blocker = idleTx.FirstOrDefault(Db.IsIdle) ?? idleTx[0];
+            var idle = Db.IsIdle(blocker);
+            var openTx = idle ? "an idle transaction" : "an open transaction";
             // In PostgreSQL (and with snapshot isolation elsewhere) a plain read never waits for a row lock;
             // if only reads are stuck, the transaction holds a table lock, typically from DDL.
             var sqlServer = provider == "SQL Server";
@@ -341,11 +480,12 @@ public sealed class DatabaseWaitDetector : IDetector
                 Id = "database-wait",
                 Severity = Severity.Warning,
                 Title = escalation ? "Database writes blocked by a big read holding its locks (lock escalation)"
-                    : tableLock ? "Database reads blocked by a table lock in an idle transaction"
+                    : tableLock ? $"Database reads blocked by a table lock in {openTx}"
                     : forUpdate is not null ? "Database query blocked by rows locked with SELECT ... FOR UPDATE"
-                    : "Database query blocked by an idle transaction",
-                Summary = $"{(waiting.Count == 1 ? $"{waiting[0].Label} is" : $"{waiting.Count} threads are")} waiting for {provider}, while {blocker.Label} keeps a transaction open and waits for something else " +
-                          $"in {Describe.Spot(FrameClassifier.BestUserFrame(blocker.Frames))}. " +
+                    : $"Database query blocked by {openTx}",
+                Summary = $"{(waiting.Count == 1 ? $"{waiting[0].Label} is" : $"{waiting.Count} threads are")} waiting for {provider}, while {blocker.Label} keeps a transaction open and " +
+                          (idle ? "waits for something else" : blocker.Database!.Waiting == DatabaseWaitKind.ReadingRows ? "reads the rows of another query" : "runs code") +
+                          $" in {Describe.Spot(FrameClassifier.BestUserFrame(blocker.Frames))}. " +
                           (escalation
                               ? $"That transaction runs under {Db.IsolationName(blocker.Database!.Isolation)} and read rows with {Describe.Sql(blocker.Database.StackCommands.First(Db.IsPlainSelect))}. " +
                                 "SQL Server keeps shared locks on everything it read until the transaction ends, and once a statement holds more than about 5,000 row locks it escalates them to one lock on the whole table, " +
@@ -405,7 +545,7 @@ public sealed class DatabaseWaitDetector : IDetector
             // Session-level advisory locks belong to a connection, not a transaction: look for connections
             // that are open but idle, above all ones kept in a field.
             var holders = snapshot.Threads
-                .Where(t => !Db.WaitingForQuery(t) && t.Database?.Connections.Count > 0)
+                .Where(t => !Db.WaitingForQuery(t) && t.Database?.Connections.Count > 0 && t.Database!.Provider == provider)
                 .OrderByDescending(t => t.Database!.Connections.Any(c => c.Field is not null))
                 .ThenByDescending(RunsOwnerCode)
                 .DistinctBy(t => Held(t).SessionId ?? -t.ManagedId) // one thread per session: a kept connection is reachable from several

@@ -24,13 +24,25 @@ public sealed class HttpDetector : IDetector
         {
             var pool = group.First().Pool;
             var full = pool.OpenConnections >= pool.MaxConnections;
+            // The pool queues a request the same way while a new connection is being established for it. Below
+            // the limit (unless the dump shows none is being established), or with every connection still being
+            // established, nothing holds the connection it waits for.
+            if (!full && pool.PendingConnections is not 0 || pool.PendingConnections is { } pending && pending > 0 && pending >= pool.OpenConnections)
+            {
+                yield return Connecting(group.ToList(), pool, full);
+                continue;
+            }
             var holders = group.SelectMany(w => w.Chain.Where(c => c.HoldsHttpResponse)).Select(c => c.Description).Distinct().ToList();
             var nested = full && holders.Count > 0;
             var first = group.First();
             var site = FrameClassifier.BestUserFrame(first.Thread.Frames);
             var details = group.Select(w => $"{w.Thread.Label} is blocked in {FrameClassifier.DescribeTaskWait(w.Thread.Frames)} at {Describe.Where(FrameClassifier.BestUserFrame(w.Thread.Frames))}, " +
                                             $"waiting for {AppPath(w.Chain)}, which is queued for a connection to {pool.Server}.").ToList();
-            details.Add($"The pool for {pool.Server} allows {pool.MaxConnections} connections (MaxConnectionsPerServer) and {pool.OpenConnections} are open.");
+            details.Add($"The pool for {pool.Server} " +
+                        (pool.MaxConnections == int.MaxValue ? "has no connection limit (MaxConnectionsPerServer isn't set)" : $"allows {Describe.Plural(pool.MaxConnections, "connection")} (MaxConnectionsPerServer)") +
+                        $" and {pool.OpenConnections} {(pool.OpenConnections == 1 ? "is" : "are")} open.");
+            if (pool.PendingConnections is > 0 and var stillConnecting)
+                details.Add($"{(stillConnecting == 1 ? "1 of them is" : $"{stillConnecting} of them are")} still being established (TCP connect or TLS handshake not finished).");
             if (nested)
                 details.Add($"{Describe.JoinAnd(holders)} {(holders.Count == 1 ? "keeps" : "keep")} an earlier HttpResponseMessage in a local while making this request. " +
                             "A response holds its connection until its body has been read or it is disposed, so each such call needs two connections at once.");
@@ -73,6 +85,40 @@ public sealed class HttpDetector : IDetector
                 Location = site?.Source,
             };
         }
+    }
+
+    /// Requests queued in a pool that isn't at its limit: each waits for a connection that is still being
+    /// established (TCP connect, TLS handshake, proxy), not for one to be returned.
+    private static Finding Connecting(List<(ThreadSnapshot Thread, List<TaskInfo> Chain, HttpPoolInfo Pool)> group, HttpPoolInfo pool, bool full)
+    {
+        var first = group[0];
+        var site = FrameClassifier.BestUserFrame(first.Thread.Frames);
+        var one = group.Count == 1;
+        var details = group.Select(w => $"{w.Thread.Label} is blocked in {FrameClassifier.DescribeTaskWait(w.Thread.Frames)} at {Describe.Where(FrameClassifier.BestUserFrame(w.Thread.Frames))}, " +
+                                        $"waiting for {AppPath(w.Chain)}, which is waiting for a connection to {pool.Server} to be established.").ToList();
+        var limit = pool.MaxConnections == int.MaxValue ? "has no connection limit (MaxConnectionsPerServer isn't set)" : $"allows {pool.MaxConnections} connections (MaxConnectionsPerServer)";
+        var connections = pool.PendingConnections is not { } p ? $"it has {Describe.Plural(pool.OpenConnections, "connection")} open"
+            : p == pool.OpenConnections ? (p == 1 ? "its only connection is still being established" : $"all {p} of its connections are still being established")
+            : $"it has {Describe.Plural(pool.OpenConnections, "connection")}, {p} of them still being established";
+        details.Add($"The pool for {pool.Server} {limit}; {connections}.");
+        var noTimeout = group.Any(w => w.Chain.Any(c => c.Http is { InfiniteTimeout: true }));
+
+        return new Finding
+        {
+            Id = "http-connect",
+            Severity = Severity.Warning,
+            Title = one ? "HTTP call waiting for a connection to be established" : "HTTP calls waiting for a connection to be established",
+            Summary = $"{Describe.JoinAnd(group.Select(w => w.Thread.Label))} {(one ? "is" : "are")} waiting for a new connection to {pool.Server} to be established. " +
+                      (full ? "Every connection the pool has is still connecting" : "The pool isn't at its limit") +
+                      ", so this isn't a wait for a free connection: the connect itself (TCP connect, TLS handshake or proxy) hasn't finished." +
+                      (site?.Source is null ? "" : $" Start at {site.Source}."),
+            Details = details,
+            Advice = $"Check that {pool.Server} is up and reachable from this machine (server, firewall, proxy, DNS). " +
+                     "SocketsHttpHandler.ConnectTimeout is infinite by default: set it (for example to 10 seconds) so a connect that never finishes fails with an error" +
+                     (noTimeout ? ", and give the HttpClient a Timeout: it has none (Timeout = Infinite), so nothing else ends this wait." : "."),
+            ThreadIds = group.Select(w => w.Thread.ManagedId).ToList(),
+            Location = site?.Source,
+        };
     }
 
     /// The pool queues the request as a TaskCompletionSource&lt;HttpConnection&gt; until a connection is free.

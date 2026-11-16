@@ -56,7 +56,7 @@ public sealed partial class SnapshotBuilder
             var port = authority.ReadInt("<Port>k__BackingField");
             if (host is not null) server = port is { } p ? $"{host}:{p}" : host;
         }
-        return new HttpPoolInfo(server, max.Value, open.Value);
+        return new HttpPoolInfo(server, max.Value, open.Value, self.ReadInt("_pendingHttp11ConnectionCount"));
     }
 
     private static bool HoldsHttpResponse(FieldReader stateMachine, ClrType smType)
@@ -68,7 +68,8 @@ public sealed partial class SnapshotBuilder
             {
                 var value = stateMachine.ReadObject(field);
                 if (!value.IsNull && value.Type?.Name == "System.Net.Http.HttpResponseMessage"
-                    && !(value.TryReadField<bool>("_disposed", out var disposed) && disposed))
+                    && !(value.TryReadField<bool>("_disposed", out var disposed) && disposed)
+                    && StillOwnsConnection(value))
                     return true;
             }
             catch
@@ -77,6 +78,19 @@ public sealed partial class SnapshotBuilder
             }
         }
         return false;
+    }
+
+    /// A response keeps its connection only while its body is unread: the content still reads from the
+    /// connection's stream (HttpConnectionResponseContent._stream._connection) and hasn't been buffered.
+    /// With the default ResponseContentRead the body is buffered and the connection is back in the pool.
+    /// Without that evidence (other content types, fields that differ), the response isn't counted.
+    private static bool StillOwnsConnection(ClrObject response)
+    {
+        if (!response.TryReadObjectField("_content", out var content) || content.IsNull
+            || content.Type?.Name != "System.Net.Http.HttpConnectionResponseContent") return false;
+        if (!content.TryReadObjectField("_bufferedContent", out var buffered) || !buffered.IsNull) return false;
+        if (!content.TryReadObjectField("_stream", out var stream) || stream.IsNull) return false;
+        return stream.TryReadObjectField("_connection", out var connection) && !connection.IsNull;
     }
 
     // ---------------------------------------------------------------- cancellation callbacks

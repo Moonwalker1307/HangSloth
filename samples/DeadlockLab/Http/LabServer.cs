@@ -8,7 +8,8 @@ namespace DeadlockLab.Http;
 /// It can answer normally, or start a big response and never finish it, or never answer at all.
 internal sealed class LabServer
 {
-    public enum Mode { Answer, StallBody, Silent }
+    /// SlowReports answers everything except /reports/ requests, which it reads and never answers.
+    public enum Mode { Answer, StallBody, Silent, SlowReports }
 
     private readonly TcpListener _listener = new(IPAddress.Loopback, 0);
     private readonly Mode _mode;
@@ -21,7 +22,12 @@ internal sealed class LabServer
         new Thread(AcceptLoop) { IsBackground = true, Name = "lab-http-server" }.Start();
     }
 
-    public Uri BaseAddress => new($"http://127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}/");
+    public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
+    public Uri BaseAddress => new($"http://127.0.0.1:{Port}/");
+
+    /// Set once the server has sent its first complete response.
+    public ManualResetEventSlim Answered { get; } = new();
 
     private void AcceptLoop()
     {
@@ -51,6 +57,7 @@ internal sealed class LabServer
                 switch (_mode)
                 {
                     case Mode.Silent:
+                    case Mode.SlowReports when request.ToString().Contains("/reports/"):
                         return; // read the request, never answer, keep the socket open
                     case Mode.StallBody when request.ToString().Contains("/products/"):
                         // Promise a large body, send a little of it, and stop: the client's connection stays busy
@@ -60,6 +67,7 @@ internal sealed class LabServer
                     default:
                         var body = "{\"ok\":true}";
                         stream.Write(Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\n\r\n{body}"));
+                        Answered.Set();
                         break;
                 }
             }

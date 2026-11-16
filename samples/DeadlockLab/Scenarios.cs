@@ -123,6 +123,22 @@ public static class Scenarios
             "Checkout calls a payment gateway with .Result and no timeout; the gateway accepted the connection and never answers.",
             ["http-wait"], HttpNoResponseScenario.Run),
 
+        new("http-connect-stall", Area.Code, Difficulty.Hidden,
+            "A price lookup calls a supplier over HTTPS with .Result; the supplier accepts the TCP connection and never answers the TLS handshake, and there is no ConnectTimeout. The pool isn't full: the connection is never established.",
+            ["http-connect"], HttpConnectStallScenario.Run),
+
+        new("http-busy-connections", Area.Code, Difficulty.Hidden,
+            "A page keeps a buffered response in a local while it fetches more, and waits for a connection: two slow report downloads use both allowed connections. Not a deadlock; the buffered response holds no connection.",
+            ["http-connection-limit"], HttpBusyConnectionsScenario.Run),
+
+        new("db-connect-stall", Area.Code, Difficulty.Hidden,
+            "Startup opens the first PostgreSQL connection with Timeout=0 to a server that accepts the TCP connection and never answers. Needs no database: a silent local listener plays the server.",
+            ["database-connect"], DbConnectStallScenario.Run),
+
+        new("sqlclient-connect-stall", Area.Code, Difficulty.Hidden,
+            "Startup opens the first SQL Server connection with Connect Timeout=0 to a server that accepts the TCP connection and never answers. Needs no database: a silent local listener plays the server.",
+            ["database-connect"], SqlConnectStallScenario.Run),
+
         new("timer-overlap", Area.Code, Difficulty.Hidden,
             "A timer fires every 100 ms but its callback holds a lock for seconds. Callbacks don't wait for each other, so they pile up behind the lock until the thread pool is full.",
             ["threadpool-starvation"], TimerOverlapScenario.Run),
