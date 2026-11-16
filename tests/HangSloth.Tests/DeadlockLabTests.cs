@@ -16,8 +16,8 @@ public class DeadlockLabTests
     public static TheoryData<string> CodeScenarios =>
     [
         "transfer", "dining-philosophers", "event-callback", "library-sync-over-async", "semaphore-order", "async-semaphore-reentry",
-        "rwlock-vs-lock", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose",
-        "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse",
+        "rwlock-vs-lock", "rwlock-upgrade-slow-reader", "rwlock-readers-block-writer", "lazy-init", "static-constructor", "lock-then-wait", "thread-join-under-lock", "timer-dispose",
+        "parallel-foreach-under-lock", "ui-invoke", "inline-continuation", "throttle-reentry", "bounded-queue", "lost-pulse", "idle-monitor-consumer",
         "http-connection-limit", "http-no-response", "timer-overlap", "cancellation-dispose", "finalizer-wait", "child-process-pipe", "healthy",
     ];
 
@@ -40,6 +40,10 @@ public class DeadlockLabTests
         ["semaphore-order"] = ["ShippingService.CarrierApi", "ShippingService.LabelPrinter"],
         ["async-semaphore-reentry"] = ["PriceCache._gate", "PriceCache.RefreshAsync", "isn't reentrant"],
         ["rwlock-vs-lock"] = ["the write lock on ConfigStore._rw", "AuditLog._sync"],
+        ["rwlock-upgrade-slow-reader"] = ["is waiting to upgrade to the write lock on PriceCatalog._rw (a ReaderWriterLockSlim) while 1 other thread holds it for reading: Thread",
+                                          "(\"report-export\")", "holds the read lock and is sleeping (Thread.Sleep) in PriceCatalog.ExportReport (PriceCatalog.cs:"],
+        ["rwlock-readers-block-writer"] = ["(\"price-update\") is waiting for PriceCatalog._rw (a ReaderWriterLockSlim), which 3 threads hold for reading: Thread",
+                                           "(\"report-export-3\") holds the read lock"],
         ["lazy-init"] = ["CatalogService._catalog (Lazy<Catalog>)", "Task.Run(CatalogService.LoadRecommendations)"],
         ["static-constructor"] = ["the static constructor of PriceTable"],
         ["lock-then-wait"] = ["ReportService._sync", "Task.Run(ReportService.CollectRows)"],
@@ -54,7 +58,7 @@ public class DeadlockLabTests
         ["inline-continuation"] = ["OrderPipeline._pipelineLock", "OrderPipeline.ShippingLock", "inline: OrderPipeline.MarkPaid (InlineContinuation.cs:", "RunContinuationsAsynchronously"],
         ["throttle-reentry"] = ["PartnerApi._throttle", "3 slots and 3 async callers waiting"],
         ["bounded-queue"] = ["EventBus._queue", "full (2 of 2)", "EventBus._subscribersLock"],
-        ["lost-pulse"] = ["Monitor.Wait(WorkQueue._sync)", "WorkQueue._items (1 item)", "(Thread.Join)"],
+        ["lost-pulse"] = ["Monitor.Wait(WorkQueue._sync)", "WorkQueue._items (1 item)", "(Thread.Join)", "holds work already, so the Pulse for it was most likely sent before"],
         ["db-migration-lock"] = ["`SELECT count(*) FROM lab_catalog`", "has an open transaction", "ALTER TABLE"],
         ["db-advisory-lock"] = ["`SELECT pg_advisory_lock(4242)`", "NightlyJob._leaderConnection", "locktype = 'advisory'"],
         ["db-starvation"] = ["ReportsController.GetCount", "`SELECT count(*) FROM lab_reports, pg_sleep(30)`"],
@@ -111,6 +115,8 @@ public class DeadlockLabTests
         var report = SampleApp.Analyze(scenario, project: "DeadlockLab", until: r => expected.All(Found(r).Contains));
         var found = Found(report);
         var text = string.Join("\n", report.Findings.SelectMany(f => new[] { f.Summary, f.Advice ?? "" }.Concat(f.Details)));
+        var forbidden = report.Findings.Select(f => f.Id).Intersect(Lab.MustNotReport.GetValueOrDefault(scenario, [])).ToList();
+        Assert.True(forbidden.Count == 0, $"'{scenario}' must not report {string.Join(", ", forbidden)}\n{text}");
 
         if (expected.Length == 0)
         {
@@ -131,6 +137,12 @@ internal static class Lab
         .Split('\n', StringSplitOptions.RemoveEmptyEntries)
         .Select(line => line.Split('\t'))
         .ToDictionary(cols => cols[0], cols => cols[3] == "-" ? [] : cols[3].Split(','));
+
+    /// Scenario name -> finding ids it must not produce at any severity (DeadlockLab --list, last column).
+    public static readonly Dictionary<string, string[]> MustNotReport = SampleApp.Run("dotnet", $"\"{SampleApp.Build("DeadlockLab")}\" --list", expectSuccess: true)
+        .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        .Select(line => line.TrimEnd('\r').Split('\t'))
+        .ToDictionary(cols => cols[0], cols => cols.Length < 6 || cols[5] == "-" ? [] : cols[5].Split(','));
 
     // Kept alive for the whole test run (declared first: static fields initialize in order); Testcontainers' reaper removes them when the process exits.
     private static readonly List<DotNet.Testcontainers.Containers.IDatabaseContainer> Containers = [];

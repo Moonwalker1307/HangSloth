@@ -13,9 +13,11 @@ public sealed class LockDeadlockDetector : IDetector
         var waitsFor = new Dictionary<int, (int Owner, MonitorLock Lock)>();
         foreach (var t in snapshot.Threads)
         {
-            if (t.WaitingForLock is { } addr && locks.TryGetValue(addr, out var l) && l.OwnerThreadId is { } owner)
+            // Never an edge to itself: a ReaderWriterLockSlim's upgrader owns the lock it waits on, and waits for its readers.
+            if (t.WaitingForLock is { } addr && locks.TryGetValue(addr, out var l) && l.OwnerThreadId is { } owner && owner != t.ManagedId)
                 waitsFor[t.ManagedId] = (owner, l);
         }
+        WaitGraph.AddReaderEdges<(int Owner, MonitorLock Lock)>(snapshot, waitsFor, e => e.Owner, (t, l, reader) => (reader, l));
 
         var reported = new HashSet<string>();
         foreach (var start in waitsFor.Keys.Order())
@@ -53,10 +55,10 @@ public sealed class LockDeadlockDetector : IDetector
         foreach (var t in threads)
         {
             var (owner, wanted) = waitsFor[t.ManagedId];
-            var held = snapshot.Locks.Where(l => l.OwnerThreadId == t.ManagedId).Select(Describe.Held).ToList();
+            var held = Describe.HeldBy(snapshot, t.ManagedId);
             var holds = held.Count == 0 ? "" : $"holds {Describe.JoinAnd(held)} and ";
             details.Add($"{t.Label} {holds}is waiting in {Describe.Where(FrameClassifier.BestUserFrame(t.Frames))} " +
-                        $"for {Describe.Wanted(wanted)}, which {snapshot.FindThread(owner)?.Label ?? $"thread {owner}"} holds.");
+                        $"{Describe.WaitFor(wanted, t.ManagedId, owner, snapshot.FindThread(owner)?.Label ?? $"thread {owner}")}.");
         }
         var inline = threads.Select(Describe.InlineContinuation).OfType<string>().ToList();
         details.AddRange(inline);

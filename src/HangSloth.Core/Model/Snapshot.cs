@@ -194,8 +194,17 @@ public sealed record MonitorLock
     public required ObjectRef Object { get; init; }
     public LockKind Kind { get; init; }
 
-    /// ReaderWriterLockSlim: how many threads hold it for reading.
+    /// ReaderWriterLockSlim: how many threads hold it for reading, counting the one in upgradeable mode.
     public int ReaderCount { get; init; }
+
+    /// ReaderWriterLockSlim: the thread in upgradeable read mode, when no thread holds the write lock.
+    /// It is the <see cref="OwnerThreadId"/> too, since writers and other upgraders wait for it, but it
+    /// doesn't hold the write lock, and when it waits on this lock it waits to upgrade, for the readers.
+    public int? UpgraderThreadId { get; init; }
+
+    /// ReaderWriterLockSlim: the threads that hold it for reading, from each thread's own lock counts.
+    /// Empty when the dump doesn't show them.
+    public IReadOnlyList<int> ReaderThreadIds { get; init; } = [];
 
     /// The field that holds the lock object, e.g. "OrderCache._sync" or "Inventory.Gate" (static), when found.
     public string? FieldName { get; init; }
@@ -218,9 +227,12 @@ public sealed record PulseWait
     /// The field that holds the object, e.g. "WorkQueue._sync", when found.
     public string? FieldName { get; init; }
     public string DisplayName => FieldName ?? Names.ShortType(Object.TypeName);
-    /// Collections in the same object that already hold items, e.g. "WorkQueue._items (1 item)":
-    /// work is there, yet the thread waits to be told about it.
+    /// The collection the waiting code checks after Monitor.Wait, when it already holds items, e.g.
+    /// "WorkQueue._items (1 item)": work is there, yet the thread waits to be told about it.
     public IReadOnlyList<string> PendingWork { get; init; } = [];
+    /// Collections in the same object that hold items when the method's code couldn't be read to say
+    /// which one the waiting code checks: maybe its work, maybe unrelated (results, history...).
+    public IReadOnlyList<string> PossibleWork { get; init; } = [];
 }
 
 /// A thread blocked in BlockingCollection.Add (no room) or Take (nothing to take).

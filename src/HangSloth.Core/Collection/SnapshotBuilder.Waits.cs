@@ -56,11 +56,16 @@ public sealed partial class SnapshotBuilder
 
     // ---------------------------------------------------------------- ReaderWriterLockSlim and SemaphoreSlim
 
-    private const uint RwMaxReader = 0x0FFFFFFE;
+    /// ReaderWriterLockSlim._owners: the low 28 bits count the readers (the upgradeable reader included),
+    /// the top bits are flags (write lock held, writers waiting, upgrader waiting). Unchanged in .NET 8, 9 and 10.
+    private const uint RwReaderMask = 0x0FFFFFFF;
+
+    internal static int RwReaderCount(uint owners) => (int)(owners & RwReaderMask);
 
     /// A ReaderWriterLockSlim records the managed id of its writer (and upgradeable reader) itself,
-    /// so it joins the lock graph like a monitor. Plain readers aren't recorded per thread, only counted.
-    private static ulong? FindReaderWriterLock(List<ClrStackRoot> roots, Dictionary<ulong, MonitorLock> locks)
+    /// so it joins the lock graph like a monitor. Plain readers are only counted on the lock; each
+    /// thread keeps its own counts per lock, which is where the dump shows who they are.
+    private static ulong? FindReaderWriterLock(List<ClrStackRoot> roots, Dictionary<ulong, MonitorLock> locks, IReadOnlyList<ClrThread> threads)
     {
         foreach (var root in roots)
         {
@@ -74,11 +79,51 @@ public sealed partial class SnapshotBuilder
                 Object = new ObjectRef(rw.Address, "System.Threading.ReaderWriterLockSlim"),
                 Kind = LockKind.ReaderWriter,
                 OwnerThreadId = writer > 0 ? writer : upgrader > 0 ? upgrader : null,
-                ReaderCount = (int)(owners & RwMaxReader),
+                UpgraderThreadId = writer <= 0 && upgrader > 0 ? upgrader : null,
+                ReaderCount = RwReaderCount(owners),
+                ReaderThreadIds = ReadLockHolders(rw, threads),
             };
             return rw.Address;
         }
         return null;
+    }
+
+    /// Each thread's [ThreadStatic] ReaderWriterLockSlim.t_rwc list has an entry per lock it uses,
+    /// matched by the lock's _lockID; readercount > 0 means it holds that lock for reading.
+    private static List<int> ReadLockHolders(ClrObject rw, IReadOnlyList<ClrThread> threads)
+    {
+        var holders = new List<int>();
+        try
+        {
+            if (!rw.TryReadField<long>("_lockID", out var id) || id == 0) return holders;
+            var counts = rw.Type?.ThreadStaticFields.FirstOrDefault(f => f.Name == "t_rwc");
+            if (counts is null) return holders;
+            foreach (var thread in threads)
+            {
+                try
+                {
+                    var entry = counts.ReadObject(thread);
+                    for (var guard = 0; !entry.IsNull && guard < 1_000; guard++)
+                    {
+                        if (entry.TryReadField<long>("lockID", out var lockId) && lockId == id)
+                        {
+                            if (entry.ReadInt("readercount") is > 0) holders.Add(thread.ManagedThreadId);
+                            break;
+                        }
+                        if (!entry.TryReadObjectField("next", out entry)) break;
+                    }
+                }
+                catch
+                {
+                    // This thread's counts can't be read; the others still can.
+                }
+            }
+        }
+        catch
+        {
+            // Without the per-thread counts the readers are still counted, just not named.
+        }
+        return holders;
     }
 
     private static ulong? FindSemaphoreBeingWaited(List<ClrStackRoot> roots)
@@ -97,8 +142,8 @@ public sealed partial class SnapshotBuilder
          "System.Collections.Generic.LinkedList<", "System.Collections.Generic.PriorityQueue<"];
 
     /// Monitor.Wait called directly from app code (not from inside ManualResetEventSlim, SemaphoreSlim...):
-    /// the object passed to it, and any collection next to it that already holds work.
-    private static PulseWait? FindPulseWait(List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
+    /// the object passed to it, and the collection next to it that the waiting code checks, if that already holds work.
+    private PulseWait? FindPulseWait(ClrThread thread, List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
     {
         var prefix = FrameClassifier.FrameworkPrefix(frames);
         if (prefix.Any(f => f.TypeName != "System.Threading.Monitor")) return null;
@@ -107,23 +152,57 @@ public sealed partial class SnapshotBuilder
         if (target is not { } obj) return null;
 
         var pending = new List<string>();
+        var possible = new List<string>();
         foreach (var root in roots)
         {
             var owner = root.Object;
             if (owner.IsNull || owner.Type is null || FrameClassifier.IsFrameworkType(owner.Type.Name ?? "")) continue;
             if (!owner.Type.Fields.Any(f => f.IsObjectReference && owner.ReadObjectField(f).Address == obj.Address)) continue;
+            var collections = new List<(ClrInstanceField Field, int? Count)>();
             foreach (var field in owner.Type.Fields)
             {
                 if (!field.IsObjectReference) continue;
                 var value = owner.ReadObjectField(field);
                 if (value.IsNull || value.Address == obj.Address || value.Type?.Name is not { } typeName || !WorkCollections.Any(c => typeName.StartsWith(c, StringComparison.Ordinal))) continue;
-                var count = value.ReadInt("_size") ?? value.ReadInt("count");
-                if (count is > 0)
-                    pending.Add($"{Names.ShortType(owner.Type.Name ?? "")}.{CleanFieldName(field.Name)} ({count} {(count == 1 ? "item" : "items")})");
+                collections.Add((field, value.ReadInt("_size") ?? value.ReadInt("count")));
             }
+            string Label((ClrInstanceField Field, int? Count) c) =>
+                $"{Names.ShortType(owner.Type.Name ?? "")}.{CleanFieldName(c.Field.Name)} ({c.Count} {(c.Count == 1 ? "item" : "items")})";
+
+            var nonEmpty = collections.Where(c => c.Count is > 0).ToList();
+            if (nonEmpty.Count == 0) break;
+            // Only the collection the waiting code checks is its work; the object may hold others (results, history...).
+            // A condition that reads none of them (a counter, a flag) says the collections aren't its work.
+            var (outcome, checkedField) = WaitingFrame(thread) is var (method, ip)
+                ? (_waitCondition ??= new WaitCondition(_runtime)).FirstReadAfterWait(method, ip, owner.Type, collections.Select(c => c.Field).ToList())
+                : (IlInstructions.Outcome.Unknown, null);
+            if (outcome == IlInstructions.Outcome.Unknown) possible.AddRange(nonEmpty.Select(Label));
+            else if (outcome == IlInstructions.Outcome.Read && nonEmpty.FirstOrDefault(c => c.Field == checkedField) is { Field: not null } work) pending.Add(Label(work));
             break;
         }
-        return new PulseWait { Object = new ObjectRef(obj.Address, obj.Type?.Name ?? "System.Object"), PendingWork = pending };
+        return new PulseWait { Object = new ObjectRef(obj.Address, obj.Type?.Name ?? "System.Object"), PendingWork = pending, PossibleWork = possible };
+    }
+
+    private WaitCondition? _waitCondition;
+
+    /// The app method that called Monitor.Wait, and where in it the call returns to.
+    private static (ClrMethod Method, ulong ReturnAddress)? WaitingFrame(ClrThread thread)
+    {
+        try
+        {
+            var inWait = false;
+            foreach (var frame in thread.EnumerateStackTrace(includeContext: false, MaxFramesPerThread))
+            {
+                if (frame.Kind != ClrStackFrameKind.ManagedMethod || frame.Method is not { } method) continue;
+                if (method.Type?.Name == "System.Threading.Monitor") inWait = true;
+                else if (inWait) return frame.InstructionPointer == 0 ? null : (method, frame.InstructionPointer);
+            }
+        }
+        catch
+        {
+            // Without the frame, the collections next to the object are reported as possible work only.
+        }
+        return null;
     }
 
     /// BlockingCollection.Add and Take wait on one of its two internal semaphores: free slots and occupied slots.
