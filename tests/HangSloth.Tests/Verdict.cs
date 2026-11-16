@@ -12,7 +12,16 @@ internal static class Verdict
     {
         if (Matches(report, expected)) return;
         var text = string.Join("\n", report.Findings.Select(f => $"[{Name(f.Severity)}] {f.Id}: {f.Summary}"));
-        Assert.Fail($"{(scenario is null ? "" : $"'{scenario}': ")}expected exactly \"{expected}\", got \"{Of(report)}\"\n{text}");
+        Assert.Fail($"{(scenario is null ? "" : $"'{scenario}': ")}expected exactly \"{expected}\", got \"{Of(report)}\"\n{text}\n{Stacks(report)}");
+    }
+
+    /// The top of every stack that runs the app's code, for the message of a failed check. A run on another
+    /// operating system (CI's Windows job) can't be looked at afterwards: its frames are what explains the verdict.
+    public static string Stacks(AnalysisReport report, int threads = 12, int frames = 10)
+    {
+        var inApp = report.Snapshot.Threads.Where(t => t.Frames.Any(FrameClassifier.IsUserFrame)).ToList();
+        var lines = inApp.Take(threads).Select(t => $"  {t.Label}: {string.Join(" < ", t.Frames.Take(frames).Select(f => f.ToString()))}");
+        return $"Stacks of the {inApp.Count} threads in the app's code{(inApp.Count > threads ? $" (the first {threads})" : "")}:\n{string.Join("\n", lines)}";
     }
 
     public static bool Matches(AnalysisReport report, string expected)

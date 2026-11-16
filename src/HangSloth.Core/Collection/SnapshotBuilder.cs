@@ -127,9 +127,9 @@ public sealed partial class SnapshotBuilder
                 ThreadReadFault?.Invoke(id, "running task");
                 return r with { RunningTask = FindRunningTask(roots) };
             });
-            result = Step(result, id, r => r with { SendingTo = FindSendTarget(roots) });
+            result = Step(result, id, r => r with { SendingTo = FindSendTarget(clr, roots, snapshot.Frames) });
             result = Step(result, id, r => r with { WaitingForCallbackOnThread = FindCallbackThread(roots, snapshot.Frames, id) });
-            result = Step(result, id, r => r with { WaitingForProcess = FindProcessWait(roots, snapshot.Frames) });
+            result = Step(result, id, r => r with { WaitingForProcess = FindProcessWait(clr, roots, snapshot.Frames) });
             result = Step(result, id, r => r with { Database = ReadDatabaseActivity(roots, kind) });
             result = Step(result, id, r =>
             {
@@ -154,7 +154,7 @@ public sealed partial class SnapshotBuilder
                         r = r with { WaitingForPulse = FindPulseWait(clr, roots, snapshot.Frames) };
                         break;
                     case BlockingKind.Join:
-                        r = r with { JoiningThreadId = FindJoinTarget(roots, id) };
+                        r = r with { JoiningThreadId = FindJoinTarget(clr, roots) };
                         break;
                     case BlockingKind.Database or BlockingKind.ConnectionPool:
                         r = r with { Database = ReadDatabaseActivity(roots, kind) };

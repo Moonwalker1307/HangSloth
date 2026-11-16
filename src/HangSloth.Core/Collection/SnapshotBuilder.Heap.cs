@@ -29,10 +29,14 @@ public sealed partial class SnapshotBuilder
         /// The first NpgsqlConnection's type, to tell whether this driver version's names are known.
         public ClrType? NpgsqlConnectionType;
         public readonly List<ulong> PendingAsyncBoxes = [];
+        /// Every SynchronizationContext subclass instance, to tell which context a Send in optimized code is for.
+        public readonly List<ClrObject> SyncContexts = [];
+        /// The walk got to the end of the heap.
+        public bool Complete;
     }
 
     [Flags]
-    private enum HeapKind { None = 0, Thread = 1, Semaphore = 2, Task = 4, Wrapper = 8, NpgsqlPool = 16, AsyncBox = 32, NpgsqlConnection = 64 }
+    private enum HeapKind { None = 0, Thread = 1, Semaphore = 2, Task = 4, Wrapper = 8, NpgsqlPool = 16, AsyncBox = 32, NpgsqlConnection = 64, SyncContext = 128 }
 
     private HeapIndex HeapLookups => _heapIndex ??= WalkHeap();
 
@@ -150,6 +154,7 @@ public sealed partial class SnapshotBuilder
             if (IsTask(type))
                 kind |= name.Contains("AsyncStateMachineBox", StringComparison.Ordinal) ? HeapKind.Task : HeapKind.Task | HeapKind.Wrapper;
             if (name.Contains("AsyncStateMachineBox<", StringComparison.Ordinal)) kind |= HeapKind.AsyncBox;
+            if (name != SyncContextType && DerivesFrom(type, SyncContextType)) kind |= HeapKind.SyncContext;
             return kinds[type.MethodTable] = kind;
         }
 
@@ -171,6 +176,7 @@ public sealed partial class SnapshotBuilder
                             index.SemaphoreOfTaskNode[n] = obj.Address;
                     }
                     if ((kind & HeapKind.NpgsqlPool) != 0) index.NpgsqlPools.Add(obj);
+                    if ((kind & HeapKind.SyncContext) != 0) index.SyncContexts.Add(obj);
                     if ((kind & HeapKind.NpgsqlConnection) != 0) index.NpgsqlConnectionType ??= type;
                     if ((kind & HeapKind.Task) != 0)
                     {
@@ -190,6 +196,7 @@ public sealed partial class SnapshotBuilder
                     // One unreadable object; the rest of the heap still counts.
                 }
             }
+            index.Complete = true;
         }
         catch (Exception e)
         {

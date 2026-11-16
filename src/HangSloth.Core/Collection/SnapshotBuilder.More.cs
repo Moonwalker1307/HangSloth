@@ -119,19 +119,72 @@ public sealed partial class SnapshotBuilder
 
     private const int StreamReadModeUndefined = 0;
 
-    private static ProcessWait? FindProcessWait(List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
+    private const string ProcessType = "System.Diagnostics.Process";
+
+    private static ProcessWait? FindProcessWait(ClrThread thread, List<ClrStackRoot> roots, IReadOnlyList<StackFrameInfo> frames)
     {
-        if (!frames.Any(f => f.TypeName == "System.Diagnostics.Process" && f.MethodName.StartsWith("WaitForExit", StringComparison.Ordinal))) return null;
-        foreach (var root in roots)
+        ClrObject p;
+        if (frames.Any(f => f.TypeName == ProcessType && FrameClassifier.FrameworkWait(f) == BlockingKind.ProcessExit))
+            p = roots.Select(r => r.Object).FirstOrDefault(IsProcess);
+        else if (frames.Any(f => FrameClassifier.FrameworkWait(f) == BlockingKind.ProcessExit))
         {
-            var p = root.Object;
-            if (p.IsNull || p.Type?.Name != "System.Diagnostics.Process") continue;
-            var unread = new List<string>();
-            if (Unread(p, "_standardOutput", "_outputStreamReadMode")) unread.Add("standard output");
-            if (Unread(p, "_standardError", "_errorStreamReadMode")) unread.Add("standard error");
-            return new ProcessWait(p.ReadInt("_processId") ?? 0, CommandLine(p), unread);
+            // Process.WaitForExit inlined into the caller (Unix leaves ProcessWaitState.WaitForExit): the process is
+            // the one Process object the caller's frame holds.
+            var inCaller = WaitCallerObjects(thread, roots, BlockingKind.ProcessExit).Where(IsProcess).ToList();
+            p = inCaller.Count == 1 ? inCaller[0] : default;
         }
-        return null;
+        else if (IsBareWaitHandleWait(frames) && roots.Any(r => IsProcess(r.Object)))
+            p = ProcessOfExitWait(thread, roots);
+        else
+            return null;
+        if (p.IsNull) return null;
+        var unread = new List<string>();
+        if (Unread(p, "_standardOutput", "_outputStreamReadMode")) unread.Add("standard output");
+        if (Unread(p, "_standardError", "_errorStreamReadMode")) unread.Add("standard error");
+        return new ProcessWait(p.ReadInt("_processId") ?? 0, CommandLine(p), unread);
+    }
+
+    private static bool IsProcess(ClrObject o) => !o.IsNull && DerivesFrom(o.Type, ProcessType);
+
+    /// Only WaitHandle's own frames above the app's code: a warmed-up process (tiered PGO) also inlines
+    /// ProcessWaitState.WaitForExit (Unix) or Process.WaitForExitCore (Windows) into the app's method. What is left
+    /// is WaitHandle.WaitOneNoCheck (Linux) or the P/Invoke stub of WaitHandle.WaitOneCore (Windows).
+    private static bool IsBareWaitHandleWait(IReadOnlyList<StackFrameInfo> frames)
+    {
+        var prefix = FrameClassifier.FrameworkPrefix(frames);
+        return prefix.Count > 0 && prefix.Count < frames.Count && prefix.All(f => f.TypeName == WaitHandleType);
+    }
+
+    private const string WaitHandleType = "System.Threading.WaitHandle";
+
+    /// Windows: the wait handle that Process.WaitForExitCore makes for the process's handle and waits on.
+    private const string WindowsProcessWaitHandleType = "Interop+Kernel32+ProcessWaitHandle";
+
+    /// The process whose exit a bare WaitHandle wait is for: the one Process object in the app frame that called
+    /// it, when the handle waited on is that process's own exit handle (Unix: its ProcessWaitState's exited event;
+    /// Windows: the ProcessWaitHandle that WaitForExitCore makes). Anything else is some other wait.
+    private static ClrObject ProcessOfExitWait(ClrThread thread, List<ClrStackRoot> roots)
+    {
+        try
+        {
+            var objects = WaitCallerObjects(thread, roots, m => m.Type?.Name == WaitHandleType);
+            var processes = objects.Where(IsProcess).ToList();
+            if (processes.Count != 1) return default;
+            var p = processes[0];
+            if (objects.Any(o => o.Type?.Name == WindowsProcessWaitHandleType)) return p;
+            if (p.TryReadObjectField("_waitStateHolder", out var holder) && !holder.IsNull
+                && holder.TryReadObjectField("_state", out var state) && !state.IsNull
+                && state.TryReadObjectField("_exitedEvent", out var exited) && !exited.IsNull)
+            {
+                var handle = exited.TryReadObjectField("_waitHandle", out var h) && !h.IsNull ? h.Address : 0;
+                if (objects.Any(o => o.Address == exited.Address || (handle != 0 && o.Address == handle))) return p;
+            }
+        }
+        catch
+        {
+            // Fields of another runtime version: the process stays unknown.
+        }
+        return default;
     }
 
     /// Redirected (the reader exists) but nobody has touched it: neither StandardOutput nor BeginOutputReadLine.

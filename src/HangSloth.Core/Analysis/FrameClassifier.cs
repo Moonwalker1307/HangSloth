@@ -55,23 +55,50 @@ public static class FrameClassifier
         if (IsIdleInfrastructure(frames)) return BlockingKind.Idle;
         if (prefix.Any(IsTypeInitializerWait)) return BlockingKind.TypeInitializer;
         if (prefix.Any(IsMonitorEnter)) return BlockingKind.MonitorEnter;
-        if (prefix.Any(f => f.TypeName == "System.GC" && f.MethodName == "WaitForPendingFinalizers")) return BlockingKind.Finalizers;
+        if (prefix.Any(f => FrameworkWait(f) == BlockingKind.Finalizers)) return BlockingKind.Finalizers;
         if (prefix.Any(f => f.MethodName == "WaitForCallbackToComplete" && f.TypeName.StartsWith("System.Threading.CancellationTokenSource", StringComparison.Ordinal)))
             return BlockingKind.CancellationCallback;
-        if (prefix.Any(f => f.TypeName == "System.Diagnostics.Process" && f.MethodName.StartsWith("WaitForExit", StringComparison.Ordinal))) return BlockingKind.ProcessExit;
+        if (prefix.Any(f => FrameworkWait(f) == BlockingKind.ProcessExit)) return BlockingKind.ProcessExit;
         if (prefix.Any(f => f.TypeName == "System.Threading.ReaderWriterLockSlim")) return BlockingKind.ReaderWriterLock;
         if (prefix.Any(f => f.TypeName == "System.Threading.SemaphoreSlim" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.SemaphoreWait;
         // A synchronous call on a non-blocking socket (HttpClient.Send, or a socket that was used async) waits for
         // the socket's event in Monitor.Wait: name it as the I/O it is.
         if (prefix.Any(IsSyncSocketOperation) && SyncIoFrame(prefix) is not null) return BlockingKind.SyncIO;
-        if (prefix.Any(f => f.TypeName == "System.Threading.Monitor" && f.MethodName is "Wait" or "ObjWait")) return BlockingKind.MonitorWait;
+        if (prefix.Any(f => FrameworkWait(f) == BlockingKind.MonitorWait)) return BlockingKind.MonitorWait;
         if (prefix.Any(f => f.TypeName == "System.Threading.Thread" && f.MethodName is "Sleep" or "SleepInternal")) return BlockingKind.Sleep;
-        if (prefix.Any(f => f.TypeName == "System.Threading.Thread" && f.MethodName == "Join")) return BlockingKind.Join;
-        if (prefix.Any(f => f.TypeName == "System.Threading.WaitHandle" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.WaitHandle;
+        if (prefix.Any(f => FrameworkWait(f) == BlockingKind.Join)) return BlockingKind.Join;
+        if (prefix.Any(f => FrameworkWait(f) == BlockingKind.WaitHandle)) return BlockingKind.WaitHandle;
         // Last: a driver, a lock or a task wait above the I/O says more about what the thread waits for.
         if (SyncIoFrame(prefix) is not null) return BlockingKind.SyncIO;
         return BlockingKind.None;
     }
+
+    /// The framework wait a frame stands for, for the waits whose public method optimized code inlines into the
+    /// app's method: then only the generated P/Invoke stub or an internal method is left on the stack. The
+    /// collection code finds the waits' targets by the same frames. None for any other frame.
+    ///   thread.Join()                  Thread.Join, or Thread.&lt;Join&gt;g____PInvoke|56_0
+    ///   Monitor.Wait(obj)              Monitor.Wait, or Monitor.&lt;Wait&gt;g____PInvoke|24_0
+    ///   GC.WaitForPendingFinalizers()  GC.WaitForPendingFinalizers, or GC._WaitForPendingFinalizers
+    ///   process.WaitForExit()          Process.WaitForExit*, or ProcessWaitState.WaitForExit (Unix; Windows keeps Process.WaitForExitCore)
+    ///   handle.WaitOne()               WaitHandle.Wait*, or WaitHandle.&lt;WaitOneCore&gt;g____PInvoke|0_0 (Windows, after warm-up)
+    public static BlockingKind FrameworkWait(string typeName, string methodName) => typeName switch
+    {
+        "System.Threading.Monitor" when methodName is "Wait" or "ObjWait" || Names.PInvokeStubOf(methodName) == "Wait" => BlockingKind.MonitorWait,
+        "System.Threading.Thread" when methodName == "Join" || Names.PInvokeStubOf(methodName) == "Join" => BlockingKind.Join,
+        "System.GC" when methodName is "WaitForPendingFinalizers" or "_WaitForPendingFinalizers" => BlockingKind.Finalizers,
+        "System.Diagnostics.Process" when methodName.StartsWith("WaitForExit", StringComparison.Ordinal) => BlockingKind.ProcessExit,
+        "System.Diagnostics.ProcessWaitState" when methodName == "WaitForExit" => BlockingKind.ProcessExit,
+        "System.Threading.WaitHandle" when methodName.StartsWith("Wait", StringComparison.Ordinal)
+            || Names.PInvokeStubOf(methodName) is "WaitOneCore" or "WaitMultipleIgnoringSyncContext" => BlockingKind.WaitHandle,
+        _ => BlockingKind.None,
+    };
+
+    public static BlockingKind FrameworkWait(StackFrameInfo f) => FrameworkWait(f.TypeName, f.MethodName);
+
+    /// The runtime's marshalling stub between a P/Invoke stub and the method that called it, there when the JIT
+    /// didn't inline the native call into the caller (as inside an async method's MoveNext).
+    public static bool IsMarshallingStub(string typeName, string methodName) =>
+        methodName == "IL_STUB_PInvoke" && typeName is "(dynamicClass)" or "";
 
     /// A synchronous I/O call: what it does in words, and the async method to use instead (null when there is none).
     private sealed record SyncIoCall(string What, string? Async);
