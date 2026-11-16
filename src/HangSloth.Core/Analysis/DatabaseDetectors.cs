@@ -347,7 +347,7 @@ public sealed class DatabaseWaitDetector : IDetector
                 Summary = $"{(waiting.Count == 1 ? $"{waiting[0].Label} is" : $"{waiting.Count} threads are")} waiting for {provider}, while {blocker.Label} keeps a transaction open and waits for something else " +
                           $"in {Describe.Spot(FrameClassifier.BestUserFrame(blocker.Frames))}. " +
                           (escalation
-                              ? $"That transaction runs under {Db.IsolationName(blocker.Database.Isolation)} and read rows with {Describe.Sql(blocker.Database.StackCommands.First(Db.IsPlainSelect))}. " +
+                              ? $"That transaction runs under {Db.IsolationName(blocker.Database!.Isolation)} and read rows with {Describe.Sql(blocker.Database.StackCommands.First(Db.IsPlainSelect))}. " +
                                 "SQL Server keeps shared locks on everything it read until the transaction ends, and once a statement holds more than about 5,000 row locks it escalates them to one lock on the whole table, " +
                                 "so writers wait even for rows the report never read."
                               : readsOnly && sqlServer

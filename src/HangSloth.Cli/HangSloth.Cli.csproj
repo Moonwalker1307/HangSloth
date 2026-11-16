@@ -10,12 +10,14 @@
     <ToolCommandName>hangsloth</ToolCommandName>
     <PackageId>HangSloth</PackageId>
     <Version>0.1.0</Version>
-    <Description>Point it at a hung .NET process or memory dump and it explains in plain language why it's stuck: sync-over-async deadlocks, lock deadlocks, lock contention, thread pool starvation.</Description>
+    <Description>Point it at a hung .NET process or memory dump and it explains in plain language why it's stuck: sync-over-async and lock deadlocks, wait cycles, lock contention, thread pool starvation, blocked HTTP calls, full queues and database waits, with file and line numbers.</Description>
     <PackageTags>dotnet;diagnostics;hang;deadlock;dump;clrmd;async</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageIcon>icon.png</PackageIcon>
-    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReadmeFile>PACKAGE.md</PackageReadmeFile>
     <RepositoryUrl>https://github.com/Moonwalker1307/HangSloth</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/Moonwalker1307/HangSloth</PackageProjectUrl>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\HangSloth.Core\HangSloth.Core.csproj" />
@@ -25,6 +27,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\assets\icon.png" Pack="true" PackagePath="\" Visible="false" />
-    <None Include="..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="PACKAGE.md" Pack="true" PackagePath="\" Visible="false" />
   </ItemGroup>
 </Project>

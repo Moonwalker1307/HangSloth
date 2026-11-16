@@ -33,6 +33,8 @@ public sealed class ExportWindow(SynchronizationContext ui)
 {
     private string _status = "";
 
+    public string Status => _status;
+
     /// The "Export" button: runs the export in the background and waits for it, to keep it simple.
     public void OnExportClicked()
     {
