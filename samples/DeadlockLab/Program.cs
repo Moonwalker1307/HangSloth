@@ -4,7 +4,8 @@
 // dotnet-dump) can take a look.
 //
 //   DeadlockLab <scenario>     run one scenario
-//   DeadlockLab --list         list scenarios as tab-separated: name, area, difficulty, expected finding ids, story
+//   DeadlockLab --list         list scenarios as tab-separated: name, area, difficulty, expected finding ids, story,
+//                              finding ids it must not report
 //
 // Database scenarios need PostgreSQL. Set DEADLOCKLAB_PG to an Npgsql connection string
 // (default: Host=localhost;Username=postgres;Password=postgres;Database=postgres).
@@ -13,7 +14,7 @@ using DeadlockLab;
 if (args is ["--list"])
 {
     foreach (var s in Scenarios.All)
-        Console.WriteLine($"{s.Name}\t{s.Area}\t{s.Difficulty}\t{(s.Expected.Length == 0 ? "-" : string.Join(",", s.Expected))}\t{s.Story}");
+        Console.WriteLine($"{s.Name}\t{s.Area}\t{s.Difficulty}\t{(s.Expected.Length == 0 ? "-" : string.Join(",", s.Expected))}\t{s.Story}\t{(s.MustNotReport is { Length: > 0 } no ? string.Join(",", no) : "-")}");
     return 0;
 }
 

@@ -98,13 +98,13 @@ public sealed partial class SnapshotBuilder
                     result = result with { WaitingForLock = FindLockBeingEntered(clr, roots, locks, clrThreads) };
                     break;
                 case BlockingKind.ReaderWriterLock:
-                    result = result with { WaitingForLock = FindReaderWriterLock(roots, locks) };
+                    result = result with { WaitingForLock = FindReaderWriterLock(roots, locks, clrThreads) };
                     break;
                 case BlockingKind.SemaphoreWait:
                     result = result with { WaitingForSemaphore = FindSemaphoreBeingWaited(roots), WaitingOnCollection = FindCollectionWait(roots) };
                     break;
                 case BlockingKind.MonitorWait:
-                    result = result with { WaitingForPulse = FindPulseWait(roots, snapshot.Frames) };
+                    result = result with { WaitingForPulse = FindPulseWait(clr, roots, snapshot.Frames) };
                     break;
                 case BlockingKind.Join:
                     result = result with { JoiningThreadId = FindJoinTarget(roots, clr.ManagedThreadId) };

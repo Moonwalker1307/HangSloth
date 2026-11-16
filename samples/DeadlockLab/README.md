@@ -1,6 +1,6 @@
 # DeadlockLab
 
-A small, deliberately broken "shop" app with 42 ways to hang: textbook lock-ordering deadlocks, the
+A small, deliberately broken "shop" app with 45 ways to hang: textbook lock-ordering deadlocks, the
 hidden kind that hide in callbacks, libraries, initializers, semaphores, queues, UI dispatching, HTTP
 clients, finalizers and child processes, and deadlocks that involve a real database: PostgreSQL (with and
 without EF Core, including large selects that hold locks) and SQL Server. It's HangSloth's test bed: every scenario declares which finding HangSloth
@@ -40,6 +40,8 @@ Linux containers), and skip those scenarios otherwise.
 | `semaphore-order` | hidden | Two `SemaphoreSlim(1, 1)` "locks" taken in opposite order. | `semaphore-deadlock` |
 | `async-semaphore-reentry` | hidden | An async cache holds its `SemaphoreSlim` and calls a refresh method that waits on it again. | `semaphore-wait`, pointing out the same object earlier in the chain |
 | `rwlock-vs-lock` | hidden | `ConfigStore` holds its `ReaderWriterLockSlim` write lock while logging; `AuditLog` holds its lock while reading the config. | `lock-deadlock` between a write lock and a monitor |
+| `rwlock-upgrade-slow-reader` | hidden | A price refresh in upgradeable mode waits to upgrade while a slow report still reads; the report finishes after two minutes. Slow, not deadlocked. | `lock-contention` naming the reader, and no `lock-deadlock` |
+| `rwlock-readers-block-writer` | obvious | Three slow reports hold a `ReaderWriterLockSlim` for reading; a price update waits for the write lock. | `lock-contention` naming the three readers, not an orphaned lock |
 | `lazy-init` | hidden | A `Lazy<T>` factory waits for a `Task.Run` that reads the same `Lazy<T>.Value`. | `wait-cycle` (lock + task) |
 | `static-constructor` | hidden | A static constructor waits for a `Task.Run` that touches the same class. | `type-initializer-deadlock` |
 | `lock-then-wait` | obvious | A thread holds a lock and `.Result`s a `Task.Run` that needs that lock. | `wait-cycle` (lock + task) |
@@ -51,6 +53,7 @@ Linux containers), and skip those scenarios otherwise.
 | `throttle-reentry` | hidden | A `SemaphoreSlim(3)` throttle: each call holds a slot and makes a nested call through the same throttle. Three concurrent calls use every slot. | `semaphore-wait` (Critical: every slot held by a nested waiter) |
 | `bounded-queue` | hidden | A publisher holds a lock while adding to a full `BlockingCollection`; the only consumer needs that lock before it takes the next item. | `bounded-queue-deadlock` |
 | `lost-pulse` | hidden | A hand-rolled queue pulses only when the consumer is already waiting; the item arrived first, so the consumer waits forever. | `monitor-wait`, noting the queue already holds an item |
+| `idle-monitor-consumer` | control | A mail sender waits in `Monitor.Wait` for its empty outbox, in the textbook loop, and a receipt printer waits while its counter of due receipts is 0; their logs of sent mails and printed receipts aren't empty. | nothing |
 | `http-connection-limit` | hidden | `HttpClient` with `MaxConnectionsPerServer = 2`; each page request keeps its first response unread while it makes a second request to the same server. | `http-connection-limit`, naming the method that holds the response |
 | `http-no-response` | obvious | `.Result` on a POST to a payment gateway that accepted the connection and never answers, with `Timeout = Infinite`. | `http-wait`, with the method and URL |
 | `timer-overlap` | hidden | A timer fires every 100 ms; its callback holds a lock for seconds, so callbacks pile up until the thread pool is full. | `threadpool-starvation`, pointing at the overlapping timer callback |
@@ -92,4 +95,4 @@ When the lab was written, HangSloth explained 7 of the first 19 scenarios, and a
 of fixes, 4 of the 10 added in the second round, and 2 of the 8 in the third. SQL Server connections weren't read at all before the last 5 were added. Most misses were reported as plain
 lock contention ("held by Thread 1, which is blocked on .Wait()"), which is true but doesn't say
 it's a deadlock, or not at all (semaphores, static constructors, everything involving the database).
-It now explains all 42. The changes are described in the pull requests that added the scenarios.
+It now explains all 45. The changes are described in the pull requests that added the scenarios.

@@ -20,7 +20,11 @@ public enum Difficulty
 /// HangSloth finding ids this scenario should produce (Warning or Critical). Empty means the
 /// app is healthy and HangSloth should stay quiet. The end-to-end tests check these.
 /// </param>
-public sealed record Scenario(string Name, Area Area, Difficulty Difficulty, string Story, string[] Expected, Action Run);
+/// <param name="MustNotReport">
+/// Finding ids HangSloth must not produce here at any severity, for a scenario that looks like a
+/// worse problem than it is (a slow reader isn't a deadlock).
+/// </param>
+public sealed record Scenario(string Name, Area Area, Difficulty Difficulty, string Story, string[] Expected, Action Run, string[]? MustNotReport = null);
 
 public static class Scenarios
 {
@@ -54,6 +58,14 @@ public static class Scenarios
         new("rwlock-vs-lock", Area.Code, Difficulty.Hidden,
             "ConfigStore holds its ReaderWriterLockSlim write lock while logging to AuditLog; AuditLog holds its lock while reading the config.",
             ["lock-deadlock"], ConfigStoreScenario.Run),
+
+        new("rwlock-upgrade-slow-reader", Area.Code, Difficulty.Hidden,
+            "A price refresh holds the ReaderWriterLockSlim in upgradeable mode and waits to upgrade while a slow report still reads. The report finishes after two minutes and the refresh goes ahead: slow, not deadlocked.",
+            ["lock-contention"], PriceCatalogScenario.RunUpgrade, MustNotReport: ["lock-deadlock", "wait-cycle"]),
+
+        new("rwlock-readers-block-writer", Area.Code, Difficulty.Obvious,
+            "Three slow reports hold a ReaderWriterLockSlim for reading; a price update waits for the write lock until they finish. Nothing is orphaned or deadlocked.",
+            ["lock-contention"], PriceCatalogScenario.RunWriterBehindReaders, MustNotReport: ["lock-deadlock", "wait-cycle"]),
 
         new("lazy-init", Area.Code, Difficulty.Hidden,
             "A Lazy<T> factory waits for a Task.Run that reads the same Lazy<T>.Value.",
@@ -98,6 +110,10 @@ public static class Scenarios
         new("lost-pulse", Area.Code, Difficulty.Hidden,
             "A hand-rolled queue pulses only when the consumer is already waiting; the item arrived first, so the consumer waits forever.",
             ["monitor-wait"], LostPulseScenario.Run),
+
+        new("idle-monitor-consumer", Area.Code, Difficulty.Obvious,
+            "Control: a mail sender waits in Monitor.Wait for its empty outbox, in the textbook loop, and a receipt printer waits while its counter of due receipts is 0; their logs of sent mails and printed receipts aren't empty, and aren't work. Nothing is wrong.",
+            [], MailOutboxScenario.Run, MustNotReport: ["monitor-wait"]),
 
         new("http-connection-limit", Area.Code, Difficulty.Hidden,
             "An HttpClient allows 2 connections per server. Each page request keeps its first response unread while it makes a second request to the same server.",

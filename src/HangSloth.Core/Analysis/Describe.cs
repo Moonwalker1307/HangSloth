@@ -61,8 +61,29 @@ internal static class Describe
         return user.Count == 2 && best == user[0] ? $"{Where(user[0])}, called from {Where(user[1])}" : Where(best);
     }
 
-    /// The lock as a thread holds it: "the lock on X", or "the write lock on X" for a ReaderWriterLockSlim.
-    public static string Held(MonitorLock l) => l.Kind == LockKind.ReaderWriter ? $"the write lock on {l.DisplayName}" : $"the lock on {l.DisplayName}";
+    /// The lock as its owner holds it: "the lock on X", or "the write lock on X" (or "the upgradeable read
+    /// lock on X") for a ReaderWriterLockSlim.
+    public static string Held(MonitorLock l) =>
+        l.Kind != LockKind.ReaderWriter ? $"the lock on {l.DisplayName}"
+        : l.UpgraderThreadId is { } upgrader && upgrader == l.OwnerThreadId ? $"the upgradeable read lock on {l.DisplayName}"
+        : $"the write lock on {l.DisplayName}";
+
+    /// Every lock a thread holds: as owner, and ReaderWriterLockSlim read locks the dump shows it holding.
+    public static List<string> HeldBy(ProcessSnapshot snapshot, int thread) =>
+        snapshot.Locks.Where(l => l.OwnerThreadId == thread).Select(Held)
+            .Concat(snapshot.Locks.Where(l => l.Kind == LockKind.ReaderWriter && l.OwnerThreadId != thread && l.ReaderThreadIds.Contains(thread))
+                .Select(l => $"the read lock on {l.DisplayName}"))
+            .ToList();
+
+    /// What a thread waits for on a lock and who holds it up: "for the lock on X, which Thread 5 holds", or
+    /// for a ReaderWriterLockSlim held up by a reader "to upgrade to the write lock on X, which Thread 4 holds for reading".
+    public static string WaitFor(MonitorLock l, int waiter, int holder, string holderLabel)
+    {
+        if (l.Kind != LockKind.ReaderWriter || l.OwnerThreadId == holder || !l.ReaderThreadIds.Contains(holder))
+            return $"for {Wanted(l)}, which {holderLabel} holds";
+        var upgrading = l.UpgraderThreadId == waiter;
+        return $"{(upgrading ? "to upgrade to" : "for")} the write lock on {l.DisplayName} (a ReaderWriterLockSlim), which {holderLabel} holds for reading";
+    }
 
     /// The lock as a thread waits for it.
     public static string Wanted(MonitorLock l) => l.Kind == LockKind.ReaderWriter ? $"{l.DisplayName} (a ReaderWriterLockSlim)" : $"the lock on {l.DisplayName}";

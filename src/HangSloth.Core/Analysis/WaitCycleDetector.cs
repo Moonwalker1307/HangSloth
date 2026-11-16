@@ -55,7 +55,63 @@ internal static class WaitGraph
                 edges[t.ManagedId] = new WaitEdge(t.ManagedId, initializer, WaitKind.TypeInitializer, TypeName: type);
             }
         }
+        AddReaderEdges(snapshot, edges, e => e.To, (t, l, reader) => new WaitEdge(t.ManagedId, reader, WaitKind.Lock, Lock: l));
         return edges;
+    }
+
+    /// The readers of a ReaderWriterLockSlim that stand in a waiting thread's way: for a writer while no thread
+    /// holds the write or upgradeable lock, or for the thread in upgradeable mode waiting to upgrade. Only the
+    /// readers the dump shows, never the thread itself. A thread waiting to read is held up by a waiting writer instead.
+    public static IReadOnlyList<int> BlockingReaders(ThreadSnapshot t, MonitorLock l)
+    {
+        if (l.Kind != LockKind.ReaderWriter || EnteringReadOrUpgradeable(t)) return [];
+        if (l.OwnerThreadId is not null && l.UpgraderThreadId != t.ManagedId) return [];
+        return l.ReaderThreadIds.Where(id => id != t.ManagedId).ToList();
+    }
+
+    /// A thread entering a ReaderWriterLockSlim for reading or in upgradeable mode: readers don't keep it out,
+    /// a writer (or an upgrader, or a writer waiting ahead of it) does.
+    public static bool EnteringReadOrUpgradeable(ThreadSnapshot t) =>
+        t.Frames.Any(f => f.TypeName == "System.Threading.ReaderWriterLockSlim" && f.MethodName is "TryEnterReadLockCore" or "TryEnterUpgradeableReadLockCore");
+
+    /// A thread waiting for readers waits for all of them, so it only takes part in a cycle through a reader
+    /// that waits, directly or through others, for it: then that reader can never leave. Add an edge to such a
+    /// reader. A thread whose readers will all finish gets no edge: it is waiting, not deadlocked.
+    public static void AddReaderEdges<T>(ProcessSnapshot snapshot, Dictionary<int, T> edges, Func<T, int> to, Func<ThreadSnapshot, MonitorLock, int, T> edge)
+    {
+        var waiting = new List<(ThreadSnapshot Thread, MonitorLock Lock, IReadOnlyList<int> Readers)>();
+        foreach (var t in snapshot.Threads)
+        {
+            if (edges.ContainsKey(t.ManagedId) || t.WaitingForLock is not { } addr || snapshot.FindLock(addr) is not { } l) continue;
+            var readers = BlockingReaders(t, l);
+            if (readers.Count > 0) waiting.Add((t, l, readers));
+        }
+        if (waiting.Count == 0) return;
+
+        var readersOf = waiting.ToDictionary(w => w.Thread.ManagedId, w => w.Readers);
+        IEnumerable<int> Next(int id) =>
+            edges.TryGetValue(id, out var e) ? [to(e)] : readersOf.TryGetValue(id, out var r) ? r : [];
+        bool Reaches(int from, int target)
+        {
+            var seen = new HashSet<int>();
+            var frontier = new Queue<int>([from]);
+            while (frontier.Count > 0)
+            {
+                var current = frontier.Dequeue();
+                if (current == target) return true;
+                if (!seen.Add(current)) continue;
+                foreach (var n in Next(current)) frontier.Enqueue(n);
+            }
+            return false;
+        }
+
+        var chosen = new Dictionary<int, T>();
+        foreach (var (t, l, readers) in waiting)
+        {
+            foreach (var reader in readers.Where(r => Reaches(r, t.ManagedId)).Take(1))
+                chosen[t.ManagedId] = edge(t, l, reader);
+        }
+        foreach (var (id, e) in chosen) edges[id] = e;
     }
 
     /// Which thread is running the static constructor this thread waits for? The runtime's class-init lock
@@ -212,7 +268,7 @@ public sealed class WaitCycleDetector : IDetector
     private static string Step(ProcessSnapshot snapshot, ThreadSnapshot t, WaitEdge edge)
     {
         var other = snapshot.FindThread(edge.To)?.Label ?? $"thread {edge.To}";
-        var held = snapshot.Locks.Where(l => l.OwnerThreadId == t.ManagedId).Select(Describe.Held).ToList();
+        var held = Describe.HeldBy(snapshot, t.ManagedId);
         var cctor = FrameClassifier.RunningStaticConstructors(t.Frames).Select(Names.ShortType).FirstOrDefault();
         var context = new List<string>();
         if (cctor is not null && edge.Kind != WaitKind.TypeInitializer) context.Add($"is running the static constructor of {cctor}");
@@ -221,7 +277,7 @@ public sealed class WaitCycleDetector : IDetector
         var where = Describe.Where(FrameClassifier.BestUserFrame(t.Frames));
         return edge.Kind switch
         {
-            WaitKind.Lock => $"{t.Label} {holds}is waiting in {where} for {Describe.Wanted(edge.Lock!)}, which {other} holds.",
+            WaitKind.Lock => $"{t.Label} {holds}is waiting in {where} {Describe.WaitFor(edge.Lock!, t.ManagedId, edge.To, other)}.",
             WaitKind.Task => $"{t.Label} {holds}is blocked in {FrameClassifier.DescribeTaskWait(t.Frames)} at {where}, waiting for {Describe.Task(edge.Task!)}, which is running on {other}.",
             WaitKind.Join => $"{t.Label} {holds}is waiting in {where} for {other} to finish (Thread.Join).",
             WaitKind.Callback => $"{t.Label} {holds}is disposing a CancellationTokenRegistration in {where}, which waits for its callback to finish running on {other}.",
