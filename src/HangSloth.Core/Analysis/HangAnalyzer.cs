@@ -26,6 +26,7 @@ public sealed class HangAnalyzer
             new DatabaseWaitDetector(),
             new LockContentionDetector(),
             new DatabaseReadDetector(),
+            new FullQueueDetector(),
             new SemaphoreWaitDetector(),
             new BlockedOnTaskDetector(),
         ];

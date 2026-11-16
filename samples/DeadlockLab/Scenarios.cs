@@ -124,7 +124,7 @@ public static class Scenarios
             ["process-pipe-deadlock"], ChildProcessScenario.Run),
 
         new("healthy", Area.Code, Difficulty.Obvious,
-            "Control: background workers ticking along with short locks and a timer. Nothing is wrong.",
+            "Control: background workers ticking along with short locks and a timer, and idle queue consumers waiting for work. Nothing is wrong.",
             [], HealthyScenario.Run),
 
         // ---------------------------------------------------------------- database

@@ -55,7 +55,7 @@ Linux containers), and skip those scenarios otherwise.
 | `cancellation-dispose` | hidden | `CancellationTokenRegistration.Dispose` under a lock waits for the running callback, which waits for that lock. | `wait-cycle` (lock + cancellation callback) |
 | `finalizer-wait` | hidden | `GC.WaitForPendingFinalizers` under a lock that a finalizer takes. | `wait-cycle` (lock + finalizer thread) |
 | `child-process-pipe` | hidden | `WaitForExit` on a child with redirected, unread output; the child fills the pipe and blocks. | `process-pipe-deadlock`, with the child's command line and pid |
-| `healthy` | control | Short locks and a timer, nothing wrong. | nothing |
+| `healthy` | control | Short locks, a timer and idle `BlockingCollection` consumers waiting for work, nothing wrong. | nothing |
 | `db-forgotten-transaction` | obvious | One thread updates a row and waits for an approval without committing; another updates the same row. | `database-wait` naming the idle transaction and the blocked SQL |
 | `db-deadlock-retry` | obvious | Two transactions update two rows in opposite order; PostgreSQL aborts one, the app retries the same way. | `database-wait` (possible database deadlock) |
 | `db-app-lock-cycle` | hidden | Thread A holds an app lock and waits for a row lock; thread B holds that row lock in a transaction and waits for the app lock. Neither .NET nor PostgreSQL sees the cycle. | `database-deadlock` |
