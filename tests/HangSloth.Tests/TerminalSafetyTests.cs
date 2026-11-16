@@ -178,7 +178,8 @@ public class TerminalSafetyTests
     public void The_json_report_escapes_control_characters_the_json_way()
     {
         var json = JsonReporter.Serialize(HostileReport());
-        Assert.All(json, ch => Assert.True(ch == '\n' || !char.IsControl(ch), $"U+{(int)ch:X4} in JSON"));
+        // The serializer ends its own lines the platform's way ("\r\n" on Windows). Nothing else may be a control character.
+        Assert.All(json.Replace("\r\n", "\n"), ch => Assert.True(ch == '\n' || !char.IsControl(ch), $"U+{(int)ch:X4} in JSON"));
         NotContains("\u202E", json);
         NotContains("\u0085", json);
         NotContains("\u2028", json);
