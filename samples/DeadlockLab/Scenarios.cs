@@ -228,6 +228,10 @@ public static class Scenarios
         new("sqlserver-read-blocked", Area.SqlServer, Difficulty.Obvious,
             "A stock adjustment updates a row and waits for a scanner without committing; under SQL Server's default READ COMMITTED, a plain SELECT of that row waits too.",
             ["database-wait"], ReadBlockedScenario.Run),
+
+        new("sqlserver-pool-exhaustion", Area.SqlServer, Difficulty.Hidden,
+            "Each shipment request keeps its SQL Server connection open and opens a second one for its audit entry. With more requests than pool slots (Max Pool Size=4), every request waits for a connection that only another waiting request can return.",
+            ["connection-pool-exhausted"], SqlPoolExhaustionScenario.Run),
     ];
 }
 

@@ -1,6 +1,6 @@
 # DeadlockLab
 
-A small, deliberately broken "shop" app with 49 ways to hang: textbook lock-ordering deadlocks, the
+A small, deliberately broken "shop" app with 50 ways to hang: textbook lock-ordering deadlocks, the
 hidden kind that hide in callbacks, libraries, initializers, semaphores, queues, UI dispatching, HTTP
 clients, finalizers and child processes, and deadlocks that involve a real database: PostgreSQL (with and
 without EF Core, including large selects that hold locks) and SQL Server. It's HangSloth's test bed: every scenario declares which finding HangSloth
@@ -92,6 +92,7 @@ the server (`pg_blocking_pids`).
 |---|---|---|---|
 | `sqlserver-lock-escalation` | hidden | A month-end report sums 20,000 orders under `REPEATABLE READ` and keeps the transaction open; SQL Server escalates its row locks to a table lock, so an order outside the range can't be updated. | `database-wait` (lock escalation), suggesting snapshot isolation |
 | `sqlserver-read-blocked` | obvious | A stock adjustment updates a row and waits before committing; under the default `READ COMMITTED` a product page's `SELECT` waits for it. | `database-wait`, pointing at `READ_COMMITTED_SNAPSHOT` |
+| `sqlserver-pool-exhaustion` | hidden | Each shipment request holds a connection and opens a second one for its audit entry; with more requests than pool slots (`Max Pool Size=4`), nobody gets one. | `connection-pool-exhausted` (pool deadlock, with the pool's size and connections in use) |
 
 ## Before and after
 
@@ -99,4 +100,4 @@ When the lab was written, HangSloth explained 7 of the first 19 scenarios, and a
 of fixes, 4 of the 10 added in the second round, and 2 of the 8 in the third. SQL Server connections weren't read at all before the last 5 were added. Most misses were reported as plain
 lock contention ("held by Thread 1, which is blocked on .Wait()"), which is true but doesn't say
 it's a deadlock, or not at all (semaphores, static constructors, everything involving the database).
-It now explains all 49. The changes are described in the pull requests that added the scenarios.
+It now explains all 50. The changes are described in the pull requests that added the scenarios.

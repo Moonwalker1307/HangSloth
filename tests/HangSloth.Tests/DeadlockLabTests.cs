@@ -28,7 +28,7 @@ public class DeadlockLabTests
         "ef-row-lock", "ef-nested-context", "db-large-select", "db-select-blocks-alter", "db-select-for-update", "db-healthy",
     ];
 
-    public static TheoryData<string> SqlServerScenarios => ["sqlserver-lock-escalation", "sqlserver-read-blocked"];
+    public static TheoryData<string> SqlServerScenarios => ["sqlserver-lock-escalation", "sqlserver-read-blocked", "sqlserver-pool-exhaustion"];
 
     /// Phrases the explanation must contain: names of the app's own locks, methods and SQL, not just the right finding id.
     private static readonly Dictionary<string, string[]> Mentions = new()
@@ -76,6 +76,7 @@ public class DeadlockLabTests
         ["db-select-for-update"] = ["FOR UPDATE", "SKIP LOCKED", "InvoiceBatch.Run"],
         ["sqlserver-lock-escalation"] = ["REPEATABLE READ", "escalat", "MonthEndReport.Run"],
         ["sqlserver-read-blocked"] = ["READ_COMMITTED_SNAPSHOT", "StockAdjustment.Adjust"],
+        ["sqlserver-pool-exhaustion"] = ["Connection pool deadlock: 8 threads are waiting for a free SQL Server connection and the pool is full (4 of 4 connections in use, 0 idle).", "ShipmentAudit.Write"],
         ["db-async-row-lock"] = ["AsyncRefundService.RefundAsync", "`UPDATE lab_async_wallets SET balance = balance + 5 WHERE id = 1`"],
     };
 

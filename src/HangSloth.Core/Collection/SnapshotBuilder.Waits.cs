@@ -378,7 +378,7 @@ public sealed partial class SnapshotBuilder
             CommandText = command.IsNull ? null : DatabaseCommandText(command),
             SessionId = command.IsNull ? null : CommandSession(command),
             Connections = open,
-            Pool = waiting == DatabaseWaitKind.ConnectionPool ? connections.Select(ReadPool).FirstOrDefault(p => p is not null) : null,
+            Pool = waiting == DatabaseWaitKind.ConnectionPool ? connections.Select(ReadPool).FirstOrDefault(p => p is not null) ?? ReadSqlClientPool(roots) : null,
             DataSource = target.DataSource,
             ConnectTimeout = target.Timeout,
             OpenQuery = openQuery,
@@ -435,11 +435,13 @@ public sealed partial class SnapshotBuilder
     // is the open transaction (_transactionState 1 = active) and whose physical state object knows the SPID.
     private const int SqlInternalStateOpen = 1;
     private const int SqlTransactionActive = 1;
+    /// The internal connection's state: a State property since SqlClient 6.0, _state before.
+    private static readonly string[] SqlInternalState = ["<State>k__BackingField", "_state"];
 
     private static DatabaseConnection? ReadSqlConnection(ClrObject connection)
     {
         if (!connection.TryReadObjectField("_innerConnection", out var inner) || inner.IsNull) return null;
-        if (inner.ReadInt("<State>k__BackingField") is { } state && state != SqlInternalStateOpen) return null;
+        if (inner.ReadInt(SqlInternalState) is { } state && state != SqlInternalStateOpen) return null;
         if (!inner.TryReadObjectField("_parser", out var parser) || parser.IsNull) return null;
         var inTx = parser.TryReadObjectField("_currentTransaction", out var tx) && !tx.IsNull && tx.ReadInt("_transactionState") == SqlTransactionActive;
         return new DatabaseConnection(SqlSpid(parser), inTx);
@@ -454,17 +456,66 @@ public sealed partial class SnapshotBuilder
             && sql.TryReadObjectField("_innerConnection", out var inner) && !inner.IsNull
             && inner.TryReadObjectField("_parser", out var parser) && !parser.IsNull)
             return SqlSpid(parser);
-        if (command.TryReadObjectField("<InternalConnection>k__BackingField", out var connection) && !connection.IsNull
+        if (command.TryReadObject(NpgsqlCommandConnection, out var connection)
             && connection.TryReadObjectField("<Connector>k__BackingField", out var connector) && !connector.IsNull)
             return BackendPid(connector);
         return null;
     }
 
-    private static ConnectionPoolInfo? ReadPool(ClrObject connection)
+    /// Npgsql: the connection's pool (PoolingDataSource, ConnectorPool before 7.0) and its counters.
+    private ConnectionPoolInfo? ReadPool(ClrObject connection)
     {
-        if (!connection.TryReadObjectField("_dataSource", out var pool) || pool.IsNull) return null;
-        if (!pool.TryReadField<int>("<MaxConnections>k__BackingField", out var max)) return null;
-        return new ConnectionPoolInfo(max, pool.ReadInt("_numConnectors") ?? 0, pool.ReadInt("_idleCount") ?? 0);
+        var npgsql = connection.Type?.Name?.StartsWith("Npgsql.", StringComparison.Ordinal) == true;
+        if (AlternativeNames.First(NpgsqlConnectionPool, connection.TryReadObjectField, out ClrObject pool) is null)
+        {
+            if (npgsql) Unrecognised(connection.Type?.Module, "Npgsql", "connection internals");
+            return null;
+        }
+        if (pool.IsNull) return null;
+        // Npgsql 4 has a _max but counts its connections differently: without the counters the size alone says nothing.
+        if (pool.ReadInt(NpgsqlPoolMax) is not { } max || pool.ReadInt("_numConnectors") is not { } open)
+        {
+            // Without pooling (or with several hosts) there are no counters to read.
+            if (npgsql && pool.Type?.Name is { } name && !name.Contains("Unpooled", StringComparison.Ordinal) && !name.Contains("MultiHost", StringComparison.Ordinal))
+                Unrecognised(connection.Type?.Module, "Npgsql", "connection pool internals");
+            return null;
+        }
+        return new ConnectionPoolInfo(max, open, pool.ReadInt("_idleCount") ?? 0);
+    }
+
+    /// SqlClient's pool: WaitHandleDbConnectionPool since 6.0, DbConnectionPool before.
+    internal static readonly string[] SqlClientPoolTypes = ["Microsoft.Data.SqlClient.ConnectionPool.WaitHandleDbConnectionPool", "Microsoft.Data.ProviderBase.DbConnectionPool"];
+
+    /// A SqlConnection waiting for the pool has no reference to it yet, but the pool's own TryGetConnection
+    /// frame keeps it on the waiting thread's stack: its size (_connectionPoolGroupOptions._maxPoolSize),
+    /// its connections (_totalObjects) and the idle ones (the _stackOld and _stackNew stacks).
+    private ConnectionPoolInfo? ReadSqlClientPool(List<ClrStackRoot> roots)
+    {
+        var seen = new HashSet<ulong>();
+        foreach (var root in roots)
+        {
+            var pool = root.Object;
+            if (pool.IsNull || !seen.Add(pool.Address) || pool.Type?.Name is not { } name || !name.EndsWith("DbConnectionPool", StringComparison.Ordinal)
+                || !(name.StartsWith("Microsoft.Data.SqlClient.", StringComparison.Ordinal) || name.StartsWith("Microsoft.Data.ProviderBase.", StringComparison.Ordinal))) continue;
+            var max = pool.TryReadObjectField("_connectionPoolGroupOptions", out var options) && !options.IsNull ? options.ReadInt("_maxPoolSize") : null;
+            var open = pool.ReadInt("_totalObjects");
+            var idle = StackCount(pool, "_stackOld") + StackCount(pool, "_stackNew");
+            // _totalObjects counts a connection once it is open: one this thread is still creating isn't in it yet.
+            var creating = roots.Any(r => r.Object.Address == pool.Address && r.StackFrame?.Method?.Name is "CreateObject" or "UserCreateRequest");
+            if (SqlClientPoolTypes.Contains(name) && max is { } m && open is { } o && idle is { } i) return new ConnectionPoolInfo(m, creating ? o + 1 : o, i);
+            Unrecognised(pool.Type.Module, "Microsoft.Data.SqlClient", "connection pool internals");
+        }
+        return null;
+    }
+
+    /// Items on a ConcurrentStack (_head, then each node's _next); null when it can't be read.
+    private static int? StackCount(ClrObject owner, string field)
+    {
+        if (!owner.TryReadObjectField(field, out var stack) || stack.IsNull || !stack.TryReadObjectField("_head", out var node)) return null;
+        var seen = new HashSet<ulong>();
+        while (!node.IsNull && seen.Add(node.Address) && seen.Count < 100_000)
+            if (!node.TryReadObjectField("_next", out node)) return null;
+        return seen.Count;
     }
 
     /// The server a connection is for and its connect timeout, from the parsed connection string the driver keeps.
