@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using HangSloth.Collection;
 using Microsoft.Diagnostics.NETCore.Client;
 
@@ -46,30 +45,10 @@ public class HeaplessDumpEndToEndTests : IDisposable
     /// Dumps the deadlocked HangApp 'sync-over-async' twice: without the heap and with it.
     private static void Capture(string mini, string withHeap)
     {
-        var app = SampleApp.Build("HangApp");
-        using var process = Process.Start(new ProcessStartInfo("dotnet", [app, "sync-over-async"])
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        _ = process.StandardError.ReadToEndAsync();
-        try
-        {
-            var ready = Task.Run(() =>
-            {
-                while (process.StandardOutput.ReadLine() is { } line)
-                    if (line == "READY") return true;
-                return false;
-            });
-            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, "Sample 'sync-over-async' never became ready.");
-            var client = new DiagnosticsClient(process.Id);
-            client.WriteDump(DumpType.Normal, mini, logDumpGeneration: false);
-            client.WriteDump(DumpType.WithHeap, withHeap, logDumpGeneration: false);
-        }
-        finally
-        {
-            try { process.Kill(entireProcessTree: true); } catch { }
-        }
+        using var sample = Sample.Start(SampleApp.Build("HangApp"), ["sync-over-async"]);
+        sample.WaitUntilReady(TimeSpan.FromSeconds(30));
+        var client = new DiagnosticsClient(sample.Process.Id);
+        client.WriteDump(DumpType.Normal, mini, logDumpGeneration: false);
+        client.WriteDump(DumpType.WithHeap, withHeap, logDumpGeneration: false);
     }
 }

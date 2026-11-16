@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.Text.RegularExpressions;
 using HangSloth.Analysis;
 using HangSloth.Collection;
@@ -24,7 +23,7 @@ public class DriverVersionsEndToEndTests
     [InlineData("10.0.3")]
     public void Npgsql_pool_exhausted_by_nested_connections(string version)
     {
-        Skip.IfNot(Lab.PostgresAvailable, "PostgreSQL isn't reachable; set DEADLOCKLAB_PG to run the database scenarios.");
+        Lab.RequirePostgres();
         var report = Analyze($"NpgsqlVersion={version}", "pool-exhaustion", r => r.Findings.Any(f => f.Severity == Severity.Critical));
 
         var f = report.Findings[0];
@@ -40,7 +39,7 @@ public class DriverVersionsEndToEndTests
     [InlineData("7.0.10")]
     public void Npgsql_pool_exhausted_by_nested_async_connections(string version)
     {
-        Skip.IfNot(Lab.PostgresAvailable, "PostgreSQL isn't reachable; set DEADLOCKLAB_PG to run the database scenarios.");
+        Lab.RequirePostgres();
         var report = Analyze($"NpgsqlVersion={version}", "async-pool-exhaustion", r => r.Findings.Any(f => f.Severity == Severity.Critical));
 
         var f = report.Findings[0];
@@ -56,7 +55,7 @@ public class DriverVersionsEndToEndTests
     [SkippableFact]
     public void Npgsql_6_row_lock_names_the_waiting_session()
     {
-        Skip.IfNot(Lab.PostgresAvailable, "PostgreSQL isn't reachable; set DEADLOCKLAB_PG to run the database scenarios.");
+        Lab.RequirePostgres();
         var report = Analyze("NpgsqlVersion=6.0.13", "row-lock", r => r.Findings.Any(f => f.Severity >= Severity.Warning));
 
         var f = report.Findings[0];
@@ -69,7 +68,7 @@ public class DriverVersionsEndToEndTests
     [SkippableFact]
     public void Npgsql_4_pool_internals_are_reported_as_not_recognised()
     {
-        Skip.IfNot(Lab.PostgresAvailable, "PostgreSQL isn't reachable; set DEADLOCKLAB_PG to run the database scenarios.");
+        Lab.RequirePostgres();
         var report = Analyze("NpgsqlVersion=4.1.14", "pool-exhaustion", r => r.Findings.Count > 0);
 
         Assert.Contains("Npgsql 4.1.14: connection pool internals not recognised, so pool exhaustion cannot be detected.", report.Snapshot.Warnings);
@@ -78,7 +77,7 @@ public class DriverVersionsEndToEndTests
     [SkippableFact]
     public void SqlClient_5_pool_exhausted_by_nested_connections()
     {
-        Skip.IfNot(Lab.SqlServerAvailable, "SQL Server isn't reachable and no container could be started; set DEADLOCKLAB_SQLSERVER to run these.");
+        Lab.RequireSqlServer();
         var report = Analyze("SqlClientVersion=5.2.3", "sqlserver-pool-exhaustion", r => r.Findings.Any(f => f.Severity == Severity.Critical));
 
         var f = report.Findings[0];
@@ -94,9 +93,8 @@ public class DriverVersionsEndToEndTests
     private static string Build(string property) =>
         Builds.GetOrAdd(property, _ => new Lazy<string>(() =>
         {
-            var csproj = Path.Combine(SampleApp.RepoRoot(), "samples", "DriverVersions", "DriverVersions.csproj");
-            var output = Path.Combine(Path.GetTempPath(), "hangsloth-sample", "DriverVersions", property.Replace('=', '-'));
-            SampleApp.Run("dotnet", $"build \"{csproj}\" -c Release -p:{property} -o \"{output}\" -nologo -v q", expectSuccess: true);
+            var output = Path.Combine(TestRun.Directory, "samples", "DriverVersions", property.Replace('=', '-'));
+            SampleApp.BuildInto("DriverVersions", output, $"-c Release -p:{property}");
             return Path.Combine(output, "DriverVersions.dll");
         })).Value;
 
@@ -104,27 +102,15 @@ public class DriverVersionsEndToEndTests
     private static AnalysisReport Analyze(string property, string mode, Func<AnalysisReport, bool> until)
     {
         var app = Build(property);
-        var dump = Path.Combine(Path.GetTempPath(), $"hangsloth-test-drivers-{mode}-{Guid.NewGuid():N}.dmp");
-        using var process = Process.Start(new ProcessStartInfo("dotnet", [app, mode])
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        var stderr = process.StandardError.ReadToEndAsync();
+        var dump = TestRun.NewDumpPath($"drivers-{mode}");
+        using var sample = Sample.Start(app, [mode]);
         try
         {
-            var ready = Task.Run(() =>
-            {
-                while (process.StandardOutput.ReadLine() is { } line)
-                    if (line == "READY") return true;
-                return false;
-            });
-            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, $"DriverVersions '{mode}' ({property}) never became ready.{(process.HasExited ? " " + stderr.Result : "")}");
+            sample.WaitUntilReady(TimeSpan.FromSeconds(30));
 
             for (var attempt = 1; ; attempt++)
             {
-                DumpLoader.CollectDump(process.Id, dump);
+                DumpLoader.CollectDump(sample.Process.Id, dump);
                 var report = new HangAnalyzer().Analyze(DumpLoader.LoadDump(dump));
                 File.Delete(dump);
                 if (until(report) || attempt == 3) return report;
@@ -133,7 +119,6 @@ public class DriverVersionsEndToEndTests
         }
         finally
         {
-            try { process.Kill(entireProcessTree: true); } catch { }
             try { File.Delete(dump); } catch { }
         }
     }
