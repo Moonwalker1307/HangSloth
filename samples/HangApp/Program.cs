@@ -28,9 +28,12 @@ switch (mode)
     case "wait-any-timeout": WaitAnyTimeoutScenario.Run(); break;
     case "task-run-returns-task": TaskRunReturnsTaskScenario.Run(); break;
     case "resumed-monitor-wait": ResumedMonitorWaitScenario.Run(); break;
+    case "parked-pool": ParkedPoolScenario.Run(); break;
+    case "pool-lock-convoy": PoolLockConvoyScenario.Run(); break;
+    case "pool-backlog": PoolBacklogScenario.Run(); break;
 
     default:
-        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|tiered-starvation|never-completes|healthy|lock-type-deadlock|sync-io-starvation|task-run-async|task-run-async-result|wait-async|unwrap|continue-with|lock-task-run-async|lock-task-run-async-start|semaphore-token|when-any|when-any-timeout|wait-any-timeout|task-run-returns-task|resumed-monitor-wait>");
+        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|tiered-starvation|never-completes|healthy|lock-type-deadlock|sync-io-starvation|task-run-async|task-run-async-result|wait-async|unwrap|continue-with|lock-task-run-async|lock-task-run-async-start|semaphore-token|when-any|when-any-timeout|wait-any-timeout|task-run-returns-task|resumed-monitor-wait|parked-pool|pool-lock-convoy|pool-backlog>");
         Environment.Exit(2);
         break;
 }

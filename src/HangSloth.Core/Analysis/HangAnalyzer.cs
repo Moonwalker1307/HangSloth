@@ -22,12 +22,14 @@ public sealed class HangAnalyzer
             new MonitorWaitDetector(),
             new HttpDetector(),
             new ProcessPipeDetector(),
-            new ThreadPoolStarvationDetector(),
             new DatabaseWaitDetector(),
             new LockContentionDetector(),
             new DatabaseReadDetector(),
             new FullQueueDetector(),
             new SemaphoreWaitDetector(),
+            // After the detectors that name what pool threads wait for (a lock, a transaction, a semaphore), so that
+            // starvation adds to their findings instead of hiding them; it doesn't skip threads they explain.
+            new ThreadPoolStarvationDetector(),
             new BlockedOnTaskDetector(),
         ];
     }

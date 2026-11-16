@@ -62,7 +62,10 @@ public class EndToEndTests
         Assert.Equal("threadpool-starvation", f.Id);
         Assert.StartsWith("Thread pool starvation: 8 of 8 thread pool threads are blocked (all in .Result at OrderController.cs:17)", f.Summary);
         Assert.NotNull(report.Snapshot.ThreadPool?.QueuedWorkItems);
-        Assert.True(report.Snapshot.ThreadPool!.QueuedWorkItems > 0);
+        // 64 work items for 8 threads: 56 still queued, plus the odd timer or continuation the runtime queued since.
+        var queued = report.Snapshot.ThreadPool!.QueuedWorkItems!.Value;
+        Assert.InRange(queued, 56, 72);
+        Assert.EndsWith($", and {queued} work items are waiting in the queue.", f.Summary);
     }
 
     [Fact]
