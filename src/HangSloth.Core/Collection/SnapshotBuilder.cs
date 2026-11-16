@@ -698,11 +698,13 @@ public sealed partial class SnapshotBuilder
             MaxThreads = pool.MaxThreads,
             ActiveWorkers = pool.ActiveWorkerThreads,
             IdleWorkers = pool.IdleWorkerThreads,
-            QueuedWorkItems = TryCountGlobalQueue(),
+            QueuedWorkItems = TryCountQueuedWork(),
         };
     }
 
-    private int? TryCountGlobalQueue()
+    /// Work items waiting for a pool thread: the global queues (normal, high and low priority, and the per-core
+    /// queues of big machines) plus the local queue of each pool thread, where work queued from a pool thread goes.
+    private int? TryCountQueuedWork()
     {
         try
         {
@@ -716,7 +718,7 @@ public sealed partial class SnapshotBuilder
 
             var total = 0;
             var found = false;
-            foreach (var queueField in new[] { "workItems", "highPriorityWorkItems" })
+            foreach (var queueField in new[] { "workItems", "highPriorityWorkItems", "lowPriorityWorkItems" })
             {
                 if (workQueue.TryReadObjectField(queueField, out var queue) && !queue.IsNull && CountConcurrentQueue(queue) is { } n)
                 {
@@ -724,7 +726,16 @@ public sealed partial class SnapshotBuilder
                     found = true;
                 }
             }
-            return found ? total : null;
+            if (!found) return null;
+            if (workQueue.TryReadObjectField("_assignableWorkItemQueues", out var assignable) && assignable.IsArray)
+            {
+                var queues = assignable.AsArray();
+                for (var i = 0; i < queues.Length; i++)
+                    if (queues.GetObjectValue(i) is { IsNull: false } queue && CountConcurrentQueue(queue) is { } n)
+                        total += n;
+            }
+            // Local queues that can't be read leave an empty global queue unknown, not empty.
+            return CountLocalQueues(bcl!, domain) is { } local ? total + local : total > 0 ? total : null;
         }
         catch
         {
@@ -742,10 +753,63 @@ public sealed partial class SnapshotBuilder
             var head = ht.ReadField<int>("Head");
             var tail = ht.ReadField<int>("Tail");
             var capacity = segment.TryReadObjectField("_slots", out var slots) && slots.IsArray ? slots.AsArray().Length : int.MaxValue;
+            // A segment frozen for enqueues (a newer segment took over) has twice its capacity added to Tail.
+            if (capacity != int.MaxValue && segment.TryReadField<bool>("_frozenForEnqueues", out var frozen) && frozen)
+                tail -= capacity * 2;
             count += Math.Clamp(tail - head, 0, capacity);
-            if (!segment.TryReadObjectField("_nextSegment", out segment)) break;
+            if (!segment.TryReadObjectField("_nextSegment", out var next)) break;
+            segment = next;
         }
         return count;
+    }
+
+    /// The pool threads' own work-stealing queues (ThreadPoolWorkQueue.WorkStealingQueueList).
+    /// Null when they could not be read, so "nothing queued" is only said when it is known.
+    private static int? CountLocalQueues(ClrModule bcl, ClrAppDomain domain)
+    {
+        var total = 0;
+        var failed = false;
+        try
+        {
+            var list = bcl.GetTypeByName("System.Threading.ThreadPoolWorkQueue+WorkStealingQueueList");
+            var field = list?.GetStaticFieldByName("s_queues") ?? list?.GetStaticFieldByName("_queues");
+            if (field is null) return null;
+            var queues = field.ReadObject(domain);
+            if (queues.IsNull || !queues.IsArray) return null;
+            var array = queues.AsArray();
+            for (var i = 0; i < array.Length && i < 10_000; i++)
+            {
+                try
+                {
+                    var queue = array.GetObjectValue(i);
+                    if (queue.IsNull) continue;
+                    if (!queue.TryReadObjectField("m_array", out var items) || !items.IsArray
+                        || !queue.TryReadField<int>("m_headIndex", out var head) || !queue.TryReadField<int>("m_tailIndex", out var tail))
+                    {
+                        failed = true;
+                        continue;
+                    }
+                    var slots = items.AsArray();
+                    var length = slots.Length;
+                    if (length == 0) continue;
+                    // Count the slots that still hold an item: a work item taken out of order leaves a null behind.
+                    // Capped, so that indexes read from a damaged dump can't make it walk a huge array.
+                    var span = Math.Min(Math.Clamp(tail - head, 0, length), 1 << 20);
+                    for (var k = 0; k < span; k++)
+                        if (!slots.GetObjectValue((int)((uint)(head + k) % (uint)length)).IsNull) total++;
+                }
+                catch
+                {
+                    failed = true;
+                }
+            }
+        }
+        catch
+        {
+            failed = true;
+        }
+        // Items that were read are known to be waiting; zero is only known when every queue was read.
+        return total > 0 || !failed ? total : null;
     }
 }
 

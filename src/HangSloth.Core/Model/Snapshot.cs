@@ -261,7 +261,7 @@ public sealed record ThreadPoolSnapshot
     public int MaxThreads { get; init; }
     public int ActiveWorkers { get; init; }
     public int IdleWorkers { get; init; }
-    /// Work items waiting in the global queue, when it could be read.
+    /// Work items waiting for a pool thread (global and per-thread queues), when the queues could be read.
     public int? QueuedWorkItems { get; init; }
 }
 
