@@ -411,8 +411,8 @@ public sealed partial class SnapshotBuilder
             return info with { Kind = TaskKind.WhenAll, Description = "Task.WhenAll(...)" };
         if (typeName.Contains("WhenAnyPromise", StringComparison.Ordinal))
             return info with { Kind = TaskKind.WhenAny, Description = "Task.WhenAny(...)" };
-        if (typeName.Contains("ContinuationTask", StringComparison.Ordinal))
-            return info with { Kind = TaskKind.Continuation, Description = "a ContinueWith(...) task" };
+        if (typeName.StartsWith("System.Threading.Tasks.Continuation", StringComparison.Ordinal))
+            return DescribeContinuation(task, info, depth, visited);
 
         if (task.TryReadObjectField("m_action", out var action) && !action.IsNull)
         {
@@ -423,6 +423,9 @@ public sealed partial class SnapshotBuilder
                 : $"Task.Run({name})";
             return info with { Kind = TaskKind.Delegate, Description = description };
         }
+
+        if (!IsPlainTask(typeName))
+            return DescribeWrapper(task, info, depth, visited);
 
         var generic = GenericArgument(typeName, "Task<");
         return info with

@@ -15,9 +15,22 @@ switch (mode)
     case "healthy": HealthyScenario.Run(); break;
     case "lock-type-deadlock": LockTypeDeadlockScenario.Run(); break;
     case "sync-io-starvation": SyncIoStarvationScenario.Run(); break;
+    case "task-run-async": TaskRunAsyncScenario.Run(); break;
+    case "task-run-async-result": TaskRunAsyncResultScenario.Run(); break;
+    case "wait-async": WaitAsyncScenario.Run(); break;
+    case "unwrap": UnwrapScenario.Run(); break;
+    case "continue-with": ContinueWithScenario.Run(); break;
+    case "lock-task-run-async": LockTaskRunAsyncScenario.Run(lockBeforeFirstAwait: false); break;
+    case "lock-task-run-async-start": LockTaskRunAsyncScenario.Run(lockBeforeFirstAwait: true); break;
+    case "semaphore-token": SemaphoreTokenScenario.Run(); break;
+    case "when-any": WhenAnyScenario.Run(); break;
+    case "when-any-timeout": WhenAnyTimeoutScenario.Run(); break;
+    case "wait-any-timeout": WaitAnyTimeoutScenario.Run(); break;
+    case "task-run-returns-task": TaskRunReturnsTaskScenario.Run(); break;
+    case "resumed-monitor-wait": ResumedMonitorWaitScenario.Run(); break;
 
     default:
-        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|tiered-starvation|never-completes|healthy|lock-type-deadlock|sync-io-starvation>");
+        Console.Error.WriteLine("usage: HangApp <sync-over-async|deadlock|contention|starvation|tiered-starvation|never-completes|healthy|lock-type-deadlock|sync-io-starvation|task-run-async|task-run-async-result|wait-async|unwrap|continue-with|lock-task-run-async|lock-task-run-async-start|semaphore-token|when-any|when-any-timeout|wait-any-timeout|task-run-returns-task|resumed-monitor-wait>");
         Environment.Exit(2);
         break;
 }
