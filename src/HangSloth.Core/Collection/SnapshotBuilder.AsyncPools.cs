@@ -27,17 +27,12 @@ public sealed partial class SnapshotBuilder
         {
             if (!_heap.CanWalkHeap) return result;
             // Walking the heap is the expensive part; only do it when the driver is loaded.
-            if (!_runtime.EnumerateModules().Any(m => Path.GetFileName(m.Name ?? "").StartsWith("Npgsql", StringComparison.OrdinalIgnoreCase))) return result;
+            if (!NpgsqlLoaded) return result;
             var full = new List<(ClrObject Pool, ConnectionPoolInfo Info, int Queued)>();
-            ClrType? connectionType = null;
-            foreach (var obj in _heap.EnumerateObjects())
+            if (HeapLookups.NpgsqlConnectionType is { } connectionType && !NpgsqlConnectionPool.Any(n => connectionType.GetFieldByName(n) is not null))
+                Unrecognised(connectionType.Module, "Npgsql", "connection internals");
+            foreach (var obj in HeapLookups.NpgsqlPools)
             {
-                if (connectionType is null && obj.Type is { Name: "Npgsql.NpgsqlConnection" } type)
-                {
-                    connectionType = type;
-                    if (!NpgsqlConnectionPool.Any(n => type.GetFieldByName(n) is not null)) Unrecognised(type.Module, "Npgsql", "connection internals");
-                }
-                if (obj.Type?.Name is not { } name || !NpgsqlPoolTypes.Contains(name)) continue;
                 var max = obj.ReadInt(NpgsqlPoolMax);
                 var open = obj.ReadInt("_numConnectors");
                 var idle = obj.ReadInt("_idleCount");
@@ -49,8 +44,9 @@ public sealed partial class SnapshotBuilder
             if (full.Count == 0) return result;
 
             var users = full.ToDictionary(f => f.Pool.Address, _ => new List<AsyncConnectionUser>());
-            foreach (var box in _heap.EnumerateObjects())
+            foreach (var address in HeapLookups.PendingAsyncBoxes)
             {
+                var box = _heap.GetObject(address);
                 var typeName = box.Type?.Name;
                 if (typeName is null || !typeName.Contains("AsyncStateMachineBox<", StringComparison.Ordinal)) continue;
                 if (ReadTaskState(box) != TaskState.Pending || !TryReadStateMachine(box, out var sm) || sm.Type is not { } smType) continue;

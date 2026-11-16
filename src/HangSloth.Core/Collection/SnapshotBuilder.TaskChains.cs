@@ -8,7 +8,6 @@ namespace HangSloth.Collection;
 // Unwrap(), WaitAsync, Task.WhenAny and Task.WaitAny. Blocking on one of them says little; follow it to the work it waits for.
 public sealed partial class SnapshotBuilder
 {
-    private Dictionary<ulong, ulong>? _taskOfContinuation;
     private readonly HashSet<ulong> _resumedAsyncMethods = [];
 
     /// Exactly Task or Task&lt;T&gt;, which is what a TaskCompletionSource hands out. Subclasses are completed
@@ -138,44 +137,10 @@ public sealed partial class SnapshotBuilder
     }
 
     /// The task a wrapper waits for. The wrapper doesn't point at it: it is registered as a continuation
-    /// on that task, so map continuations back to their tasks once.
+    /// on that task, so continuations are mapped back to their tasks on the heap.
     private ClrObject? FindSourceTask(ClrObject wrapper)
     {
-        if (_taskOfContinuation is null)
-        {
-            _taskOfContinuation = [];
-            try
-            {
-                if (_heap.CanWalkHeap)
-                {
-                    var kinds = new Dictionary<ulong, (bool IsTask, bool IsWrapper)>();
-                    (bool IsTask, bool IsWrapper) KindOf(ClrType type)
-                    {
-                        if (!kinds.TryGetValue(type.MethodTable, out var kind))
-                        {
-                            var isTask = IsTask(type);
-                            kinds[type.MethodTable] = kind = (isTask, isTask && type.Name?.Contains("AsyncStateMachineBox", StringComparison.Ordinal) != true);
-                        }
-                        return kind;
-                    }
-                    foreach (var obj in _heap.EnumerateObjects())
-                    {
-                        if (obj.Type is not { } type || !KindOf(type).IsTask) continue;
-                        foreach (var continuation in EnumerateContinuations(obj))
-                        {
-                            // Only wrappers are looked up: delegates, ContinueWith and await continuations would just fill the map.
-                            if (continuation.Type is { } continuationType && KindOf(continuationType).IsWrapper)
-                                _taskOfContinuation.TryAdd(continuation.Address, obj.Address);
-                        }
-                    }
-                }
-            }
-            catch
-            {
-                // Without the mapping the wrapper is still described, just not what it waits for.
-            }
-        }
-        if (!_taskOfContinuation.TryGetValue(wrapper.Address, out var address)) return null;
+        if (!HeapLookups.TaskOfContinuation.TryGetValue(wrapper.Address, out var address)) return null;
         var source = _heap.GetObject(address);
         return source.IsValid && IsTask(source.Type) && ReadTaskState(source) == TaskState.Pending ? source : null;
     }

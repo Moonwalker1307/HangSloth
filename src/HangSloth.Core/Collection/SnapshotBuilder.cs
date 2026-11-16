@@ -46,31 +46,62 @@ public sealed partial class SnapshotBuilder
 
     private ProcessSnapshot Build(string source, string? runtimeVersion)
     {
-        var managedThreads = FindManagedThreadObjects();
         var clrThreads = _runtime.Threads.Where(t => t.IsAlive && (t.State & ClrThreadState.TS_Unstarted) == 0).ToList();
         var byAddress = clrThreads.ToDictionary(t => t.Address, t => t.ManagedThreadId);
+        var managedThreads = FindManagedThreadObjects(byAddress);
+
+        // One unreadable object on one thread must not cost the whole report: such a thread keeps what could be read.
+        // Each read is guarded on its own, so a failed detail never costs the wait that makes a deadlock.
+        var incomplete = new SortedSet<int>();
+        ThreadSnapshot Step(ThreadSnapshot current, int threadId, Func<ThreadSnapshot, ThreadSnapshot> read)
+        {
+            try
+            {
+                return read(current);
+            }
+            catch
+            {
+                incomplete.Add(threadId);
+                return current;
+            }
+        }
 
         // First pass: stacks, names, contexts. Task chains need to know every context in use, so they come after.
         var partial = new List<(ClrThread Clr, ThreadSnapshot Snapshot, List<ClrStackRoot> Roots)>();
         foreach (var thread in clrThreads)
         {
-            var frames = ReadFrames(thread);
-            managedThreads.TryGetValue(thread.ManagedThreadId, out var threadObject);
-            var ctx = ReadSynchronizationContext(threadObject);
-            if (ctx is not null) _contextsInUse[ctx.Address] = ctx;
-
             var snapshot = new ThreadSnapshot
             {
                 ManagedId = thread.ManagedThreadId,
                 OSThreadId = thread.OSThreadId,
-                Name = ReadThreadName(threadObject),
-                IsThreadPoolWorker = frames.Any(FrameClassifier.IsThreadPoolDispatchFrame)
-                                     || ((thread.State & ClrThreadState.TS_TPWorkerThread) != 0 && !frames.Any(FrameClassifier.IsThreadPoolServiceFrame)),
                 IsFinalizer = thread.IsFinalizer,
                 IsBackground = (thread.State & ClrThreadState.TS_Background) != 0,
-                Frames = frames,
-                SynchronizationContext = ctx,
+                Frames = [],
             };
+            var id = thread.ManagedThreadId;
+            snapshot = Step(snapshot, id, s =>
+            {
+                var frames = ReadFrames(thread);
+                return s with
+                {
+                    IsThreadPoolWorker = frames.Any(FrameClassifier.IsThreadPoolDispatchFrame)
+                                         || ((thread.State & ClrThreadState.TS_TPWorkerThread) != 0 && !frames.Any(FrameClassifier.IsThreadPoolServiceFrame)),
+                    Frames = frames,
+                };
+            });
+            managedThreads.TryGetValue(id, out var threadObject);
+            snapshot = Step(snapshot, id, s =>
+            {
+                ThreadReadFault?.Invoke(id, "context");
+                var ctx = ReadSynchronizationContext(threadObject);
+                if (ctx is not null) _contextsInUse[ctx.Address] = ctx;
+                return s with { SynchronizationContext = ctx };
+            });
+            snapshot = Step(snapshot, id, s =>
+            {
+                ThreadReadFault?.Invoke(id, "name");
+                return s with { Name = ReadThreadName(threadObject) };
+            });
             partial.Add((thread, snapshot, SafeRoots(thread)));
         }
 
@@ -79,46 +110,64 @@ public sealed partial class SnapshotBuilder
         var threads = new List<ThreadSnapshot>();
         foreach (var (clr, snapshot, roots) in partial)
         {
-            var result = snapshot with
+            var id = clr.ManagedThreadId;
+            var result = snapshot;
+            var kind = BlockingKind.None;
+            try
             {
-                RunningTask = FindRunningTask(roots),
-                SendingTo = FindSendTarget(roots),
-                WaitingForCallbackOnThread = FindCallbackThread(roots, snapshot.Frames, clr.ManagedThreadId),
-                WaitingForProcess = FindProcessWait(roots, snapshot.Frames),
-                Database = ReadDatabaseActivity(roots, FrameClassifier.Classify(snapshot.Frames)),
-            };
-            var kind = FrameClassifier.Classify(snapshot.Frames);
-            switch (kind)
-            {
-                case BlockingKind.TaskWait:
-                // host.Run() waits for the host's RunAsync task too: a host that never finishes starting looks idle otherwise.
-                case BlockingKind.Idle when FrameClassifier.FrameworkPrefix(snapshot.Frames).Any(FrameClassifier.IsHostRunFrame):
-                    var task = FindBlockedOnTask(roots);
-                    result = result with { BlockedOnTask = task };
-                    if (task is not null && DatabaseCommandInChain(task) is { } command)
-                        result = result with { Database = AsyncDatabaseWait(command, result.Database) };
-                    break;
-                case BlockingKind.MonitorEnter:
-                    result = result with { WaitingForLock = FindLockBeingEntered(clr, roots, locks, clrThreads) };
-                    break;
-                case BlockingKind.ReaderWriterLock:
-                    result = result with { WaitingForLock = FindReaderWriterLock(roots, locks, clrThreads) };
-                    break;
-                case BlockingKind.SemaphoreWait:
-                    result = result with { WaitingForSemaphore = FindSemaphoreBeingWaited(roots), WaitingOnCollection = FindCollectionWait(roots) };
-                    break;
-                case BlockingKind.MonitorWait:
-                    result = result with { WaitingForPulse = FindPulseWait(clr, roots, snapshot.Frames) };
-                    break;
-                case BlockingKind.Join:
-                    result = result with { JoiningThreadId = FindJoinTarget(roots, clr.ManagedThreadId) };
-                    break;
-                case BlockingKind.Database or BlockingKind.ConnectionPool:
-                    result = result with { Database = ReadDatabaseActivity(roots, kind) };
-                    break;
+                kind = FrameClassifier.Classify(snapshot.Frames);
             }
+            catch
+            {
+                incomplete.Add(id);
+            }
+            result = Step(result, id, r =>
+            {
+                ThreadReadFault?.Invoke(id, "running task");
+                return r with { RunningTask = FindRunningTask(roots) };
+            });
+            result = Step(result, id, r => r with { SendingTo = FindSendTarget(roots) });
+            result = Step(result, id, r => r with { WaitingForCallbackOnThread = FindCallbackThread(roots, snapshot.Frames, id) });
+            result = Step(result, id, r => r with { WaitingForProcess = FindProcessWait(roots, snapshot.Frames) });
+            result = Step(result, id, r => r with { Database = ReadDatabaseActivity(roots, kind) });
+            result = Step(result, id, r =>
+            {
+                ThreadReadFault?.Invoke(id, "waits");
+                switch (kind)
+                {
+                    case BlockingKind.TaskWait:
+                    // host.Run() waits for the host's RunAsync task too: a host that never finishes starting looks idle otherwise.
+                    case BlockingKind.Idle when FrameClassifier.FrameworkPrefix(snapshot.Frames).Any(FrameClassifier.IsHostRunFrame):
+                        r = r with { BlockedOnTask = FindBlockedOnTask(roots) };
+                        break;
+                    case BlockingKind.MonitorEnter:
+                        r = r with { WaitingForLock = FindLockBeingEntered(clr, roots, locks, clrThreads) };
+                        break;
+                    case BlockingKind.ReaderWriterLock:
+                        r = r with { WaitingForLock = FindReaderWriterLock(roots, locks, clrThreads) };
+                        break;
+                    case BlockingKind.SemaphoreWait:
+                        r = r with { WaitingForSemaphore = FindSemaphoreBeingWaited(roots), WaitingOnCollection = FindCollectionWait(roots) };
+                        break;
+                    case BlockingKind.MonitorWait:
+                        r = r with { WaitingForPulse = FindPulseWait(clr, roots, snapshot.Frames) };
+                        break;
+                    case BlockingKind.Join:
+                        r = r with { JoiningThreadId = FindJoinTarget(roots, id) };
+                        break;
+                    case BlockingKind.Database or BlockingKind.ConnectionPool:
+                        r = r with { Database = ReadDatabaseActivity(roots, kind) };
+                        break;
+                }
+                return r;
+            });
+            result = Step(result, id, r => r.BlockedOnTask is { } task && DatabaseCommandInChain(task) is { } command
+                ? r with { Database = AsyncDatabaseWait(command, r.Database) }
+                : r);
             threads.Add(result);
         }
+        if (incomplete.Count > 0)
+            _warnings.Add(IncompleteThreadsWarning(incomplete));
 
         // Fill in waiters from what each thread is trying to enter, and name each lock after the field holding it.
         var semaphoreAddresses = threads.Select(t => t.WaitingForSemaphore).OfType<ulong>().Concat(_semaphoresInChains).ToHashSet();
@@ -160,35 +209,10 @@ public sealed partial class SnapshotBuilder
     /// Also read by the text report and the CLI, which then word the missing-heap warning for a dump taken mid-GC.
     public const string HeapNotWalkableWarning = "The GC heap could not be walked (was the dump taken mid-GC?). Thread names, SynchronizationContexts and task details are unavailable.";
 
-    private Dictionary<int, ClrObject> FindManagedThreadObjects()
-    {
-        var result = new Dictionary<int, ClrObject>();
-        if (!_heap.CanWalkHeap)
-        {
-            _warnings.Add(HeapNotWalkableWarning);
-            _heapAvailable = false;
-            return result;
-        }
-        var objects = 0;
-        try
-        {
-            foreach (var obj in _heap.EnumerateObjects())
-            {
-                objects++;
-                if (obj.Type?.Name != "System.Threading.Thread") continue;
-                if (obj.TryReadField<int>("_managedThreadId", out var id) && id != 0)
-                    result[id] = obj;
-            }
-        }
-        catch (Exception e)
-        {
-            _warnings.Add($"Walking the heap failed part-way: {e.Message}");
-        }
-        // A running .NET process always has objects on its heap. A mini or triage dump leaves the heap's memory
-        // out, and ClrMD then still says the heap can be walked but enumerates nothing.
-        if (objects == 0) _heapAvailable = false;
-        return result;
-    }
+    /// One line for all threads that could not be read completely, so a damaged dump doesn't flood the notes.
+    internal static string IncompleteThreadsWarning(IReadOnlyCollection<int> threadIds) =>
+        $"{Describe.Plural(threadIds.Count, "thread")} could not be read completely from the dump ({string.Join(", ", threadIds.Select(id => $"Thread {id}"))}); " +
+        $"the report shows what could be read of {(threadIds.Count == 1 ? "it" : "them")}.";
 
     private static string? ReadThreadName(ClrObject threadObject)
     {

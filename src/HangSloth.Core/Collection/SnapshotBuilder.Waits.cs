@@ -8,8 +8,6 @@ namespace HangSloth.Collection;
 // SemaphoreSlim, another thread (Join), or a database. Plus naming the objects involved.
 public sealed partial class SnapshotBuilder
 {
-    private Dictionary<ulong, ulong>? _semaphoreOfTaskNode;
-
     // ---------------------------------------------------------------- what a thread is running
 
     private static readonly HashSet<string> TaskExecuteMethods =
@@ -233,31 +231,10 @@ public sealed partial class SnapshotBuilder
         return null;
     }
 
-    /// WaitAsync queues a TaskNode on the semaphore; the node doesn't point back, so map nodes to semaphores once.
-    private ulong? FindSemaphoreOfTaskNode(ClrObject node)
-    {
-        if (_semaphoreOfTaskNode is null)
-        {
-            _semaphoreOfTaskNode = [];
-            try
-            {
-                if (_heap.CanWalkHeap)
-                {
-                    foreach (var obj in _heap.EnumerateObjects())
-                    {
-                        if (obj.Type?.Name != "System.Threading.SemaphoreSlim") continue;
-                        foreach (var n in AsyncWaiterNodes(obj))
-                            _semaphoreOfTaskNode[n] = obj.Address;
-                    }
-                }
-            }
-            catch
-            {
-                // Without the mapping the wait is still described, just without the semaphore's name.
-            }
-        }
-        return _semaphoreOfTaskNode.TryGetValue(node.Address, out var s) ? s : null;
-    }
+    /// WaitAsync queues a TaskNode on the semaphore; the node doesn't point back, so nodes are mapped to semaphores on the heap.
+    /// Without the mapping the wait is still described, just without the semaphore's name.
+    private ulong? FindSemaphoreOfTaskNode(ClrObject node) =>
+        HeapLookups.SemaphoreOfTaskNode.TryGetValue(node.Address, out var s) ? s : null;
 
     private static IEnumerable<ulong> AsyncWaiterNodes(ClrObject semaphore)
     {
