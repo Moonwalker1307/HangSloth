@@ -118,6 +118,17 @@ public class OptimizedWaitFramesTests
     }
 
     [Fact]
+    public void WaitOne_inlined_down_to_its_stub_is_still_a_wait_on_a_WaitHandle()
+    {
+        // Windows after warm-up (tiered PGO), the stack of a dump from CI: WaitOne, WaitOneNoCheck and WaitOneCore are
+        // inlined into the app's method and only the generated stub is left, twice.
+        var stub = Fx("System.Threading.WaitHandle", "<WaitOneCore>g____PInvoke|0_0");
+        Assert.Equal(BlockingKind.WaitHandle, FrameClassifier.Classify([stub, stub, Caller]));
+        // WaitAny and WaitAll end in the type's other stub.
+        Assert.Equal(BlockingKind.WaitHandle, FrameClassifier.Classify([Fx("System.Threading.WaitHandle", "<WaitMultipleIgnoringSyncContext>g____PInvoke|2_0"), Caller]));
+    }
+
+    [Fact]
     public void A_thread_running_the_apps_code_is_not_blocked_by_a_stub_further_down()
     {
         // The app's own frame is on top: it runs. The stub below it belongs to code that hasn't returned yet.

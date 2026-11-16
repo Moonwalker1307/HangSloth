@@ -147,7 +147,8 @@ public sealed partial class SnapshotBuilder
     private static bool IsProcess(ClrObject o) => !o.IsNull && DerivesFrom(o.Type, ProcessType);
 
     /// Only WaitHandle's own frames above the app's code: a warmed-up process (tiered PGO) also inlines
-    /// ProcessWaitState.WaitForExit (Unix) or Process.WaitForExitCore (Windows) into the app's method.
+    /// ProcessWaitState.WaitForExit (Unix) or Process.WaitForExitCore (Windows) into the app's method. What is left
+    /// is WaitHandle.WaitOneNoCheck (Linux) or the P/Invoke stub of WaitHandle.WaitOneCore (Windows).
     private static bool IsBareWaitHandleWait(IReadOnlyList<StackFrameInfo> frames)
     {
         var prefix = FrameClassifier.FrameworkPrefix(frames);
@@ -155,6 +156,9 @@ public sealed partial class SnapshotBuilder
     }
 
     private const string WaitHandleType = "System.Threading.WaitHandle";
+
+    /// Windows: the wait handle that Process.WaitForExitCore makes for the process's handle and waits on.
+    private const string WindowsProcessWaitHandleType = "Interop+Kernel32+ProcessWaitHandle";
 
     /// The process whose exit a bare WaitHandle wait is for: the one Process object in the app frame that called
     /// it, when the handle waited on is that process's own exit handle (Unix: its ProcessWaitState's exited event;
@@ -167,7 +171,7 @@ public sealed partial class SnapshotBuilder
             var processes = objects.Where(IsProcess).ToList();
             if (processes.Count != 1) return default;
             var p = processes[0];
-            if (objects.Any(o => o.Type?.Name == "System.Diagnostics.ProcessWaitHandle")) return p;
+            if (objects.Any(o => o.Type?.Name == WindowsProcessWaitHandleType)) return p;
             if (p.TryReadObjectField("_waitStateHolder", out var holder) && !holder.IsNull
                 && holder.TryReadObjectField("_state", out var state) && !state.IsNull
                 && state.TryReadObjectField("_exitedEvent", out var exited) && !exited.IsNull)

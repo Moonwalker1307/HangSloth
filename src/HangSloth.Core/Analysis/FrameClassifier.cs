@@ -67,7 +67,7 @@ public static class FrameClassifier
         if (prefix.Any(f => FrameworkWait(f) == BlockingKind.MonitorWait)) return BlockingKind.MonitorWait;
         if (prefix.Any(f => f.TypeName == "System.Threading.Thread" && f.MethodName is "Sleep" or "SleepInternal")) return BlockingKind.Sleep;
         if (prefix.Any(f => FrameworkWait(f) == BlockingKind.Join)) return BlockingKind.Join;
-        if (prefix.Any(f => f.TypeName == "System.Threading.WaitHandle" && f.MethodName.StartsWith("Wait", StringComparison.Ordinal))) return BlockingKind.WaitHandle;
+        if (prefix.Any(f => FrameworkWait(f) == BlockingKind.WaitHandle)) return BlockingKind.WaitHandle;
         // Last: a driver, a lock or a task wait above the I/O says more about what the thread waits for.
         if (SyncIoFrame(prefix) is not null) return BlockingKind.SyncIO;
         return BlockingKind.None;
@@ -80,6 +80,7 @@ public static class FrameClassifier
     ///   Monitor.Wait(obj)              Monitor.Wait, or Monitor.&lt;Wait&gt;g____PInvoke|24_0
     ///   GC.WaitForPendingFinalizers()  GC.WaitForPendingFinalizers, or GC._WaitForPendingFinalizers
     ///   process.WaitForExit()          Process.WaitForExit*, or ProcessWaitState.WaitForExit (Unix; Windows keeps Process.WaitForExitCore)
+    ///   handle.WaitOne()               WaitHandle.Wait*, or WaitHandle.&lt;WaitOneCore&gt;g____PInvoke|0_0 (Windows, after warm-up)
     public static BlockingKind FrameworkWait(string typeName, string methodName) => typeName switch
     {
         "System.Threading.Monitor" when methodName is "Wait" or "ObjWait" || Names.PInvokeStubOf(methodName) == "Wait" => BlockingKind.MonitorWait,
@@ -87,6 +88,8 @@ public static class FrameClassifier
         "System.GC" when methodName is "WaitForPendingFinalizers" or "_WaitForPendingFinalizers" => BlockingKind.Finalizers,
         "System.Diagnostics.Process" when methodName.StartsWith("WaitForExit", StringComparison.Ordinal) => BlockingKind.ProcessExit,
         "System.Diagnostics.ProcessWaitState" when methodName == "WaitForExit" => BlockingKind.ProcessExit,
+        "System.Threading.WaitHandle" when methodName.StartsWith("Wait", StringComparison.Ordinal)
+            || Names.PInvokeStubOf(methodName) is "WaitOneCore" or "WaitMultipleIgnoringSyncContext" => BlockingKind.WaitHandle,
         _ => BlockingKind.None,
     };
 

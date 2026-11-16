@@ -15,10 +15,12 @@ public class OptimizedWaitTargetEndToEndTests
     [Fact]
     public void A_child_process_wait_is_found_after_warm_up_inlined_it_down_to_the_WaitHandle()
     {
-        // Default tiering with PGO: after warm-up only WaitHandle.WaitOneNoCheck is left above Exporter.Wait.
+        // Default tiering with PGO: after warm-up only WaitHandle.WaitOneNoCheck (Linux) or the P/Invoke stub of
+        // WaitHandle.WaitOneCore (Windows) is left above Exporter.Wait.
         var report = Analyze("export-warm", environment: null, until: r => r.Findings.Any(f => f.Id == "process-pipe-deadlock"));
         Verdict.Expect(report, "warning process-pipe-deadlock");
-        Assert.Contains("for `dotnet OptimizedWaitProbe.dll --spew` (pid ", report.Findings[0].Summary);
+        // The child is started with the running dotnet executable, which is dotnet.exe on Windows.
+        Assert.Matches(@"for `dotnet(\.exe)? OptimizedWaitProbe\.dll --spew` \(pid ", report.Findings[0].Summary);
         Assert.Contains("its standard output is redirected and nothing has read it yet", report.Findings[0].Summary);
     }
 
