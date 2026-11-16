@@ -92,7 +92,7 @@ public class ConnectionWaitEndToEndTests
         Assert.Equal(Severity.Warning, f.Severity);
         Assert.Equal("Waiting to connect to SQL Server", f.Title);
         Assert.Equal("Thread N is still connecting to SQL Server at 127.0.0.1,PORT: the network connect, TLS handshake or login hasn't finished. " +
-                     "It isn't waiting for a free connection from the pool.", Stable(f.Summary));
+                     "It isn't waiting for a free connection from the pool (1 of 100 connections in use, counting the one being opened).", Stable(f.Summary));
         Assert.Equal(
             [
                 "Opening a new connection in StartupCheck.OpenSqlServer (ConnectStall.cs:22), called from SqlConnectStallScenario.Run (ConnectStall.cs:42) (Thread N).",

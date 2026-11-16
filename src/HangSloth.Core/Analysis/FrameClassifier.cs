@@ -248,10 +248,12 @@ public static class FrameClassifier
                || (type.EndsWith("DataReader", StringComparison.Ordinal) && f.MethodName is "Read" or "NextResult" or "ReadAsync" or "NextResultAsync");
     }
 
-    /// Renting a connection from the driver's pool (Npgsql's PoolingDataSource, SqlClient's DbConnectionPool...).
+    /// Renting a connection from the driver's pool (Npgsql's PoolingDataSource, ConnectorPool before 7.0, SqlClient's
+    /// DbConnectionPool...). SqlClient before 6.0 keeps its pool in Microsoft.Data.ProviderBase.
     public static bool IsConnectionPoolFrame(StackFrameInfo f) =>
-        DatabaseProvider(f.TypeName) is not null
-        && (f.TypeName.Contains("PoolingDataSource", StringComparison.Ordinal) || f.TypeName.Contains("ConnectionPool", StringComparison.Ordinal))
+        (DatabaseProvider(f.TypeName) is not null || f.TypeName.StartsWith("Microsoft.Data.ProviderBase.", StringComparison.Ordinal))
+        && (f.TypeName.Contains("PoolingDataSource", StringComparison.Ordinal) || f.TypeName.Contains("ConnectionPool", StringComparison.Ordinal)
+            || f.TypeName.Contains("ConnectorPool", StringComparison.Ordinal))
         && (f.MethodName.Contains("Get", StringComparison.Ordinal) || f.MethodName.Contains("Rent", StringComparison.Ordinal) || f.MethodName.Contains("Wait", StringComparison.Ordinal));
 
     /// .NET 9+ runs class initialization through managed helpers; a thread parked in one, before any of
