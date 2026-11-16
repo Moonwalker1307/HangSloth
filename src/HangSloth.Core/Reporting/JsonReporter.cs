@@ -21,6 +21,8 @@ public static class JsonReporter
         tool = "hangsloth",
         source = report.Snapshot.Source,
         runtimeVersion = report.Snapshot.RuntimeVersion,
+        // False for a dump without the managed heap: an empty findings list then means "could not tell", not "healthy".
+        heapAvailable = report.Snapshot.HeapAvailable,
         findings = report.Findings,
         snapshot = report.Snapshot,
     }, Options);

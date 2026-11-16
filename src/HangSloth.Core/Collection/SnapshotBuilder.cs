@@ -30,6 +30,7 @@ public sealed partial class SnapshotBuilder
     private readonly Dictionary<ulong, ObjectRef> _contextsInUse = [];
     private readonly HashSet<ulong> _semaphoresInChains = [];
     private readonly List<ClrObject> _asyncThisObjects = [];
+    private bool _heapAvailable = true;
 
     private SnapshotBuilder(ClrRuntime runtime, SourceResolver sources)
     {
@@ -146,23 +147,30 @@ public sealed partial class SnapshotBuilder
             ThreadPool = ReadThreadPool(),
             AsyncPoolWaits = ReadAsyncPoolWaits(),
             Warnings = [.. _warnings, .. _sources.Warnings],
+            HeapAvailable = _heapAvailable,
         };
     }
 
     // ---------------------------------------------------------------- threads
+
+    /// Also read by the text report and the CLI, which then word the missing-heap warning for a dump taken mid-GC.
+    public const string HeapNotWalkableWarning = "The GC heap could not be walked (was the dump taken mid-GC?). Thread names, SynchronizationContexts and task details are unavailable.";
 
     private Dictionary<int, ClrObject> FindManagedThreadObjects()
     {
         var result = new Dictionary<int, ClrObject>();
         if (!_heap.CanWalkHeap)
         {
-            _warnings.Add("The GC heap could not be walked (was the dump taken mid-GC?). Thread names, SynchronizationContexts and task details are unavailable.");
+            _warnings.Add(HeapNotWalkableWarning);
+            _heapAvailable = false;
             return result;
         }
+        var objects = 0;
         try
         {
             foreach (var obj in _heap.EnumerateObjects())
             {
+                objects++;
                 if (obj.Type?.Name != "System.Threading.Thread") continue;
                 if (obj.TryReadField<int>("_managedThreadId", out var id) && id != 0)
                     result[id] = obj;
@@ -172,6 +180,9 @@ public sealed partial class SnapshotBuilder
         {
             _warnings.Add($"Walking the heap failed part-way: {e.Message}");
         }
+        // A running .NET process always has objects on its heap. A mini or triage dump leaves the heap's memory
+        // out, and ClrMD then still says the heap can be walked but enumerates nothing.
+        if (objects == 0) _heapAvailable = false;
         return result;
     }
 
