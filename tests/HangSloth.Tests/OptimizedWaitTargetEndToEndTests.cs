@@ -48,7 +48,7 @@ public class OptimizedWaitTargetEndToEndTests
         Assert.All(report.Snapshot.Threads, t => Assert.Null(t.SendingTo));
     }
 
-    private static readonly Lazy<string> Probe = new(() =>
+    internal static readonly Lazy<string> Probe = new(() =>
     {
         // Copied into the run's own folder and built there, so that runs from one checkout never share its obj folder.
         var source = Path.Combine(SampleApp.RepoRoot(), "tests", "OptimizedWaitProbe");

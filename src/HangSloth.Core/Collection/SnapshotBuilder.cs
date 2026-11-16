@@ -113,23 +113,37 @@ public sealed partial class SnapshotBuilder
         {
             var id = clr.ManagedThreadId;
             var result = snapshot;
-            var kind = BlockingKind.None;
-            try
-            {
-                kind = FrameClassifier.Classify(snapshot.Frames);
-            }
-            catch
-            {
-                incomplete.Add(id);
-            }
             result = Step(result, id, r =>
             {
                 ThreadReadFault?.Invoke(id, "running task");
                 return r with { RunningTask = FindRunningTask(roots) };
             });
-            result = Step(result, id, r => r with { SendingTo = FindSendTarget(clr, roots, snapshot.Frames) });
-            result = Step(result, id, r => r with { WaitingForCallbackOnThread = FindCallbackThread(roots, snapshot.Frames, id) });
-            result = Step(result, id, r => r with { WaitingForProcess = FindProcessWait(clr, roots, snapshot.Frames) });
+            // Optimized code can leave the task a thread runs on no frame, with its delegate inlined into the code that runs it.
+            ulong? currentTask = null;
+            result = Step(result, id, r =>
+            {
+                ThreadReadFault?.Invoke(id, "current task");
+                if (r.RunningTask is null || InlinedDelegateIndex(r.Frames) >= 0) currentTask = FindCurrentTask(clr);
+                return r.RunningTask is null ? r with { RunningTask = currentTask } : r;
+            });
+            RestoredDelegate? restored = null;
+            result = Step(result, id, r => r with { Frames = WithInlinedDelegate(r.Frames, roots, currentTask, r.RunningTask, out restored) });
+            // And a ManualResetEventSlim.Wait inlined into its caller leaves only the Monitor.Wait on the event's own lock.
+            result = Step(result, id, r => r with { Frames = WithInlinedEventWait(clr, roots, r.Frames) });
+            // The delegate's line, from the call it makes to the frame above it, once that frame is there too.
+            result = Step(result, id, r => restored is { } d ? r with { Frames = WithDelegateLine(r.Frames, d, roots) } : r);
+            var kind = BlockingKind.None;
+            try
+            {
+                kind = FrameClassifier.Classify(result.Frames);
+            }
+            catch
+            {
+                incomplete.Add(id);
+            }
+            result = Step(result, id, r => r with { SendingTo = FindSendTarget(clr, roots, r.Frames) });
+            result = Step(result, id, r => r with { WaitingForCallbackOnThread = FindCallbackThread(roots, r.Frames, id) });
+            result = Step(result, id, r => r with { WaitingForProcess = FindProcessWait(clr, roots, r.Frames) });
             result = Step(result, id, r => r with { Database = ReadDatabaseActivity(roots, kind) });
             result = Step(result, id, r =>
             {
@@ -138,7 +152,7 @@ public sealed partial class SnapshotBuilder
                 {
                     case BlockingKind.TaskWait:
                     // host.Run() waits for the host's RunAsync task too: a host that never finishes starting looks idle otherwise.
-                    case BlockingKind.Idle when FrameClassifier.FrameworkPrefix(snapshot.Frames).Any(FrameClassifier.IsHostRunFrame):
+                    case BlockingKind.Idle when FrameClassifier.FrameworkPrefix(r.Frames).Any(FrameClassifier.IsHostRunFrame):
                         r = r with { BlockedOnTask = FindBlockedOnTask(roots) };
                         break;
                     case BlockingKind.MonitorEnter:
@@ -151,7 +165,7 @@ public sealed partial class SnapshotBuilder
                         r = r with { WaitingForSemaphore = FindSemaphoreBeingWaited(roots), WaitingOnCollection = FindCollectionWait(roots) };
                         break;
                     case BlockingKind.MonitorWait:
-                        r = r with { WaitingForPulse = FindPulseWait(clr, roots, snapshot.Frames) };
+                        r = r with { WaitingForPulse = FindPulseWait(clr, roots, r.Frames) };
                         break;
                     case BlockingKind.Join:
                         r = r with { JoiningThreadId = FindJoinTarget(clr, roots) };
@@ -311,7 +325,8 @@ public sealed partial class SnapshotBuilder
     /// The app frame that blocks on a task: read the blocking call from its IL, which gives the right line and the
     /// right kind of wait even when optimized code inlined Task&lt;T&gt;.Result and lost its frame. When the frame above
     /// is another framework method that waits for a task itself (Parallel.ForEach, Process.WaitForExit), that is the call.
-    private StackFrameInfo WithBlockingCall(IReadOnlyList<StackFrameInfo> frames, StackFrameInfo frame, ClrMethod method, ClrModule module, int ilOffset, bool mapped,
+    /// <paramref name="ilOffset"/> is null for a frame the stack walk doesn't show, which has no offset of its own.
+    private StackFrameInfo WithBlockingCall(IReadOnlyList<StackFrameInfo> frames, StackFrameInfo frame, ClrMethod method, ClrModule module, int? ilOffset, bool mapped,
         StackFrameInfo? callee, List<ClrStackRoot> roots)
     {
         if (callee is not null && !IsTaskWaitFrame(callee))
@@ -330,7 +345,7 @@ public sealed partial class SnapshotBuilder
                 return (sites.HasSymbols ? WithLines(frame, sites) : frame) with { BlockingCall = sites.Call };
             }
         }
-        return _sources.ResolveBlockingCall(module.Name, method.MetadataToken, ilOffset, () => module.Pdb?.Guid) is { } found
+        return ilOffset is { } offset && _sources.ResolveBlockingCall(module.Name, method.MetadataToken, offset, () => module.Pdb?.Guid) is { } found
             ? frame with { BlockingCall = found.Call, Source = found.Location ?? frame.Source }
             : frame;
     }
