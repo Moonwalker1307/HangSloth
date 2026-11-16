@@ -57,7 +57,7 @@ Source lines come from your portable PDBs (side-by-side or embedded), including 
 hangsloth <dump-file>   [options]   Analyze a memory dump
 hangsloth <pid>         [options]   Capture a dump of a running .NET process and analyze it
 
-  --json               Findings plus the full snapshot as JSON
+  --json               Findings plus the full snapshot as JSON (UTF-8)
   --all-threads        Show every thread's stack, not just the ones involved
   --symbols <dir>      Extra folder with the app's .dll/.pdb files (repeatable)
   --dac <path>         The runtime's libmscordaccore.so / mscordaccore.dll, for dumps from
@@ -99,6 +99,27 @@ The usual case is a dump from a server or container that you open on your workst
 ```sh
 hangsloth prod.dmp --dac ~/dac/10.0.15/libmscordaccore.so --symbols ./publish
 ```
+
+### The output
+
+The text report is always UTF-8, whatever the console's code page: written to a file or a pipe it is UTF-8 without a byte order mark, and on a Windows console whose code page is not UTF-8 HangSloth switches the console to UTF-8 for the run and puts it back afterwards. On Linux and macOS the terminal's own character set (from the locale) cannot be changed by a program, so a terminal that is not UTF-8 gets plain ASCII. The same happens on Windows when the switch is not possible (no console attached, or not allowed): HangSloth prints plain ASCII markers instead of the severity glyphs (`X`, `!`, `i`, `-`, `>`, `|`) and writes any other non-ASCII character as `\uXXXX`. `--json` is always UTF-8 too. In PowerShell, set `[Console]::OutputEncoding = [Text.Encoding]::UTF8` before piping or redirecting HangSloth's output, or it decodes the UTF-8 with the console's code page.
+
+Names and text in a dump come from another machine, so the text report never passes them on as they are: control characters (escape sequences, bell, newlines, the C1 controls) and bidirectional overrides are shown as `\x1B`, `\u202E` and so on (tab, carriage return and newline become a space), so a dump cannot move the cursor, recolor the terminal or forge a line of the report. Numbers in sentences read the same on every machine (`12,345 rows`, `1.5 minutes`), whatever the machine's language settings.
+
+A thread's stack always shows the app's own frames (up to 40 per thread, then `… N more frames`). The framework's frames are what gets shortened: a run of more than eight framework frames above the first app frame is cut to its first four and its last one, and a run of three or more framework frames between or below app frames is shown as `… N framework frames`. `--json` has every frame that was collected.
+
+`--json` has a versioned shape. Fields are only ever added within a `schemaVersion`; a renamed, removed or re-purposed field raises it.
+
+| Field | Meaning |
+|---|---|
+| `schemaVersion` | The version of this shape, currently `1`. |
+| `tool`, `version` | `"hangsloth"` and the version that wrote the report (for example `0.1.0+f182f67`; the command line passes its own version, a program that calls `JsonReporter.Serialize` passes `toolVersion` or gets the library's version, which is the same number). |
+| `source`, `runtimeVersion` | What was analyzed (a dump path, or `process <pid>`), and the runtime that ran it. |
+| `heapAvailable` | `false` for a dump without a readable managed heap: an empty `findings` list then means "could not tell". |
+| `warnings` | Notes about a degraded analysis (a missing PDB, a build that is not the one dumped...); the same list as `snapshot.warnings`. |
+| `failedDetectors` | Checks that failed: their findings are missing, so an empty `findings` list cannot be trusted. |
+| `findings` | The findings: `id`, `severity` (`info`, `warning`, `critical`), `title`, `summary`, `details`, `advice`, `threadIds`, `location`. |
+| `snapshot` | Everything HangSloth read from the dump: threads and their frames, locks, semaphores, the thread pool. Properties that are not set are left out, and addresses are decimal numbers. |
 
 ## Build and run from source
 

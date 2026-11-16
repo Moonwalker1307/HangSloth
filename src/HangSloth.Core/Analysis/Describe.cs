@@ -1,3 +1,4 @@
+using System.Globalization;
 using HangSloth.Model;
 
 namespace HangSloth.Analysis;
@@ -26,7 +27,7 @@ internal static class Describe
         var at = withMethod ? Where(FrameClassifier.BestUserFrame(thread.Frames)) : Spot(FrameClassifier.BestUserFrame(thread.Frames));
         if (thread.Database is { Waiting: DatabaseWaitKind.ReadingRows } reading)
             return $"reading the rows of {Sql(reading.CommandText)} from {reading.Provider}" +
-                   (reading.RowsRead is { } rows ? $" ({rows:N0} rows so far)" : "") + $" in {at}";
+                   (reading.RowsRead is { } rows ? $" ({Number(rows)} rows so far)" : "") + $" in {at}";
         if (thread.WaitingOnCollection is { } c)
             return $"waiting to {(c.Adding ? "add to" : "take from")} {c.DisplayName} ({(c.Adding ? "full" : "empty")} BlockingCollection) in {at}";
         return kind switch
@@ -96,6 +97,12 @@ internal static class Describe
         var oneLine = string.Join(' ', sql.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         return $"`{(oneLine.Length > 160 ? oneLine[..157] + "..." : oneLine)}`";
     }
+
+    /// "12,345": the same on every machine, whatever its language settings, so a report reads the same everywhere.
+    public static string Number(long n) => n.ToString("N0", CultureInfo.InvariantCulture);
+
+    /// "1.5", with at most one decimal and a point, on every machine.
+    public static string Number(double n) => n.ToString("0.#", CultureInfo.InvariantCulture);
 
     public static string Plural(int n, string singular, string? plural = null) => n == 1 ? $"1 {singular}" : $"{n} {plural ?? singular + "s"}";
 

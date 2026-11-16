@@ -9,7 +9,6 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>hangsloth</ToolCommandName>
     <PackageId>HangSloth</PackageId>
-    <Version>0.1.0</Version>
     <Description>Point it at a hung .NET process or memory dump and it explains in plain language why it's stuck: sync-over-async and lock deadlocks, wait cycles, lock contention, thread pool starvation, blocked HTTP calls, full queues and database waits, with file and line numbers.</Description>
     <PackageTags>dotnet;diagnostics;hang;deadlock;dump;clrmd;async</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

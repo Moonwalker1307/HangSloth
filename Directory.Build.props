@@ -5,5 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <Deterministic>true</Deterministic>
+    <!-- One version for the tool and its library, so a report names the same version whichever of them wrote it. -->
+    <Version>0.1.0</Version>
   </PropertyGroup>
 </Project>
