@@ -15,6 +15,7 @@ public class EndToEndTests
     public void Sync_over_async_on_a_single_threaded_context()
     {
         var report = SampleApp.Analyze("sync-over-async");
+        Verdict.Expect(report, "critical sync-over-async-deadlock");
         var f = report.Findings[0];
         Assert.Equal("sync-over-async-deadlock", f.Id);
         // The main thread's managed id isn't always 1 (it's 2 on Windows with .NET 10).
@@ -28,6 +29,7 @@ public class EndToEndTests
     {
         // Debug builds compile state machines as classes rather than structs.
         var report = SampleApp.Analyze("sync-over-async", "Debug");
+        Verdict.Expect(report, "critical sync-over-async-deadlock");
         var f = report.Findings[0];
         Assert.Equal("sync-over-async-deadlock", f.Id);
         Assert.Equal("OrderController.cs", f.Location?.FileName);
@@ -38,9 +40,11 @@ public class EndToEndTests
     public void Lock_ordering_deadlock()
     {
         var report = SampleApp.Analyze("deadlock");
+        Verdict.Expect(report, "critical lock-deadlock");
         var f = Assert.Single(report.Findings, x => x.Severity == Severity.Critical);
         Assert.Equal("lock-deadlock", f.Id);
-        Assert.Contains("Thread 4 (\"reserve-worker\") and Thread 5 (\"billing-worker\") are each waiting for a lock the other one holds", f.Summary);
+        // The numbers depend on how many threads the runtime started first; the names are the sample's own.
+        Assert.Matches(@"^Thread \d+ \(""reserve-worker""\) and Thread \d+ \(""billing-worker""\) are each waiting for a lock the other one holds", f.Summary);
         Assert.Contains(f.Details, d => d.Contains("holds the lock on LockDeadlockScenario.InventoryLock") && d.Contains("Scenarios.cs:39"));
         Assert.Contains(f.Details, d => d.Contains("holds the lock on LockDeadlockScenario.BillingLock") && d.Contains("Scenarios.cs:51"));
     }
@@ -49,15 +53,17 @@ public class EndToEndTests
     public void Lock_contention_behind_a_sleeping_owner()
     {
         var report = SampleApp.Analyze("contention");
+        Verdict.Expect(report, "warning lock-contention");
         var f = Assert.Single(report.Findings);
         Assert.Equal("lock-contention", f.Id);
-        Assert.Equal("5 threads are stuck waiting for the lock on LockContentionScenario.CacheLock, held by Thread 4 (\"cache-rebuilder\"), which is sleeping (Thread.Sleep) in Scenarios.cs:84 while holding it.", f.Summary);
+        Assert.Matches(@"^5 threads are stuck waiting for the lock on LockContentionScenario\.CacheLock, held by Thread \d+ \(""cache-rebuilder""\), which is sleeping \(Thread\.Sleep\) in Scenarios\.cs:84 while holding it\.$", f.Summary);
     }
 
     [Fact]
     public void Thread_pool_starvation()
     {
         var report = SampleApp.Analyze("starvation");
+        Verdict.Expect(report, "critical threadpool-starvation");
         var f = Assert.Single(report.Findings);
         Assert.Equal("threadpool-starvation", f.Id);
         Assert.StartsWith("Thread pool starvation: 8 of 8 thread pool threads are blocked (all in .Result at OrderController.cs:17)", f.Summary);
@@ -74,6 +80,9 @@ public class EndToEndTests
         // 200 pool threads blocked on the same .Result, most of them in tier-1 code where Task<T>.Result is
         // inlined: they must all be reported at the .Result line, as .Result, in a single group.
         var report = SampleApp.Analyze("tiered-starvation");
+        // 200 pool threads are blocked, a few others are idle and nothing is queued: a warning today. Whether it is
+        // a warning or critical rests on those spare workers, so only the finding is pinned here (Assert.Single
+        // below); the severity rule has unit tests.
         // The scenario only tests something if some threads really run the inlined code.
         var stacks = string.Join("\n", report.Snapshot.Threads.Where(t => t.IsThreadPoolWorker)
             .Select(t => string.Join(" > ", t.Frames.Take(9).Select(x => x.ToString()))).Distinct());
@@ -82,6 +91,7 @@ public class EndToEndTests
             $"No thread ran tier-1 code with Task<T>.Result inlined. Pool thread stacks:\n{stacks}");
         var f = Assert.Single(report.Findings);
         Assert.Equal("threadpool-starvation", f.Id);
+        Assert.NotEqual(Severity.Info, f.Severity);
         Assert.StartsWith("Thread pool starvation: 200 of ", f.Summary);
         Assert.Contains("(all in .Result at InvoiceCheck.cs:23)", f.Summary);
         Assert.Contains("200 threads: .Result at InvoiceCheck.Validate (InvoiceCheck.cs:23).", f.Details);
@@ -92,6 +102,7 @@ public class EndToEndTests
     public void Task_that_is_never_completed()
     {
         var report = SampleApp.Analyze("never-completes");
+        Verdict.Expect(report, "warning blocked-on-task");
         var f = Assert.Single(report.Findings);
         Assert.Equal("blocked-on-task", f.Id);
         // The main thread's managed id isn't guaranteed to be 1 on every runtime/OS.
@@ -109,6 +120,7 @@ public class EndToEndTests
     public void Deadlock_on_net9_lock_type()
     {
         var report = SampleApp.Analyze("lock-type-deadlock");
+        Verdict.Expect(report, "critical lock-deadlock");
         var f = Assert.Single(report.Findings, x => x.Severity == Severity.Critical);
         Assert.Equal("lock-deadlock", f.Id);
         Assert.Contains(f.Details, d => d.Contains("holds the lock on LockTypeDeadlockScenario.Accounts"));
@@ -122,28 +134,16 @@ internal static class SampleApp
     public static AnalysisReport Analyze(string mode, string configuration = "Release", string project = "HangApp", Func<AnalysisReport, bool>? until = null)
     {
         var app = Build(project, configuration);
-        var dump = Path.Combine(Path.GetTempPath(), $"hangsloth-test-{mode}-{Guid.NewGuid():N}.dmp");
+        var dump = TestRun.NewDumpPath(mode);
 
-        using var process = Process.Start(new ProcessStartInfo("dotnet", [app, mode])
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        var stderr = process.StandardError.ReadToEndAsync();
+        using var sample = Sample.Start(app, [mode]);
         try
         {
-            var ready = Task.Run(() =>
-            {
-                while (process.StandardOutput.ReadLine() is { } line)
-                    if (line == "READY") return true;
-                return false;
-            });
-            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, $"Sample '{mode}' never became ready.{(process.HasExited ? " " + stderr.Result : "")}");
+            sample.WaitUntilReady(TimeSpan.FromSeconds(30));
 
             for (var attempt = 1; ; attempt++)
             {
-                DumpLoader.CollectDump(process.Id, dump);
+                DumpLoader.CollectDump(sample.Process.Id, dump);
                 var report = new HangAnalyzer().Analyze(DumpLoader.LoadDump(dump));
                 File.Delete(dump);
                 // The samples are analysed with the build that was dumped, so no scenario may get the "other build" note.
@@ -154,20 +154,45 @@ internal static class SampleApp
         }
         finally
         {
-            try { process.Kill(entireProcessTree: true); } catch { }
             try { File.Delete(dump); } catch { }
         }
     }
 
-    /// Builds a sample once per test run and returns the path of its .dll.
+    /// Builds a sample once per test run, into the run's own folder, and returns the path of its .dll.
     public static string Build(string project, string configuration = "Release") =>
         Builds.GetOrAdd($"{project}|{configuration}", _ => new Lazy<string>(() =>
         {
-            var csproj = Path.Combine(RepoRoot(), "samples", project, $"{project}.csproj");
-            var output = Path.Combine(Path.GetTempPath(), "hangsloth-sample", project, configuration);
-            Run("dotnet", $"build \"{csproj}\" -c {configuration} -o \"{output}\" -nologo -v q", expectSuccess: true);
+            var output = Path.Combine(TestRun.Directory, "samples", project, configuration);
+            BuildInto(project, output, $"-c {configuration}");
             return Path.Combine(output, $"{project}.dll");
         })).Value;
+
+    /// Builds samples/<project> into <paramref name="output"/> (a folder of this run's own) with extra MSBuild arguments.
+    public static void BuildInto(string project, string output, string arguments)
+    {
+        var csproj = Path.Combine(RepoRoot(), "samples", project, $"{project}.csproj");
+        // Another run from this checkout may be building the same project: they share its obj folder.
+        var obj = Directory.CreateDirectory(Path.Combine(RepoRoot(), "samples", project, "obj")).FullName;
+        using (ExclusiveFile(Path.Combine(obj, "hangsloth-test-build.lock"), TimeSpan.FromMinutes(5)))
+            Run("dotnet", $"build \"{csproj}\" {arguments} -o \"{output}\" -nologo -v q -nodeReuse:false", expectSuccess: true);
+    }
+
+    /// Opens a file for this process alone, waiting while another process has it open.
+    private static FileStream ExclusiveFile(string path, TimeSpan timeout)
+    {
+        var until = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            try
+            {
+                return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (DateTime.UtcNow < until)
+            {
+                Thread.Sleep(250);
+            }
+        }
+    }
 
     public static string RepoRoot()
     {

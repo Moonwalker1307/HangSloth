@@ -25,9 +25,13 @@ The `sqlserver-*` scenarios need SQL Server. Set `DEADLOCKLAB_SQLSERVER` to a Sq
 `docker run -d -p 1433:1433 -e ACCEPT_EULA=Y -e MSSQL_SA_PASSWORD='Lab_Passw0rd!' mcr.microsoft.com/mssql/server:2022-latest`.
 `scripts/try-deadlock-lab.sh` skips them with `SKIP_SQLSERVER=1`.
 
-The tests don't need any of this set up: with no connection string and nothing listening on the default
-port, they start PostgreSQL and SQL Server containers themselves with Testcontainers (when Docker can run
-Linux containers), and skip those scenarios otherwise.
+The tests don't need any of this set up: with no connection string and no server that accepts the default
+login, they start PostgreSQL and SQL Server containers themselves with Testcontainers (when Docker can run
+Linux containers), and skip those scenarios otherwise. Each test run creates a database of its own on the
+server (`hangsloth_run_<time>_<id>`, dropped when the run ends), so two runs don't share the `lab_*` tables
+(a login that may not create databases works in the database it names, as before).
+They use `DeadlockLab --lab-db postgres|sqlserver check|create <name>|drop <name>|list` for that, with the
+same connection settings as the scenarios.
 
 ## Scenarios
 

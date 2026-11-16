@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using HangSloth.Collection;
 
 namespace HangSloth.Tests;
@@ -36,30 +35,10 @@ public class CliEndToEndTests : IClassFixture<CliEndToEndTests.DumpFixture>, IDi
 
     private static string Capture(string dump)
     {
-        var app = SampleApp.Build("HangApp");
-        using var process = Process.Start(new ProcessStartInfo("dotnet", [app, "deadlock"])
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        _ = process.StandardError.ReadToEndAsync();
-        try
-        {
-            var ready = Task.Run(() =>
-            {
-                while (process.StandardOutput.ReadLine() is { } line)
-                    if (line == "READY") return true;
-                return false;
-            });
-            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, "Sample 'deadlock' never became ready.");
-            DumpLoader.CollectDump(process.Id, dump);
-            return dump;
-        }
-        finally
-        {
-            try { process.Kill(entireProcessTree: true); } catch { }
-        }
+        using var sample = Sample.Start(SampleApp.Build("HangApp"), ["deadlock"]);
+        sample.WaitUntilReady(TimeSpan.FromSeconds(30));
+        DumpLoader.CollectDump(sample.Process.Id, dump);
+        return dump;
     }
 
     [Fact]

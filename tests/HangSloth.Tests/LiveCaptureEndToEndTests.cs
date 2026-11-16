@@ -63,35 +63,19 @@ public class LiveCaptureEndToEndTests : IClassFixture<CliEndToEndTests.DumpFixtu
         Assert.Equal("", err);
     }
 
-    private sealed class Sample : IDisposable
+    /// A HangApp mode, started once it is READY; the shared Sample keeps reading its output (createdump writes its lines there).
+    private static Sample StartSample(string mode)
     {
-        public readonly Process Process;
-
-        public Sample(string mode)
+        var sample = Sample.Start(SampleApp.Build("HangApp"), [mode]);
+        try
         {
-            var app = SampleApp.Build("HangApp");
-            Process = Process.Start(new ProcessStartInfo("dotnet", [app, mode])
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            })!;
-            _ = Process.StandardError.ReadToEndAsync();
-            var ready = Task.Run(() =>
-            {
-                while (Process.StandardOutput.ReadLine() is { } line)
-                    if (line == "READY") return true;
-                return false;
-            });
-            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, $"Sample '{mode}' never became ready.");
-            // Drain the rest (createdump writes its lines to the app's stdout).
-            _ = Process.StandardOutput.ReadToEndAsync();
+            sample.WaitUntilReady(TimeSpan.FromSeconds(30));
+            return sample;
         }
-
-        public void Dispose()
+        catch
         {
-            try { Process.Kill(entireProcessTree: true); } catch { }
-            Process.Dispose();
+            sample.Dispose();
+            throw;
         }
     }
 
@@ -106,7 +90,7 @@ public class LiveCaptureEndToEndTests : IClassFixture<CliEndToEndTests.DumpFixtu
     [Fact]
     public void A_live_capture_says_what_it_does_and_leaves_no_dump()
     {
-        using var sample = new Sample("deadlock");
+        using var sample = StartSample("deadlock");
         var pid = sample.Process.Id;
         var (exit, stdout, err) = CliTests.Run([pid.ToString(), "--no-color"]);
         Assert.Equal(2, exit);
@@ -122,7 +106,7 @@ public class LiveCaptureEndToEndTests : IClassFixture<CliEndToEndTests.DumpFixtu
     [Fact]
     public void A_live_capture_whose_analysis_fails_keeps_the_dump_for_another_try()
     {
-        using var sample = new Sample("deadlock");
+        using var sample = StartSample("deadlock");
         var pid = sample.Process.Id;
         var notADac = Path.Combine(_dir, "not-a-dac.so");
         File.WriteAllText(notADac, "this is a text file");
@@ -158,7 +142,7 @@ public class LiveCaptureEndToEndTests : IClassFixture<CliEndToEndTests.DumpFixtu
     public void An_interrupted_live_capture_leaves_no_dump(string signal, int delayMs)
     {
         Skip.If(OperatingSystem.IsWindows(), "Sends a POSIX signal to the CLI, which Windows does not have.");
-        using var sample = new Sample("deadlock");
+        using var sample = StartSample("deadlock");
         var temp = Directory.CreateDirectory(Path.Combine(_dir, "t")).FullName;
         var cli = typeof(HangSloth.Cli.Program).Assembly.Location;
         var start = new ProcessStartInfo("dotnet", [cli, sample.Process.Id.ToString(), "--no-color"])

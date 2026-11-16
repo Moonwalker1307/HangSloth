@@ -245,7 +245,8 @@ public class SymbolIdentityEndToEndTests
     {
         var release = Path.GetDirectoryName(SampleApp.Build("HangApp"))!;
         var debug = Path.GetDirectoryName(SampleApp.Build("HangApp", "Debug"))!;
-        var root = Path.Combine(Path.GetTempPath(), $"hangsloth-symbols-{Guid.NewGuid():N}");
+        // Inside the run's folder, so that the sample running from it is stopped with the run's other samples.
+        var root = Path.Combine(TestRun.Directory, $"symbols-{Guid.NewGuid():N}");
         var app = Directory.CreateDirectory(Path.Combine(root, "app")).FullName;
         var dumped = Directory.CreateDirectory(Path.Combine(root, "dumped-build")).FullName;
         var dump = Path.Combine(Directory.CreateDirectory(Path.Combine(root, "dumps")).FullName, "hangapp.dmp");
@@ -283,29 +284,8 @@ public class SymbolIdentityEndToEndTests
     /// Runs the sample from where it is, dumps it once it hangs, and stops it so that its files can be replaced.
     private static void DumpHangApp(string appDll, string mode, string dump)
     {
-        using var process = Process.Start(new ProcessStartInfo("dotnet", [appDll, mode])
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        try
-        {
-            process.ErrorDataReceived += (_, _) => { };
-            process.BeginErrorReadLine();
-            var ready = Task.Run(() =>
-            {
-                while (process.StandardOutput.ReadLine() is { } line)
-                    if (line == "READY") return true;
-                return false;
-            });
-            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)) && ready.Result, $"Sample '{mode}' never became ready.");
-            DumpLoader.CollectDump(process.Id, dump);
-        }
-        finally
-        {
-            try { process.Kill(entireProcessTree: true); } catch { }
-            process.WaitForExit(10_000);
-        }
+        using var sample = Sample.Start(appDll, [mode]);
+        sample.WaitUntilReady(TimeSpan.FromSeconds(30));
+        DumpLoader.CollectDump(sample.Process.Id, dump);
     }
 }
