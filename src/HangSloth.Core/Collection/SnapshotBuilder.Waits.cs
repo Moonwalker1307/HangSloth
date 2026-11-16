@@ -366,6 +366,7 @@ public sealed partial class SnapshotBuilder
             : waiting == DatabaseWaitKind.ReadingRows ? ReaderCommand(readingRows) ?? commands.FirstOrDefault()
             : default;
         var typeName = (commands.Concat(connections).Concat(kept.Select(k => k.Connection)).FirstOrDefault().Type?.Name) ?? "";
+        var target = waiting == DatabaseWaitKind.ConnectionPool ? connections.Select(ConnectTarget).FirstOrDefault(t => t.DataSource is not null) : default;
         return new DatabaseActivity
         {
             Provider = FrameClassifier.DatabaseProvider(typeName) ?? "the database",
@@ -374,6 +375,8 @@ public sealed partial class SnapshotBuilder
             SessionId = command.IsNull ? null : CommandSession(command),
             Connections = open,
             Pool = waiting == DatabaseWaitKind.ConnectionPool ? connections.Select(ReadPool).FirstOrDefault(p => p is not null) : null,
+            DataSource = target.DataSource,
+            ConnectTimeout = target.Timeout,
             OpenQuery = openQuery,
             Isolation = isolation,
             RowsRead = waiting == DatabaseWaitKind.ReadingRows && lists.Count > 0 ? lists.Max() : null,
@@ -458,6 +461,30 @@ public sealed partial class SnapshotBuilder
         if (!connection.TryReadObjectField("_dataSource", out var pool) || pool.IsNull) return null;
         if (!pool.TryReadField<int>("<MaxConnections>k__BackingField", out var max)) return null;
         return new ConnectionPoolInfo(max, pool.ReadInt("_numConnectors") ?? 0, pool.ReadInt("_idleCount") ?? 0);
+    }
+
+    /// The server a connection is for and its connect timeout, from the parsed connection string the driver keeps.
+    /// Npgsql: NpgsqlConnection.Settings (_host, _port, _timeout). SqlClient: SqlConnection._userConnectionOptions
+    /// (_dataSource, _connectTimeout). Never the password or anything else from the string.
+    private static (string? DataSource, int? Timeout) ConnectTarget(ClrObject connection)
+    {
+        try
+        {
+            if (connection.TryReadObjectField("<Settings>k__BackingField", out var settings) && !settings.IsNull
+                && settings.TryReadStringField("_host", 256, out var host) && !string.IsNullOrEmpty(host))
+            {
+                var port = settings.ReadInt("_port");
+                return (port is > 0 && !host.Contains(',') ? $"{host}:{port}" : host, settings.ReadInt("_timeout"));
+            }
+            if (connection.TryReadObjectField("_userConnectionOptions", out var options) && !options.IsNull
+                && options.TryReadStringField("_dataSource", 256, out var dataSource) && !string.IsNullOrEmpty(dataSource))
+                return (dataSource, options.ReadInt("_connectTimeout"));
+        }
+        catch
+        {
+            // Unknown target: the wait is still described.
+        }
+        return (null, null);
     }
 
     private static string? DatabaseCommandText(ClrObject obj)

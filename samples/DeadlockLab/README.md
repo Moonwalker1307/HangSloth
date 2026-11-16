@@ -1,6 +1,6 @@
 # DeadlockLab
 
-A small, deliberately broken "shop" app with 45 ways to hang: textbook lock-ordering deadlocks, the
+A small, deliberately broken "shop" app with 49 ways to hang: textbook lock-ordering deadlocks, the
 hidden kind that hide in callbacks, libraries, initializers, semaphores, queues, UI dispatching, HTTP
 clients, finalizers and child processes, and deadlocks that involve a real database: PostgreSQL (with and
 without EF Core, including large selects that hold locks) and SQL Server. It's HangSloth's test bed: every scenario declares which finding HangSloth
@@ -56,6 +56,10 @@ Linux containers), and skip those scenarios otherwise.
 | `idle-monitor-consumer` | control | A mail sender waits in `Monitor.Wait` for its empty outbox, in the textbook loop, and a receipt printer waits while its counter of due receipts is 0; their logs of sent mails and printed receipts aren't empty. | nothing |
 | `http-connection-limit` | hidden | `HttpClient` with `MaxConnectionsPerServer = 2`; each page request keeps its first response unread while it makes a second request to the same server. | `http-connection-limit`, naming the method that holds the response |
 | `http-no-response` | obvious | `.Result` on a POST to a payment gateway that accepted the connection and never answers, with `Timeout = Infinite`. | `http-wait`, with the method and URL |
+| `http-connect-stall` | hidden | `.Result` on an HTTPS call to a supplier that accepts the TCP connection and never answers the TLS handshake; no `ConnectTimeout`. | `http-connect`: a connection that is never established, not a full pool |
+| `http-busy-connections` | hidden | A page keeps a buffered response in a local while it waits for a connection that two slow report downloads are using (`MaxConnectionsPerServer = 2`). | `http-connection-limit` as a warning, not a deadlock: the buffered response holds no connection |
+| `db-connect-stall` | hidden | Startup opens the first PostgreSQL connection with `Timeout=0` to a server that accepts the TCP connection and never answers. No database needed. | `database-connect` with the host and the timeout, not a full pool |
+| `sqlclient-connect-stall` | hidden | The same with SQL Server (`Connect Timeout=0`). No database needed. | `database-connect` |
 | `timer-overlap` | hidden | A timer fires every 100 ms; its callback holds a lock for seconds, so callbacks pile up until the thread pool is full. | `threadpool-starvation`, pointing at the overlapping timer callback |
 | `cancellation-dispose` | hidden | `CancellationTokenRegistration.Dispose` under a lock waits for the running callback, which waits for that lock. | `wait-cycle` (lock + cancellation callback) |
 | `finalizer-wait` | hidden | `GC.WaitForPendingFinalizers` under a lock that a finalizer takes. | `wait-cycle` (lock + finalizer thread) |
@@ -95,4 +99,4 @@ When the lab was written, HangSloth explained 7 of the first 19 scenarios, and a
 of fixes, 4 of the 10 added in the second round, and 2 of the 8 in the third. SQL Server connections weren't read at all before the last 5 were added. Most misses were reported as plain
 lock contention ("held by Thread 1, which is blocked on .Wait()"), which is true but doesn't say
 it's a deadlock, or not at all (semaphores, static constructors, everything involving the database).
-It now explains all 45. The changes are described in the pull requests that added the scenarios.
+It now explains all 49. The changes are described in the pull requests that added the scenarios.

@@ -167,7 +167,10 @@ public sealed record TaskInfo
 /// <param name="Timeout">The HttpClient's Timeout; null when infinite or unknown.</param>
 public sealed record HttpCall(string Method, string Uri, TimeSpan? Timeout, bool InfiniteTimeout);
 
-public sealed record HttpPoolInfo(string Server, int MaxConnections, int OpenConnections);
+/// <param name="MaxConnections">MaxConnectionsPerServer; int.MaxValue when no limit is set.</param>
+/// <param name="OpenConnections">Connections the pool counts as its own, including ones still being established.</param>
+/// <param name="PendingConnections">Of those, the ones still being established (TCP connect, TLS handshake), when known.</param>
+public sealed record HttpPoolInfo(string Server, int MaxConnections, int OpenConnections, int? PendingConnections = null);
 
 public enum ResumeStatus
 {
@@ -306,6 +309,12 @@ public sealed record DatabaseActivity
 
     /// For ConnectionPool waits: the pool being waited on.
     public ConnectionPoolInfo? Pool { get; init; }
+
+    /// For ConnectionPool waits: the server the connection is for, from its connection string ("db1:5432"), when known.
+    public string? DataSource { get; init; }
+
+    /// For ConnectionPool waits: the connection string's connect timeout in seconds (0 = wait forever), when known.
+    public int? ConnectTimeout { get; init; }
 
     /// The SQL of a data reader that is still open on this thread's stack, even while the thread does something else.
     /// An open reader keeps its statement running, with its locks.
