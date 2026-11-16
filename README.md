@@ -66,6 +66,8 @@ hangsloth <pid>         [options]   Capture a dump of a running .NET process and
   --no-color           Disable colored output
   --version            Show the version
 
+An option's value can also be written as --name=value, which is the way to pass one that starts with '-'.
+
 Exit codes: 0 = nothing wrong found, 2 = a hang pattern was found,
             1 = error, or nothing found but the dump has no managed heap or a check failed.
 ```
@@ -84,7 +86,13 @@ HangSloth needs a dump with the managed heap: `dotnet-dump collect` (its default
 
 When nothing is found, the report lists what the threads in your code are doing (for example `Thread 1 is waiting on a WaitHandle in SingleInstance.Run (SingleInstance.cs:13).` or `Thread 6 is running Parser.Loop (Parser.cs:88).`) with their stacks, so a wait HangSloth doesn't explain or a loop that never ends is visible without `--all-threads`. Idle thread pool workers, the finalizer and the runtime's own threads aren't listed.
 
-For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written. It writes a full dump to the temp folder while it analyzes (hundreds of megabytes for a busy app) and deletes it afterwards, unless you pass `--keep-dump`. The target has to run as the same user and see the same `TMPDIR` (the diagnostics socket lives there; if the connection fails with a message about the socket path length, set `TMPDIR` to a shorter folder for both processes).
+For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written. It says so on stderr first (`Taking a full dump of process 4242 to /tmp/hangsloth-x1Yz2a/4242.dmp (the app is paused while it is written; the file can be several GB)...`), and the app's own output shows a few `[createdump]` lines. The dump is a full one, hundreds of megabytes for a busy app and often much bigger than the app's memory use, and goes to a new folder in the temp directory (`TMPDIR` on Linux and macOS, `%TEMP%` on Windows; straight into the temp directory for an app that runs as another user, which writes the file itself), or to the `--keep-dump` path. It is deleted when HangSloth is done, also when you stop it with Ctrl+C or it gets SIGTERM; only a hard kill (`kill -9`, out of memory) can leave one behind, and on Windows so can a Ctrl+C while the dump is still being written. If the dump was taken but the analysis failed, HangSloth keeps it and prints its path, so you can retry with `hangsloth <that file>` without pausing the app again.
+
+HangSloth has to run as the target's user, or as root (`sudo hangsloth <pid>`). On Linux it finds the target's diagnostics socket wherever the target's `TMPDIR` points; on macOS both have to see the same `TMPDIR` (the socket lives there; if the connection fails with a message about the socket path length, set `TMPDIR` to a shorter folder for both processes).
+
+When the dump cannot be taken, HangSloth says why instead of waiting: a process that is not running, one stopped with Ctrl+Z or `kill -STOP`, one held by a debugger or `strace`, or the id of one of its threads instead of the process (the last three are checked up front on Linux). If the app does not write anything for 2 minutes (for example under `docker pause`), HangSloth gives up and says so; resume the app, or take a dump yourself with `createdump`, `gcore` or `procdump -ma` and pass the file. An app that runs as another user can still write the dump it was asked for once it is resumed, as `hangsloth-<pid>-<id>.dmp` in the temp directory; delete that file.
+
+A dump whose file is shorter than its own headers say (an interrupted copy or download, or a disk that filled up while it was written) is reported as cut off, with exit code 1, instead of being analysed: the threads' stacks are near the end of a dump, so a cut-off dump would otherwise look like an app with nothing wrong.
 
 Reports can contain SQL text, URLs, database server names and the command lines of child processes, taken from the dump. Check a report before you paste it into a public issue.
 

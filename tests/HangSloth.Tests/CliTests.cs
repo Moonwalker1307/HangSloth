@@ -21,7 +21,8 @@ public class CliTests : IDisposable
 
     private static readonly object ConsoleLock = new();
 
-    internal static (int Exit, string Out, string Err) Run(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump = null, Func<HangAnalyzer>? analyzer = null)
+    internal static (int Exit, string Out, string Err) Run(string[] args, Func<string, LoadOptions, ProcessSnapshot>? loadDump = null, Func<HangAnalyzer>? analyzer = null,
+        Func<int, string?, Action<string>, CapturedDump>? capture = null)
     {
         // Also used by the end-to-end class, which is another collection, so the lock is what serialises the capture.
         lock (ConsoleLock)
@@ -33,7 +34,7 @@ public class CliTests : IDisposable
             Console.SetError(stderr);
             try
             {
-                var exit = loadDump is null && analyzer is null ? Program.Main(args) : Program.Run(args, loadDump, analyzer);
+                var exit = loadDump is null && analyzer is null && capture is null ? Program.Main(args) : Program.Run(args, loadDump, analyzer, capture);
                 return (exit, stdout.ToString(), stderr.ToString());
             }
             finally
