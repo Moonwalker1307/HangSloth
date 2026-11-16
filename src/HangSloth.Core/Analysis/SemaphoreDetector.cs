@@ -90,9 +90,10 @@ internal static class SemaphoreFacts
         snapshot.FindThread(threadId)?.WaitingOnCollection is not null;
 
     /// Is any thread other than these running (not blocked, not idle) the app's own code?
+    /// A thread in synchronous I/O counts: when the I/O returns it carries on and can release things.
     public static bool AppCodeRunningOutside(ProcessSnapshot snapshot, IReadOnlyCollection<int> except) =>
         snapshot.Threads.Any(t => !except.Contains(t.ManagedId)
                                   && FrameClassifier.FirstUserFrame(t.Frames) is not null
-                                  && FrameClassifier.Classify(t.Frames) == BlockingKind.None
+                                  && FrameClassifier.Classify(t.Frames) is BlockingKind.None or BlockingKind.SyncIO
                                   && t.BlockedOnTask is null);
 }

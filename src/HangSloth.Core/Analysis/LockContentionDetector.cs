@@ -59,6 +59,8 @@ public sealed class LockContentionDetector : IDetector
                 Advice = owner?.Database?.Waiting == DatabaseWaitKind.ReadingRows
                     ? $"Don't read a big query result while holding {l.DisplayName}: load the rows into a local without the lock, then swap the reference in under the lock. " +
                       "Better still, read only what you need (WHERE, LIMIT, paging) or aggregate in SQL."
+                    : ownerKind == BlockingKind.SyncIO
+                    ? SyncIoAdvice(owner!, l)
                     : ownerBlocked
                     ? "Don't do slow or blocking work while holding a lock: copy what you need, release the lock, then do the slow part."
                     : "Keep the work inside this lock short, or use a finer-grained or reader/writer lock.",
@@ -66,6 +68,14 @@ public sealed class LockContentionDetector : IDetector
                 Location = ownerSite?.Source,
             };
         }
+    }
+
+    private static string SyncIoAdvice(ThreadSnapshot owner, MonitorLock l)
+    {
+        var async = FrameClassifier.SyncIoAsyncAlternative(owner.Frames);
+        return $"Don't do I/O while holding a lock: {FrameClassifier.SyncIoMethod(owner.Frames)} waits for as long as the other side takes to answer, and every thread that needs {l.DisplayName} waits with it. " +
+               "Do the I/O before taking the lock and hold the lock only to update shared state" +
+               (async is null ? "." : $"; if the lock has to cover the I/O, use a SemaphoreSlim with WaitAsync and await {async}.");
     }
 
     private static bool IsTimerCallback(ThreadSnapshot t) =>

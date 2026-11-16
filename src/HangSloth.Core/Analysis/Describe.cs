@@ -47,6 +47,7 @@ internal static class Describe
             BlockingKind.Finalizers => $"waiting for the finalizer thread (GC.WaitForPendingFinalizers) in {at}",
             BlockingKind.CancellationCallback => $"waiting for a running cancellation callback (CancellationTokenRegistration.Dispose) in {at}",
             BlockingKind.ProcessExit => $"waiting for a child process to exit in {at}",
+            BlockingKind.SyncIO => $"blocked in {FrameClassifier.DescribeSyncIo(thread.Frames)} in {at}",
             _ => $"running {at}",
         };
     }
