@@ -16,15 +16,24 @@ public sealed class SourceResolver : IDisposable
     private readonly IReadOnlyList<string> _searchDirectories;
     private readonly Dictionary<string, MetadataReaderProvider?> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, PEReader?> _images = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Guid?> _dumpedBuilds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _dumpedBuildPdbs = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _warned = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _warnings = [];
 
     public SourceResolver(IEnumerable<string>? searchDirectories = null)
     {
         _searchDirectories = (searchDirectories ?? []).Where(Directory.Exists).ToList();
     }
 
-    public SourceLocation? Resolve(string? modulePath, int methodToken, int ilOffset)
+    /// One note per module whose files on this machine are not the build that was dumped.
+    public IReadOnlyList<string> Warnings => _warnings;
+
+    /// <param name="dumpedBuild">Gives the PDB id of the module as it is in the dump (ClrModule.Pdb?.Guid), or null
+    /// when the dump does not say. Asked once per module, the first time one of its frames is resolved.</param>
+    public SourceLocation? Resolve(string? modulePath, int methodToken, int ilOffset, Func<Guid?>? dumpedBuild = null)
     {
-        var reader = GetReader(modulePath);
+        var reader = GetReader(modulePath, dumpedBuild);
         if (reader is null || !TryGetMethodHandle(methodToken, out var handle)) return null;
         try
         {
@@ -34,10 +43,10 @@ public sealed class SourceResolver : IDisposable
     }
 
     /// For an async method's MoveNext, find the source of the await that state <paramref name="state"/> is suspended at.
-    public SourceLocation? ResolveAwait(string? modulePath, int moveNextToken, int state)
+    public SourceLocation? ResolveAwait(string? modulePath, int moveNextToken, int state, Func<Guid?>? dumpedBuild = null)
     {
         if (state < 0) return null;
-        var reader = GetReader(modulePath);
+        var reader = GetReader(modulePath, dumpedBuild);
         if (reader is null || !TryGetMethodHandle(moveNextToken, out var handle)) return null;
         try
         {
@@ -67,9 +76,9 @@ public sealed class SourceResolver : IDisposable
     /// at or after <paramref name="ilOffset"/>, and returns its source line and how it blocks.
     /// Optimized (tier-1) code often maps a return address to an earlier statement than the call, and inlines
     /// Task&lt;T&gt;.Result so that its frame is gone; the method's own IL still says exactly which call it was.
-    public BlockingCall? ResolveBlockingCall(string? modulePath, int methodToken, int ilOffset)
+    public BlockingCall? ResolveBlockingCall(string? modulePath, int methodToken, int ilOffset, Func<Guid?>? dumpedBuild = null)
     {
-        var image = GetImage(modulePath);
+        var image = GetImage(modulePath, dumpedBuild);
         if (image is null || !TryGetMethodHandle(methodToken, out var handle)) return null;
         try
         {
@@ -87,7 +96,7 @@ public sealed class SourceResolver : IDisposable
             // The first blocking call at or after the offset; failing that, the last one before it.
             var (offset, call) = calls.FirstOrDefault(c => c.Offset >= ilOffset) is { Call: not null } after ? after : calls[^1];
 
-            var pdb = GetReader(modulePath);
+            var pdb = GetReader(modulePath, dumpedBuild);
             var location = pdb is null ? null : FindSequencePoint(pdb, handle, offset);
             return new BlockingCall(call!, location);
         }
@@ -185,12 +194,12 @@ public sealed class SourceResolver : IDisposable
         return new SourceLocation(reader.GetString(doc.Name), point.StartLine, point.StartColumn);
     }
 
-    private MetadataReader? GetReader(string? modulePath)
+    private MetadataReader? GetReader(string? modulePath, Func<Guid?>? dumpedBuild)
     {
         if (string.IsNullOrEmpty(modulePath)) return null;
         if (!_cache.TryGetValue(modulePath, out var provider))
         {
-            provider = OpenPdb(modulePath);
+            provider = OpenPdb(modulePath, DumpedBuild(modulePath, dumpedBuild));
             _cache[modulePath] = provider;
         }
         try
@@ -204,24 +213,187 @@ public sealed class SourceResolver : IDisposable
         }
     }
 
-    private PEReader? GetImage(string? modulePath)
+    private PEReader? GetImage(string? modulePath, Func<Guid?>? dumpedBuild)
     {
         if (string.IsNullOrEmpty(modulePath)) return null;
         if (_images.TryGetValue(modulePath, out var cached)) return cached;
+        var expected = DumpedBuild(modulePath, dumpedBuild);
         PEReader? image = null;
+        var isDumpedBuild = false;
         var fileName = Path.GetFileName(modulePath.Replace('\\', '/'));
         foreach (var candidate in new[] { modulePath }.Concat(_searchDirectories.Select(d => Path.Combine(d, fileName))).Where(File.Exists))
         {
             try
             {
                 var pe = new PEReader(File.OpenRead(candidate));
-                if (pe.HasMetadata) { image = pe; break; }
+                if (pe.HasMetadata)
+                {
+                    if (expected is not { } id) { image = pe; break; }
+                    // The build that was dumped wins wherever it is; failing that, the first binary found.
+                    if (BuildIds(pe).Contains(id))
+                    {
+                        image?.Dispose();
+                        image = pe;
+                        isDumpedBuild = true;
+                        break;
+                    }
+                    if (image is null) { image = pe; continue; }
+                }
                 pe.Dispose();
             }
             catch (Exception e) when (e is BadImageFormatException or IOException or UnauthorizedAccessException) { }
         }
+        if (image is not null && expected is not null && !isDumpedBuild)
+        {
+            // IL from another build next to the dumped build's PDB would point at the wrong statement.
+            try
+            {
+                GetReader(modulePath, dumpedBuild);
+            }
+            catch (Exception)
+            {
+                // A PDB that cannot be read is not the dumped build's; the image is still cached below.
+            }
+            if (_dumpedBuildPdbs.Contains(modulePath))
+            {
+                image.Dispose();
+                image = null;
+            }
+            else
+            {
+                WarnNotTheDumpedBuild(fileName);
+            }
+        }
         _images[modulePath] = image;
         return image;
+    }
+
+    /// The PDB id of the module in the dump, or null when it is unknown: then any build found is used, unchecked.
+    private Guid? DumpedBuild(string modulePath, Func<Guid?>? dumpedBuild)
+    {
+        if (_dumpedBuilds.TryGetValue(modulePath, out var known)) return known;
+        Guid? id = null;
+        try
+        {
+            id = dumpedBuild?.Invoke();
+        }
+        catch (Exception)
+        {
+            // Whatever reading the dump threw: unknown.
+        }
+        if (id == Guid.Empty) id = null;
+        _dumpedBuilds[modulePath] = id;
+        return id;
+    }
+
+    /// An old dump analysed after a rebuild would otherwise get the new build's lines without a word.
+    /// The lines are kept: the same source built in another folder has another id and the right lines.
+    private void WarnNotTheDumpedBuild(string moduleFileName)
+    {
+        if (_warned.Add(moduleFileName))
+            _warnings.Add($"{moduleFileName} on this machine is not the build that was dumped; file and line numbers for it may be off. Pass --symbols <folder with the dumped build>.");
+    }
+
+    /// The PDB ids a binary was built with (its CodeView debug directory entries).
+    private static List<Guid> BuildIds(PEReader pe)
+    {
+        var ids = new List<Guid>();
+        try
+        {
+            foreach (var entry in pe.ReadDebugDirectory())
+            {
+                if (entry.Type == DebugDirectoryEntryType.CodeView)
+                    ids.Add(pe.ReadCodeViewDebugDirectoryData(entry).Guid);
+            }
+        }
+        catch (Exception e) when (e is BadImageFormatException or IOException or InvalidOperationException) { }
+        return ids;
+    }
+
+    /// The id of a portable PDB file: the first 16 bytes of its header id are the GUID that the binary's
+    /// CodeView entry, and so the dump, records.
+    private static Guid? PdbId(string path)
+    {
+        try
+        {
+            using var provider = MetadataReaderProvider.FromPortablePdbStream(File.OpenRead(path));
+            var id = provider.GetMetadataReader().DebugMetadataHeader?.Id ?? default;
+            return id.IsDefault || id.Length < 16 ? null : new Guid(id.AsSpan(0, 16));
+        }
+        catch (Exception e) when (e is BadImageFormatException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    private MetadataReaderProvider? OpenPdb(string modulePath, Guid? dumpedBuild)
+    {
+        if (dumpedBuild is not { } id) return OpenPdb(modulePath);
+        if (OpenDumpedBuildPdb(modulePath, id) is { } match)
+        {
+            _dumpedBuildPdbs.Add(modulePath);
+            return match;
+        }
+
+        // Nothing here is the dumped build: use what is found, as without an id, and say so.
+        var first = OpenPdb(modulePath);
+        try
+        {
+            if (first?.GetMetadataReader() is not null)
+                WarnNotTheDumpedBuild(Path.GetFileName(modulePath.Replace('\\', '/')));
+        }
+        catch (BadImageFormatException)
+        {
+            // Not a portable PDB: nothing will be read from it, so there is nothing to warn about.
+        }
+        return first;
+    }
+
+    /// The PDB of the build that was dumped, wherever it is among the candidates: a stale build that is
+    /// found first must not hide the right one in a later folder.
+    private MetadataReaderProvider? OpenDumpedBuildPdb(string modulePath, Guid dumpedBuild)
+    {
+        var fileName = Path.GetFileName(modulePath.Replace('\\', '/'));
+        var pdbName = Path.ChangeExtension(fileName, ".pdb");
+        var pdbFiles = new[] { Path.Combine(Path.GetDirectoryName(modulePath) ?? "", pdbName) }
+            .Concat(_searchDirectories.Select(d => Path.Combine(d, pdbName)))
+            .ToList();
+
+        foreach (var image in new[] { modulePath }.Concat(_searchDirectories.Select(d => Path.Combine(d, fileName))).Where(File.Exists))
+        {
+            try
+            {
+                using var stream = File.OpenRead(image);
+                using var pe = new PEReader(stream);
+                var ids = BuildIds(pe);
+                if (!ids.Contains(dumpedBuild)) continue;
+                // The right binary: its PDB is next to it, in a search directory, or embedded in it.
+                if (pe.TryOpenAssociatedPortablePdb(image, path => OpenPdbFile(pdbFiles.Prepend(path), ids), out var provider, out _) && provider is not null)
+                    return provider;
+            }
+            catch (Exception e) when (e is BadImageFormatException or IOException or UnauthorizedAccessException) { }
+        }
+
+        // The binary isn't available on this machine: a PDB alone will do when it is the dumped build's.
+        try
+        {
+            return OpenPdbFile(pdbFiles, [dumpedBuild]) is { } pdb ? MetadataReaderProvider.FromPortablePdbStream(pdb) : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// The first of these PDB files that has one of these ids.
+    private static Stream? OpenPdbFile(IEnumerable<string> candidates, IReadOnlyCollection<Guid> ids)
+    {
+        foreach (var candidate in candidates)
+        {
+            if (candidate.Length > 0 && File.Exists(candidate) && PdbId(candidate) is { } id && ids.Contains(id))
+                return File.OpenRead(candidate);
+        }
+        return null;
     }
 
     private MetadataReaderProvider? OpenPdb(string modulePath)

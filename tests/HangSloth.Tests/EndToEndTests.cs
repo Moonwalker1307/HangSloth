@@ -143,6 +143,8 @@ internal static class SampleApp
                 DumpLoader.CollectDump(process.Id, dump);
                 var report = new HangAnalyzer().Analyze(DumpLoader.LoadDump(dump));
                 File.Delete(dump);
+                // The samples are analysed with the build that was dumped, so no scenario may get the "other build" note.
+                Assert.DoesNotContain(report.Snapshot.Warnings, w => w.Contains("is not the build that was dumped"));
                 if (until is null || until(report) || attempt == 3) return report;
                 Thread.Sleep(700);
             }

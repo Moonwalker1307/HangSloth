@@ -73,7 +73,7 @@ Exit code 1 also covers a check that failed when no other check found anything: 
 
 Dumps from `dotnet-dump collect`, `createdump`, `procdump` or Task Manager all work. For a live process, HangSloth captures a dump through the same diagnostics channel `dotnet-dump` uses, so it needs no debugger and pauses the app only while the dump is written.
 
-If the dump comes from another machine, pass `--symbols` with a folder containing the app's `.dll` and `.pdb` files to get file and line numbers.
+If the dump comes from another machine, pass `--symbols` with a folder containing the app's `.dll` and `.pdb` files to get file and line numbers. HangSloth checks that the `.dll` and `.pdb` files it finds are the build that was dumped, and uses that build wherever it is: at the app's original path or in any `--symbols` folder. If it only finds another build (for example because the app was rebuilt after the dump was taken), it still shows file and line numbers, with a note that they may be off for that module.
 
 ## Build and run from source
 

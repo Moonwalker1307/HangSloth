@@ -145,7 +145,7 @@ public sealed partial class SnapshotBuilder
             Semaphores = semaphores,
             ThreadPool = ReadThreadPool(),
             AsyncPoolWaits = ReadAsyncPoolWaits(),
-            Warnings = _warnings,
+            Warnings = [.. _warnings, .. _sources.Warnings],
         };
     }
 
@@ -245,7 +245,7 @@ public sealed partial class SnapshotBuilder
         try
         {
             var il = method.GetILOffset(code[index].IsLeaf ? code[index].Ip : code[index].Ip - 1);
-            if (_sources.ResolveBlockingCall(module.Name, method.MetadataToken, il) is not { } call) return;
+            if (_sources.ResolveBlockingCall(module.Name, method.MetadataToken, il, () => module.Pdb?.Guid) is not { } call) return;
             frames[index] = frames[index] with { BlockingCall = call.Call, Source = call.Location ?? frames[index].Source };
         }
         catch
@@ -262,7 +262,7 @@ public sealed partial class SnapshotBuilder
         {
             // Non-leaf frames sit at a return address, which belongs to the *next* instruction.
             var il = method.GetILOffset(isLeaf ? ip : ip - 1);
-            return _sources.Resolve(module.Name, method.MetadataToken, il);
+            return _sources.Resolve(module.Name, method.MetadataToken, il, () => module.Pdb?.Guid);
         }
         catch
         {
@@ -473,7 +473,7 @@ public sealed partial class SnapshotBuilder
 
     private SourceLocation? SafeResolveAwait(string? module, int token, int state)
     {
-        try { return _sources.ResolveAwait(module, token, state); }
+        try { return _sources.ResolveAwait(module, token, state, () => _runtime.EnumerateModules().FirstOrDefault(m => m.Name == module)?.Pdb?.Guid); }
         catch { return null; }
     }
 
